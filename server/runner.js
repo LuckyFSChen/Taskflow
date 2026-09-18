@@ -9,7 +9,7 @@ import { mkdirSync,writeFileSync,readFileSync,existsSync,cpSync,readdirSync,lsta
 import { resolve,join,basename } from 'node:path';
 import { id,now } from './db.js';
 import { planSchema,resultSchema,planJson,resultJson } from './domain.js';
-import { commandPermissionArgs, developmentCommandRules } from './command-permissions.js';
+import { commandPermissionArgs, developmentCommandRules, matchingCommandApprovals, approvedCommandRules, consumeCommandApprovals } from './command-permissions.js';
 import {detectManualActionRequirement,buildUserActionRequest} from './manual-action.js';
 import {resolveCliExecutable} from './cli-executable.js';
 import {detectWebProject,createProjectPreview} from './project-preview.js';
@@ -24,7 +24,7 @@ export function snapshot(source,dest,{excludePaths=[]}={}) {
   for(const entry of readdirSync(source)){const path=join(source,entry);if(blocked(entry)||excluded(path)||lstatSync(path).isSymbolicLink())continue;cpSync(path,join(dest,entry),{recursive:true,filter:p=>!blocked(basename(p))&&!lstatSync(p).isSymbolicLink()&&!excluded(p)});}
 }
 export function killTree(child) { if(!child?.pid)return;if(process.platform==='win32')execFile('taskkill',['/PID',String(child.pid),'/T','/F'],{windowsHide:true},()=>{});else child.kill('SIGTERM'); }
-export function cliAdapter({engine,prompt,cwd,schema,readOnly,runDir,onEvent,onProcess,spawnProcess=spawn,preflight=false,browser=null}) {
+export function cliAdapter({engine,prompt,cwd,schema,readOnly,runDir,onEvent,onProcess,spawnProcess=spawn,preflight=false,browser=null,extraAllowedTools=[]}) {
   return new Promise((resolveResult,reject)=>{
     mkdirSync(runDir,{recursive:true});
     const schemaPath=join(runDir,'schema.json'),outputPath=join(runDir,'result.json');writeFileSync(schemaPath,JSON.stringify(schema));
@@ -35,7 +35,7 @@ export function cliAdapter({engine,prompt,cwd,schema,readOnly,runDir,onEvent,onP
     const useBrowser=!!browserSpec;
     const mcpConfig=useBrowser?JSON.stringify(browserMcpConfig(browserSpec)):'{"mcpServers":{}}';
     const args=engine==='codex'?['exec','--json','--skip-git-repo-check','--sandbox',readOnly?'read-only':'workspace-write','--output-schema',schemaPath,'-o',outputPath,'-C',cwd,'-']:['-p','--output-format','stream-json','--verbose','--json-schema',JSON.stringify(schema),'--permission-mode',readOnly?'plan':'acceptEdits','--strict-mcp-config','--mcp-config',mcpConfig,'--setting-sources','', '--tools',preflight?'Bash':readOnly?'Read,Glob,Grep,WebSearch,WebFetch':'Read,Write,Edit,Glob,Grep,Bash,WebSearch,WebFetch'];
-    const claudeAllowed=preflight?['Bash(node *)','Bash(npm --version)','Bash(npm config get registry)','Bash(npm ping *)','Bash(pnpm --version)','Bash(yarn --version)']:(readOnly?[]:[...developmentCommandRules,...(useBrowser?browserAllowedTools():[])]);    args.push(...(engine==='claude'?(claudeAllowed.length?['--allowedTools',...claudeAllowed]:[]):commandPermissionArgs(engine,readOnly)));
+    const claudeAllowed=preflight?['Bash(node *)','Bash(npm --version)','Bash(npm config get registry)','Bash(npm ping *)','Bash(pnpm --version)','Bash(yarn --version)']:(readOnly?[]:[...developmentCommandRules,...(useBrowser?browserAllowedTools():[]),...extraAllowedTools]);    args.push(...(engine==='claude'?(claudeAllowed.length?['--allowedTools',...claudeAllowed]:[]):commandPermissionArgs(engine,readOnly)));
     prompt+='\n\n最終輸出契約（必須遵守）：必須回傳符合以下 JSON Schema 的完整物件，不能只回傳 summary。所有 required 欄位都必須存在；沒有問題時 questions=[]。'+(schema.properties?.acceptance?'有待確認問題也仍須提供驗收條件與步驟。':'')+'工具參數與最後結果均不可包在額外的 result/output 欄位內。請在提交前逐一檢查必要欄位及型別。\n'+JSON.stringify(schema);
     prompt+='\n完整結構範例（僅示範欄位與型別，內容必須來自本次工作，不得照抄）：'+JSON.stringify(schema.properties?.acceptance?{summary:'本次計畫摘要',acceptance:['實際驗收條件'],questions:[],steps:[{title:'實際步驟',role:'負責角色',instructions:'具體做法'}]}:preflight?{summary:'實際檢查摘要',toolAvailable:false,registryReachable:false,installationAllowed:false,evidence:['實際指令結果']}:{summary:'實際工作摘要',questions:[],artifacts:[],passed:false,evidence:[]});
     if(!readOnly&&!preflight)prompt+='\n平台已授權在工作副本內執行 npm/pnpm/yarn install、npm ci、test，以及 run build/test/lint/typecheck/check/dev/preview。需要安裝、建置、測試時直接執行，不必再次詢問；指令請從目前工作目錄執行。安裝可下載公開依賴。不得執行部署、publish 或 push；其他未授權操作遇到拒絕時回報具體指令。';
@@ -149,6 +149,17 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
       }
       prompt+=writeTaskHandoff(store,t);
       const adapterOptions={engine:eng,prompt,cwd:t.workspace,schema:['plan','repair_plan'].includes(phase)?planJson:resultJson,readOnly:['plan','repair_plan'].includes(phase),runDir:join(dataDir,'runs',thread.id),onEvent:message=>store.event(t.id,'activity',message,thread.id),onProcess:p=>{slot.child=p;},browser:browserRequirement.previewUrl?{previewUrl:browserRequirement.previewUrl}:null};
+      if(['execute','repair'].includes(phase)){
+        // A user-approved one-off command is granted only for this single attempt: bake it
+        // into this run's --allowedTools, then spend it immediately so it can never be reused
+        // silently on a later, unrelated attempt.
+        const commandApprovals=matchingCommandApprovals(t,t.workspace);
+        if(commandApprovals.length){
+          adapterOptions.extraAllowedTools=approvedCommandRules(commandApprovals);
+          consumeCommandApprovals(t,commandApprovals.map(a=>a.id));
+          store.saveTask(t);
+        }
+      }
       if(['execute','repair'].includes(phase)&&needsPreflight(t)){
         const key=JSON.stringify(['process-probe-v1',t.planVersion,eng,t.plan,t.approvedRepairId,step]);
         if(t.dependencyPreflight?.key!==key){

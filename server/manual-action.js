@@ -1,6 +1,7 @@
 import {hash,now,id} from './db.js';
 import {HttpError,requireTask} from './domain.js';
 import {recordClarification} from './clarifications.js';
+import {normalizeCommand,isHighRiskCommand} from './command-permissions.js';
 
 // Unambiguous: the execution environment itself refused the operation, not the code.
 const STRONG_PATTERNS=[
@@ -92,17 +93,39 @@ export function buildUserActionRequest({detection,selfReport,workingDirectory,ph
     phase,threadId,planVersion,at:now(),
   };
 }
+// A pending manual action can be retried in-sandbox (instead of asking the user to run it on
+// their own machine) only when: it is a Claude Code / policy allow-list block, not something
+// that genuinely needs elevation or a human outside the app, and none of the commands are
+// high-risk (destructive/irreversible) operations.
+export function canRetryWithApproval(ua){
+  return !!ua&&ua.category==='approval_required'&&ua.requiresAdministrator!==true&&ua.commands?.length>0&&!ua.commands.some(isHighRiskCommand);
+}
 export function manualActionRequest(store,task){
   const ua=task.userActionRequired;
   if(!ua||ua.status!=='pending')return null;
-  return {id:hash(JSON.stringify([ua.threadId,task.planVersion,task.controlVersion||0,ua])),...ua};
+  return {id:hash(JSON.stringify([ua.threadId,task.planVersion,task.controlVersion||0,ua])),...ua,retryable:canRetryWithApproval(ua)};
 }
 export function decideManualAction(store,user,taskId,{requestId,decision,note}={}){
   const task=requireTask(store,user,taskId),request=manualActionRequest(store,task);
-  if(!['completed','failed','skip'].includes(decision))throw new HttpError(400,'請選擇「已完成」、「執行失敗」或「略過」');
+  if(!['completed','failed','skip','approve_once'].includes(decision))throw new HttpError(400,'請選擇「已完成」、「執行失敗」、「略過」或「允許一次執行」');
   if(!request||request.id!==requestId||store.threads(taskId).some(t=>t.status==='running'))throw new HttpError(409,'此請求已變更或已處理，請重新查看');
   if(decision==='failed'&&(typeof note!=='string'||!note.trim()))throw new HttpError(400,'請貼上執行後看到的錯誤訊息');
   const ua=task.userActionRequired,commandsText=ua.commands.join('\n')||'（請參閱此步驟的活動紀錄取得實際指令）';
+  if(decision==='approve_once'){
+    if(!request.retryable)throw new HttpError(409,'此操作不支援自動核准重試，請改用「已完成」、「執行失敗」或「略過」');
+    // Bind the grant to this task's own workspace; never let it authorize a command against
+    // a path outside the sandboxed working copy.
+    if(!task.workspace||ua.workingDirectory!==task.workspace)throw new HttpError(409,'工作目錄與任務工作副本不符，無法核准');
+    const approvals=ua.commands.map(command=>({id:id(),command,normalizedCommand:normalizeCommand(command),cwd:ua.workingDirectory,status:'approved',scope:'once',requestedAt:ua.at,approvedAt:now(),approvedBy:user.id,consumedAt:null,source:{phase:ua.phase,planVersion:ua.planVersion}}));
+    task.manualActionHistory=[...(task.manualActionHistory||[]),{...ua,decision,resolvedAt:now(),resolvedBy:user.id}];
+    task.commandApprovals=[...(task.commandApprovals||[]),...approvals];
+    recordClarification(task,store.threads(taskId),[`使用者已核准以下指令可於這次執行中執行一次：\n${commandsText}`],'已核准；此次執行環境已臨時放行上述指令，請照常執行完成原步驟，不必再次詢問或改用其他指令。核准僅限本次執行，之後若再遇到相同或其他被擋的指令，仍須重新申請核准。');
+    task.userActionRequired=null;task.status='queued';task.error=null;
+    task.controlVersion=(task.controlVersion||0)+1;
+    store.saveTask(task);
+    store.event(taskId,'command_approval_approved',`${user.name} 核准以下指令執行一次：\n${commandsText}`);
+    return task;
+  }
   task.manualActionHistory=[...(task.manualActionHistory||[]),{...ua,decision,note:note?String(note).trim().slice(0,4000):null,resolvedAt:now(),resolvedBy:user.id}];
   if(decision==='completed'){
     recordClarification(task,store.threads(taskId),[`使用者已於本機完成以下操作：\n${commandsText}`],`已完成。請只驗證結果（${ua.verification.join('；')||'依原驗收條件檢查'}），不要重新執行相同或等效的指令。`);
