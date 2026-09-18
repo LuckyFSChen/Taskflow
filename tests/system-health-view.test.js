@@ -4,6 +4,7 @@ import {healthGroups,healthAlert,healthMark,healthStatusLabel,healthCheckLabel} 
 
 const ok=message=>({status:'ok',message});
 const healthy=()=>({status:'ok',checkedAt:'2026-01-01T00:00:00.000Z',checks:{
+  runtime:ok('Node 24.20.0 可使用'),
   runner:ok('任務服務已啟用'),codex:ok('Codex CLI 可使用'),claude:ok('Claude CLI 可使用'),
   browser:ok('Browser MCP 可使用（playwright-mcp）'),projects:ok('2 個專案路徑正常'),line:ok('已連線')
 }});
@@ -11,11 +12,12 @@ const flat=health=>healthGroups(health).flatMap(group=>group.items);
 const find=(health,key)=>flat(health).find(item=>item.key===key);
 
 // --- 分組與顯示 --------------------------------------------------------------------
-test('分組順序固定：AI Engines / Browser / Runner / Projects / LINE',()=>{
+test('分組順序固定：Runtime / AI Engines / Browser / Runner / Projects / LINE',()=>{
   const groups=healthGroups(healthy());
-  assert.deepEqual(groups.map(g=>g.label),['AI Engines','Browser','Runner','Projects','LINE']);
-  assert.deepEqual(groups[0].items.map(i=>i.label),['Codex','Claude']);
-  assert.deepEqual(groups[2].items.map(i=>i.label),['任務服務']);
+  assert.deepEqual(groups.map(g=>g.label),['Runtime','AI Engines','Browser','Runner','Projects','LINE']);
+  assert.deepEqual(groups[0].items.map(i=>i.label),['Node']);
+  assert.deepEqual(groups[1].items.map(i=>i.label),['Codex','Claude']);
+  assert.deepEqual(groups[3].items.map(i=>i.label),['任務服務']);
 });
 
 test('每個項目帶出狀態、符號與後端訊息',()=>{

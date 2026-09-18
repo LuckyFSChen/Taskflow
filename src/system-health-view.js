@@ -9,10 +9,11 @@
 
 const MARKS={ok:'✓',warning:'⚠',error:'✗',unknown:'？'};
 const STATUS_LABELS={ok:'正常',warning:'需要注意',error:'有問題',unknown:'尚未確認'};
-const CHECK_LABELS={runner:'任務服務',codex:'Codex',claude:'Claude',browser:'Playwright MCP',projects:'專案路徑',line:'LINE'};
+const CHECK_LABELS={runtime:'Node',runner:'任務服務',codex:'Codex',claude:'Claude',browser:'Playwright MCP',projects:'專案路徑',line:'LINE'};
 // 顯示順序固定，使用者每次看到的版面一致；後端新增的檢查若沒有分組會被忽略，
 // 不會因為多了一項就把版面弄亂。
 const GROUPS=[
+  {label:'Runtime',keys:['runtime']},
   {label:'AI Engines',keys:['codex','claude']},
   {label:'Browser',keys:['browser']},
   {label:'Runner',keys:['runner']},

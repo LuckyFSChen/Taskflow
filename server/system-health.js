@@ -44,6 +44,16 @@ export function engineCheck(engine,probe,label){
   return {status:'error',message:`${label} 無法執行。請確認已安裝並完成登入，或以 ${variable} 指定執行檔路徑。`};
 }
 
+// package.json 的 engines 要求 Node 24 以上（node:sqlite 等功能需要）。這裡只讀取
+// 目前 process 的版本字串，不執行任何指令，也不嘗試安裝或切換版本。
+export function runtimeCheck({version=process.versions.node,required=24}={}){
+  const major=Number.parseInt(String(version||'').split('.')[0],10);
+  if(!Number.isFinite(major))return {status:'unknown',message:'無法判斷目前的 Node 版本'};
+  return major>=required
+    ?{status:'ok',message:`Node ${version} 可使用`}
+    :{status:'error',message:`Node ${version} 過舊：TaskFlow 需要 Node ${required} 以上，請升級後重新啟動服務。`};
+}
+
 export function runnerCheck(store){
   return store.setting('runnerEnabled',false)
     ?{status:'ok',message:'任務服務已啟用'}
@@ -76,13 +86,14 @@ export function lineCheck(store,{env=process.env}={}){
   return {status:'ok',message:`已連線（最後同步 ${lastSync}）`};
 }
 
-export async function systemHealth(store,{env=process.env,execFileImpl,timeoutMs,browserCapability=checkClaudeBrowserCapability,exists=existsSync,clock=Date.now}={}){
+export async function systemHealth(store,{env=process.env,execFileImpl,timeoutMs,browserCapability=checkClaudeBrowserCapability,exists=existsSync,clock=Date.now,nodeVersion=process.versions.node}={}){
   const [codex,claude,browser]=await Promise.all([
     probeCliVersion('codex',{env,execFileImpl,timeoutMs}),
     probeCliVersion('claude',{env,execFileImpl,timeoutMs}),
     (async()=>browserCapability({env}))().catch(error=>({available:false,provider:null,error:String(error.message||error)}))
   ]);
   const checks={
+    runtime:runtimeCheck({version:nodeVersion}),
     runner:runnerCheck(store),
     codex:engineCheck('codex',codex,'Codex CLI'),
     claude:engineCheck('claude',claude,'Claude CLI'),

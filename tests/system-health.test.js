@@ -4,7 +4,7 @@ import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createStore,id} from '../server/db.js';
-import {systemHealth,createSystemHealth,aggregateStatus,probeCliVersion,runnerCheck,projectsCheck,lineCheck,browserCheck,HEALTH_STATUSES} from '../server/system-health.js';
+import {systemHealth,createSystemHealth,aggregateStatus,probeCliVersion,runtimeCheck,runnerCheck,projectsCheck,lineCheck,browserCheck,HEALTH_STATUSES} from '../server/system-health.js';
 
 function fixture(t){
   const dir=mkdtempSync(join(tmpdir(),'tf-health-'));
@@ -22,8 +22,9 @@ function cliStub(results){
 const browserOk=async()=>({available:true,provider:'playwright-mcp',cli:'claude',error:null});
 const browserDown=async()=>({available:false,provider:null,cli:'claude',error:'尚未安裝 @playwright/mcp'});
 
-function healthOptions({store,dir,cli,browserCapability=browserOk,env={}}){
-  return {env:{CODEX_BIN:'codex-bin',CLAUDE_BIN:'claude-bin',...env},execFileImpl:cli.execFileImpl,browserCapability};
+// nodeVersion 固定，報告才不會因為跑測試的 Node 版本不同而得到不同結論。
+function healthOptions({store,dir,cli,browserCapability=browserOk,env={},nodeVersion='24.0.0'}){
+  return {env:{CODEX_BIN:'codex-bin',CLAUDE_BIN:'claude-bin',...env},execFileImpl:cli.execFileImpl,browserCapability,nodeVersion};
 }
 
 test('CLI available: both engines report ok and a fully healthy system aggregates to ok',async t=>{
@@ -40,7 +41,8 @@ test('CLI available: both engines report ok and a fully healthy system aggregate
   assert.equal(report.checks.claude.status,'ok');
   assert.equal(report.checks.runner.message,'任務服務已啟用');
   assert.equal(report.status,'ok');
-  assert.deepEqual(Object.keys(report.checks),['runner','codex','claude','browser','projects','line']);
+  assert.equal(report.checks.runtime.status,'ok');
+  assert.deepEqual(Object.keys(report.checks),['runtime','runner','codex','claude','browser','projects','line']);
   for(const check of Object.values(report.checks))assert.ok(HEALTH_STATUSES.includes(check.status));
   assert.ok(!Number.isNaN(Date.parse(report.checkedAt)));
 });
@@ -67,6 +69,24 @@ test('a CLI that cannot be spawned at all is reported, never thrown',async t=>{
   assert.deepEqual({available:probe.available,executable:probe.executable},{available:false,executable:'codex-bin'});
   assert.match(probe.error,/EACCES/);
   assert.ok(store);
+});
+
+test('Node runtime is read from the running process only, and a version below the engines requirement is an error',async t=>{
+  const {store,dir}=fixture(t);
+  const workspace=join(dir,'project');mkdirSync(workspace);
+  store.setSetting('runnerEnabled',true);
+  addProject(store,'demo',workspace);
+  assert.deepEqual(runtimeCheck({version:'24.20.0'}),{status:'ok',message:'Node 24.20.0 可使用'});
+  assert.equal(runtimeCheck({version:'22.14.0'}).status,'error');
+  assert.match(runtimeCheck({version:'22.14.0'}).message,/需要 Node 24 以上/);
+  // 讀不出版本時是「尚未確認」，不會樂觀地當成正常。
+  assert.equal(runtimeCheck({version:''}).status,'unknown');
+  const cli=cliStub({default:'v1\n'});
+  const report=await systemHealth(store,healthOptions({store,dir,cli,nodeVersion:'20.11.0'}));
+  assert.equal(report.checks.runtime.status,'error');
+  assert.equal(report.status,'error');
+  // 這個檢查只讀字串，不會多 spawn 任何行程。
+  assert.equal(cli.calls.length,2);
 });
 
 test('Runner disabled is a warning, not an error, and the overall status follows',async t=>{
