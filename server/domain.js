@@ -1,12 +1,42 @@
 import {recordClarification} from './clarifications.js';
 import { z } from 'zod';
 import { id,now } from './db.js';
+import { defaultBrowserValidation } from './browser-capability.js';
 export const engine=z.enum(['codex','claude']);
 export const taskInput=z.object({title:z.string().trim().min(2).max(140),description:z.string().trim().min(5).max(16000),projectId:z.string().uuid(),type:z.enum(['code','research']),priority:z.number().int().min(0).max(3).default(1),planner:engine.default('claude'),executor:engine.default('codex'),reviewer:engine.default('claude')});
 export const planSchema=z.object({summary:z.string().min(1),acceptance:z.array(z.string().min(1)).min(1).max(20),questions:z.array(z.string()).max(10),steps:z.array(z.object({title:z.string().min(1),role:z.string().min(1),instructions:z.string().min(1)}).strict()).min(1).max(8)}).strict();
-export const resultSchema=z.object({summary:z.string(),questions:z.array(z.string()),artifacts:z.array(z.string()),passed:z.boolean(),evidence:z.array(z.string())}).strict();
+export const browserCheckSchema=z.object({description:z.string().min(1),passed:z.boolean()}).strict();
+export const browserValidationSchema=z.object({
+  required:z.boolean(),
+  status:z.enum(['not_required','pending','running','passed','failed','blocked']),
+  executed:z.boolean(),
+  passed:z.boolean().nullable(),
+  toolUsed:z.boolean(),
+  toolCallCount:z.number().int().min(0),
+  url:z.string().nullable(),
+  checks:z.array(browserCheckSchema),
+  consoleErrors:z.array(z.string()),
+  networkErrors:z.array(z.string()),
+  notes:z.string(),
+  error:z.string().nullable(),
+}).strict();
+export const resultSchema=z.object({summary:z.string(),questions:z.array(z.string()),artifacts:z.array(z.string()),passed:z.boolean(),evidence:z.array(z.string()),browserValidation:browserValidationSchema.default(defaultBrowserValidation)}).strict();
 export const planJson={type:'object',additionalProperties:false,required:['summary','acceptance','questions','steps'],properties:{summary:{type:'string'},acceptance:{type:'array',items:{type:'string'},minItems:1,maxItems:20},questions:{type:'array',items:{type:'string'},maxItems:10},steps:{type:'array',minItems:1,maxItems:8,items:{type:'object',additionalProperties:false,required:['title','role','instructions'],properties:{title:{type:'string'},role:{type:'string'},instructions:{type:'string'}}}}}};
-export const resultJson={type:'object',additionalProperties:false,required:['summary','questions','artifacts','passed','evidence'],properties:{summary:{type:'string'},questions:{type:'array',items:{type:'string'}},artifacts:{type:'array',items:{type:'string'}},passed:{type:'boolean'},evidence:{type:'array',items:{type:'string'}}}};
+const browserValidationJson={type:'object',additionalProperties:false,properties:{
+  required:{type:'boolean'},
+  status:{type:'string',enum:['not_required','pending','running','passed','failed','blocked']},
+  executed:{type:'boolean'},
+  passed:{type:['boolean','null']},
+  toolUsed:{type:'boolean'},
+  toolCallCount:{type:'integer'},
+  url:{type:['string','null']},
+  checks:{type:'array',items:{type:'object',additionalProperties:false,required:['description','passed'],properties:{description:{type:'string'},passed:{type:'boolean'}}}},
+  consoleErrors:{type:'array',items:{type:'string'}},
+  networkErrors:{type:'array',items:{type:'string'}},
+  notes:{type:'string'},
+  error:{type:['string','null']},
+}};
+export const resultJson={type:'object',additionalProperties:false,required:['summary','questions','artifacts','passed','evidence'],properties:{summary:{type:'string'},questions:{type:'array',items:{type:'string'}},artifacts:{type:'array',items:{type:'string'}},passed:{type:'boolean'},evidence:{type:'array',items:{type:'string'}},browserValidation:browserValidationJson}};
 export class HttpError extends Error {constructor(status,message){super(message);this.status=status;}}
 export function requireTask(store,user,tid) {const t=store.task(tid); if(!t || (t.ownerId!==user.id&&user.role!=='admin')) throw new HttpError(404,'找不到任務');return t;}
 export function createTask(store,user,input) {const data=taskInput.parse(input);if(!store.hasProject(user,data.projectId)) throw new HttpError(403,'尚未獲授權使用此專案');const t={...data,id:id(),ownerId:user.id,status:'planning',position:Date.now(),created:now(),planVersion:1,approvedVersion:null,plan:null,round:0,questions:[],error:null,workspace:null,publishApproval:null};store.saveTask(t);store.event(t.id,'created','任務已建立，等待根節點規劃');return t;}

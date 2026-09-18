@@ -9,13 +9,14 @@ import {createRunner} from '../server/runner.js';
 import {createApp} from '../server/app.js';
 import {changeTaskStatus} from '../server/task-status.js';
 import {validatedOutput} from '../server/output-validation.js';
+import {defaultBrowserValidation} from '../server/browser-capability.js';
 const plan={summary:'新增上傳套件',acceptance:['完成上傳'],questions:[],steps:[{title:'安裝套件',role:'工程',instructions:'使用已核准的 multer'}]};
 const good={summary:'完成',questions:[],artifacts:[],passed:true,evidence:['checked']};
 function fixture(t,cleanup=true){const dir=mkdtempSync(join(tmpdir(),'tf-output-'));if(cleanup)t.after(()=>rmSync(dir,{recursive:true,force:true}));return dir;}
 test('Two lossless format passes preserve content and never repeat adapter execution',async t=>{
  const dir=fixture(t);let calls=0;
  const result=await validatedOutput(async()=>{calls++;return {result:{output:{...good,passed:'true',evidence:'checked'}}};},{runDir:dir,schema:resultJson},resultSchema);
- assert.equal(calls,1);assert.deepEqual(result.result,good);assert.ok(readFileSync(join(dir,'original-output.json'),'utf8').includes('output'));assert.ok(readdirSync(dir).includes('format-repair-2.json'));
+ assert.equal(calls,1);assert.deepEqual(result.result,{...good,browserValidation:defaultBrowserValidation()});assert.ok(readFileSync(join(dir,'original-output.json'),'utf8').includes('output'));assert.ok(readdirSync(dir).includes('format-repair-2.json'));
 });
 test('Missing content fails closed after two passes, with named fields and original evidence',async t=>{
  const dir=fixture(t);let calls=0;
