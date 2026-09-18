@@ -22,6 +22,9 @@ import {checkClaudeBrowserCapability} from './browser-capability.js';
 import {createSystemHealth} from './system-health.js';
 import {onboardingStatus,completeOnboarding} from './onboarding.js';
 import {recoverTaskOutput,taskOriginalOutput,outputIssueRecoverable} from './output-issue.js';
+import {taskGitReview,decideGitReview,rollbackTaskMerge} from './git-review.js';
+import {legacyWorkspaceStatus,migrateLegacyWorkspace} from './git-migration.js';
+import {createGitWorkspace} from './git-workspace.js';
 
 export function allowedOrigins(publicOrigin=process.env.PUBLIC_ORIGIN) {
   const configured=new URL(publicOrigin||`http://127.0.0.1:${process.env.PORT||4310}`).origin;
@@ -35,7 +38,7 @@ export function allowedOrigins(publicOrigin=process.env.PUBLIC_ORIGIN) {
   return [...allowed];
 }
 
-export function createApp(store,runner,{dist=resolve('dist'),previews=createProjectPreview(),folderOpener=openFolder,health=createSystemHealth(store)}={}) {
+export function createApp(store,runner,{dist=resolve('dist'),previews=createProjectPreview(),folderOpener=openFolder,health=createSystemHealth(store),gitWorkspace=createGitWorkspace()}={}) {
   const app=express(),attempts=new Map();app.disable('x-powered-by');
   app.use((req,res,next)=>{res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','same-origin');res.setHeader('X-Frame-Options','DENY');res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");next();});
   app.use('/api',express.json({limit:'100kb'}));
@@ -80,6 +83,9 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     // Distinct, explicit status a UI/automation consumer can branch on for "needs a human to act
     // outside the app" — never collapse this into the generic waiting_input/failed states.
     displayStatus:t.userActionRequired?.status==='pending'?MANUAL_ACTION_DISPLAY_STATUS:t.status,
+    // repositoryPath／workingDirectory 是伺服器磁碟路徑，和 workspace 一樣不送到瀏覽器；
+    // 只送使用者真正需要判讀的 Git 座標：從哪個分支開出、目前在哪個分支、哪兩個 commit。
+    git:t.git?{mode:t.git.mode,baseBranch:t.git.baseBranch,workingBranch:t.git.workingBranch,baseCommit:t.git.baseCommit,headCommit:t.git.headCommit}:t.git,
     workspace:undefined,threads,ownerName:store.user(t.ownerId)?.name,projectName:store.project(t.projectId)?.name,completedSteps:threads.filter(th=>th.phase==='execute'&&th.status==='completed'&&th.result?.passed&&!th.result.questions?.length).length,totalSteps:t.plan?.steps.length||0};}
   app.get('/api/state',async(req,res)=>{
     const browser=await checkClaudeBrowserCapability().catch(error=>({available:false,provider:null,cli:'claude',error:error.message}));
@@ -98,6 +104,31 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/tasks',(req,res)=>res.status(201).json(decorated(store.transaction(()=>createTaskWithProject(store,req.user,req.body)))));
   app.get('/api/tasks/:id',(req,res)=>{const t=requireTask(store,req.user,req.params.id);res.json({...decorated(t),events:store.events(t.id)});});
   app.post('/api/tasks/:id/preflight/retry',(req,res)=>{const t=requireTask(store,req.user,req.params.id);if(!t.environmentIssue||t.environmentIssue.id!==req.body.issueId||t.environmentIssue.planVersion!==t.planVersion||t.status!=='waiting_input')throw new HttpError(409,'環境問題已變更，請重新查看');t.environmentIssue=null;t.dependencyPreflight=null;t.error=null;t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'awaiting_approval';t.controlVersion=(t.controlVersion||0)+1;store.saveTask(t);store.event(t.id,'preflight_approved',`${req.user.name} 核准重新檢查套件環境；通過前不執行工作`);res.json(decorated(t));});
+  // Git 安全守門（未提交修改、受保護分支、巢狀版本庫…）只能由使用者處理完後手動重新檢查。
+  // 這條路徑不執行任何 git 寫入指令，只是清掉問題旗標讓 runner 重跑同一份檢查。
+  app.post('/api/tasks/:id/git/recheck',(req,res)=>{
+    const t=requireTask(store,req.user,req.params.id);
+    if(!t.gitIssue||t.gitIssue.id!==req.body.issueId||t.status!=='waiting_input')throw new HttpError(409,'Git 問題已變更，請重新查看');
+    t.gitIssue=null;t.error=null;t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'planning';t.controlVersion=(t.controlVersion||0)+1;
+    store.saveTask(t);store.event(t.id,'git_rechecked',`${req.user.name} 已處理 Git 狀態並要求重新檢查；通過前不執行工作`);
+    res.json(decorated(t));
+  });
+  // Phase 3：自動流程到「驗證完成」就停住，之後每一步都要人按下去。這些路徑只會執行使用者
+  // 選的那一個動作；TaskFlow 不替他切換分支、不解衝突，也不在沒被要求時刪掉任何分支。
+  app.get('/api/tasks/:id/git/review',(req,res)=>res.json(taskGitReview(store,req.user,req.params.id,{gitWorkspace})));
+  app.post('/api/tasks/:id/git/decision',(req,res)=>{
+    const input=z.object({decision:z.enum(['merge','changes','reject']),artifactVersion:z.string().max(200).optional(),answer:z.string().max(8000).optional(),keepBranch:z.boolean().optional(),cleanup:z.boolean().optional()}).strict().parse(req.body||{});
+    // 不包在 store.transaction 裡：git merge 無法隨資料庫交易一起回滾，
+    // 一旦合併成功卻因後續步驟回滾而在紀錄上消失，比多寫幾次任務更危險。
+    res.json(decorated(decideGitReview(store,req.user,req.params.id,input,{gitWorkspace})));
+  });
+  // 舊的 v1/v2 工作副本只在使用者按下轉換時才會搬進 Git，而且原資料夾一律保留不刪。
+  app.get('/api/tasks/:id/git/legacy',(req,res)=>res.json(legacyWorkspaceStatus(store,req.user,req.params.id)));
+  app.post('/api/tasks/:id/git/migrate',(req,res)=>{z.object({}).strict().parse(req.body||{});res.json(decorated(migrateLegacyWorkspace(store,req.user,req.params.id,{gitWorkspace})));});
+  app.post('/api/tasks/:id/git/rollback',(req,res)=>{
+    const input=z.object({mergeCommit:z.string().min(7).max(64)}).strict().parse(req.body||{});
+    res.json(decorated(rollbackTaskMerge(store,req.user,req.params.id,input,{gitWorkspace})));
+  });
   // 只執行 deterministic recovery（讀已存在的原始回傳並重新整理格式）。這條路徑
   // 沒有任何引擎呼叫，也永遠不會重跑已完成的工作。
   app.post('/api/tasks/:id/output/recover',(req,res)=>{
@@ -116,7 +147,7 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/tasks/:id/user-action/decision',(req,res)=>res.json(decorated(store.transaction(()=>decideManualAction(store,req.user,req.params.id,req.body)))));
   app.post('/api/tasks/:id/action',(req,res)=>{const t=requireTask(store,req.user,req.params.id),action=z.enum(['pause','resume','cancel','stop','retry','publish-approve']).parse(req.body.action),active=store.threads(t.id).some(x=>x.status==='running');
     if(action==='pause'){if(!['planning','repair_planning','awaiting_repair_approval','rate_limited','queued','running'].includes(t.status))throw new HttpError(409,'此狀態無法暫停');t.resumeStatus=t.status==='planning'?'planning':'queued';t.status='paused';}
-    if(['resume','retry'].includes(action)&&(t.outputIssue||t.environmentIssue||t.userActionRequired?.status==='pending'))throw new HttpError(409,'請先審核問題處理方案；不能直接重跑工作');
+    if(['resume','retry'].includes(action)&&(t.outputIssue||t.environmentIssue||t.gitIssue||t.userActionRequired?.status==='pending'))throw new HttpError(409,'請先審核問題處理方案；不能直接重跑工作');
     if(action==='resume'||action==='retry'){if(!['paused','failed'].includes(t.status)||active)throw new HttpError(409,'尚無法恢復，請等待目前工作結束');t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'planning';t.error=null;}
     if(action==='cancel'){if(['completed','cancelled'].includes(t.status))throw new HttpError(409,'任務已結束');t.status='cancelled';runner.stopTask(t.id);}
     if(action==='stop'){if(!active)throw new HttpError(409,'目前沒有正在執行的工作');t.status='paused';t.error='已中止執行，請檢查工作副本後恢復。';runner.stopTask(t.id);}
@@ -155,6 +186,6 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   // Unknown API endpoints must never fall through to the Vue HTML entry point.
   app.use('/api',(req,res)=>res.status(404).json({error:'找不到此功能，服務可能仍在更新，請重新整理後再試。'}));
   if(existsSync(dist)){app.use(express.static(dist));app.get('/{*path}',(req,res)=>res.sendFile(join(dist,'index.html')));}
-  app.use((error,req,res,next)=>{const status=error instanceof z.ZodError?400:error.status||500;res.status(status).json({error:error instanceof z.ZodError?'欄位格式不正確：'+error.issues.map(i=>`${i.path.join('.')} ${i.message}`).join('；'):status===500?'伺服器錯誤；請檢查資料是否重複或服務紀錄。':error.message});if(status===500)console.error(error.message);});
+  app.use((error,req,res,next)=>{const status=error instanceof z.ZodError?400:error.code==='GIT_SAFETY'?409:error.status||500;res.status(status).json({error:error instanceof z.ZodError?'欄位格式不正確：'+error.issues.map(i=>`${i.path.join('.')} ${i.message}`).join('；'):status===500?'伺服器錯誤；請檢查資料是否重複或服務紀錄。':error.message});if(status===500)console.error(error.message);});
   return app;
 }

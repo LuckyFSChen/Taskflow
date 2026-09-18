@@ -39,9 +39,15 @@ export function projectRemovalPlan(store,runner,previews,pid,{dataDir=resolve('d
     if(!/^[0-9a-f-]{36}$/i.test(identifier))throw new HttpError(409,'工作紀錄識別碼不正確，停止刪除');
     const root=canonical(join(data,section)),path=canonical(join(root,identifier));
     if(!contains(data,root)||root===data||!contains(root,path)||path===root)throw new HttpError(409,'工作副本路徑超出管理範圍');
-    paths.push({path,kind:section==='workspaces'?'AI 工作副本（全部版本）':'AI 執行紀錄'});
+    paths.push({path,kind:section==='workspaces'?'AI 工作副本（全部版本）':section==='worktrees'?'AI 任務分支工作目錄（git worktree）':'AI 執行紀錄'});
   };
-  for(const t of tasks){addManaged('workspaces',t.id);if(t.workspace&&!contains(paths.at(-1).path,canonical(t.workspace)))throw new HttpError(409,'工作副本不在此任務的管理目錄，停止刪除');}
+  // 工作目錄可能是舊版 v1/v2 工作副本，也可能是 Git 模式的 worktree；兩個受管理目錄都要一併清除，
+  // 但 task.workspace 仍必須落在其中之一，否則一樣停止刪除，避免刪到管理範圍外的路徑。
+  for(const t of tasks){
+    addManaged('workspaces',t.id);const managed=[paths.at(-1).path];
+    if(t.git?.mode==='worktree'){addManaged('worktrees',t.id);managed.push(paths.at(-1).path);}
+    if(t.workspace&&!managed.some(root=>contains(root,canonical(t.workspace))))throw new HttpError(409,'工作副本不在此任務的管理目錄，停止刪除');
+  }
   for(const th of threads)addManaged('runs',th.id);
   for(const other of store.tasks().filter(t=>t.projectId!==pid&&t.workspace))if(paths.some(p=>overlap(p.path,canonical(other.workspace))))throw new HttpError(409,'刪除範圍與其他任務的工作副本重疊');
   for(const item of paths){if(existsSync(item.path)&&!lstatSync(item.path).isDirectory())throw new HttpError(409,'刪除目標已變更為檔案');item.exists=existsSync(item.path);}
