@@ -111,7 +111,14 @@ export function createProjectPreview({npm=runNpm}={}) {
     try{
       await Promise.race([exitPromise,waitForHealth(url,20000)]);
     }catch(err){
-      killTree(child);
+      // Wait for the child to actually exit before rejecting, so a failed/timed-out startup
+      // never leaves an orphaned process still holding its cwd (and this fixture's temp dir) open.
+      await new Promise(resolveKill=>{
+        if(child.exitCode!==null||child.signalCode){resolveKill();return;}
+        const timer=setTimeout(resolveKill,5000);
+        child.once('exit',()=>{clearTimeout(timer);resolveKill();});
+        killTree(child);
+      });
       throw err;
     }finally{
       exitPromise.catch(()=>{});
