@@ -1,4 +1,5 @@
 import {validatedOutput} from './output-validation.js';
+import {recoverFormatFailure} from './output-recovery.js';
 import {toolAccessFailure} from './validation-skip.js';
 import {writeTaskHandoff} from './handoff.js';
 import {needsPreflight,dependencyPreflight} from './dependency-preflight.js';
@@ -170,7 +171,15 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
         }
       }
       const validator=['plan','repair_plan'].includes(phase)?planSchema:resultSchema;
-      let output=await validatedOutput(adapter,adapterOptions,validator);
+      // Result Recovery 不等於重新執行工作：recoverFormatFailure 只讀已經存在的 raw
+      // output，沒有 adapter 可用，因此不可能重跑 Executor／Reviewer。還原不成功就
+      // 原樣往外拋，維持既有的 Output Issue 流程。
+      let output=await validatedOutput(adapter,adapterOptions,validator).catch(error=>{
+        const recovery=recoverFormatFailure(error,{phase});
+        if(!recovery.ok)throw error;
+        store.event(t.id,'output_recovered',recovery.message,thread.id);
+        return {result:recovery.result,sessionId:error.sessionId};
+      });
       if(['plan','repair_plan'].includes(phase)&&output.result?.questions?.length&&clarificationHistory(t,store.threads(t.id)).length&&(store.task(t.id).controlVersion||0)===controlVersion&&!['paused','cancelled','completed'].includes(store.task(t.id).status)){
         store.event(t.id,'question_check','核對既有回答，避免重複詢問',thread.id);
         output=await validatedOutput(adapter,{...adapterOptions,runDir:join(dataDir,'runs',thread.id,'question-check'),prompt:prompt+'\n提問前最後核對（僅此一次，不執行修正）：以下是本輪草案。逐項核對歷次回答，移除已回答、例行技術選擇或僅說明環境限制的問題，將限制寫入 summary。新且必要的問題保留，不得猜測答案或放寬驗收。回傳完整計畫。\n'+JSON.stringify(output.result)},validator);

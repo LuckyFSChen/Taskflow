@@ -58,7 +58,9 @@ export async function validatedOutput(adapter,options,validator){
   if(!checked.success){
     const issues=checked.error.issues.map(issue=>`${issue.path.join('.')||'根物件'}：${issue.message}`);
     const error=new Error('AI 回傳格式仍不完整，已停止自動處理；需求與進度均保留。\n'+issues.join('\n')+'\n建議：查看保留的原始結果，補充缺失內容或審核重新規劃；不會自動重跑已執行的工作。');
-    error.code='OUTPUT_FORMAT';error.sessionId=output.sessionId;error.issues=issues;error.runDir=options.runDir;throw error;
+    // 交給 Deterministic Recovery 的素材：原始輸出與最後一次無損轉換的結果。
+    // 兩者都只是既有資料，附上它們不會讓任何工作被重新執行。
+    error.code='OUTPUT_FORMAT';error.sessionId=output.sessionId;error.issues=issues;error.runDir=options.runDir;error.rawResult=raw;error.candidate=candidate;throw error;
   }
   return {...output,result:checked.data};
 }
