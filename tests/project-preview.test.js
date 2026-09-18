@@ -1,12 +1,59 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,writeFileSync,mkdirSync,rmSync} from 'node:fs';
-import {join} from 'node:path';
+import {mkdtempSync,writeFileSync,mkdirSync,rmSync,existsSync,readFileSync} from 'node:fs';
+import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {get} from 'node:http';
 import {createProjectPreview} from '../server/project-preview.js';
 import {createStore,id} from '../server/db.js';
 import {createApp} from '../server/app.js';
+
+// Preview db 路徑須與 server/project-preview.js 的 safeKeyFragment() 保持一致，
+// 純為測試清理用，不影響實際實作邏輯。
+const previewDbSlug=key=>key.replace(/[^a-zA-Z0-9_-]/g,'_');
+const previewDbPathFor=key=>resolve('data/preview',previewDbSlug(key),'taskflow.sqlite');
+// killTree() on Windows is fire-and-forget (taskkill runs async), so the OS can still hold a
+// brief file lock on the fixture directory right after stop()/close() resolve; retry the cleanup.
+const rmDirSafe=path=>rmSync(path,{recursive:true,force:true,maxRetries:5,retryDelay:200});
+const fakeNpm=async(path,args)=>{if(args[0]==='install')mkdirSync(join(path,'node_modules'),{recursive:true});};
+function writeFullstackFixture(root,serverSource) {
+  writeFileSync(join(root,'package.json'),JSON.stringify({type:'module',dependencies:{express:'*'},devDependencies:{vite:'*'},scripts:{build:'vite build',start:'node server.js'}}));
+  writeFileSync(join(root,'server.js'),serverSource);
+}
+const FULLSTACK_SERVER_OK=`
+import {createServer} from 'node:http';
+import {writeFileSync} from 'node:fs';
+const port=Number(process.env.PORT);
+const host=process.env.HOST||'127.0.0.1';
+if(process.env.TF_TEST_DUMP_PATH){
+  writeFileSync(process.env.TF_TEST_DUMP_PATH,JSON.stringify({
+    inboxToken:process.env.INBOX_TOKEN||null,
+    lineSecret:process.env.LINE_CHANNEL_SECRET||null,
+    lineToken:process.env.LINE_CHANNEL_ACCESS_TOKEN||null,
+    openaiKey:process.env.OPENAI_API_KEY||null,
+    codexKey:process.env.CODEX_API_KEY||null,
+    anthropicKey:process.env.ANTHROPIC_API_KEY||null,
+    dbFile:process.env.TASKFLOW_DB_FILE||null,
+  }));
+}
+createServer((req,res)=>{
+  const send=(code,body)=>{res.writeHead(code,{'Content-Type':'application/json'});res.end(JSON.stringify(body));};
+  if(req.url==='/api/health'&&req.method==='GET')return send(200,{ok:true});
+  if(req.url==='/api/login'&&req.method==='POST')return send(200,{ok:true,user:{username:'preview-test'}});
+  if(req.url==='/api/state'&&req.method==='GET')return send(200,{state:'ok'});
+  send(404,{error:'not found'});
+}).listen(port,host);
+`;
+const FULLSTACK_SERVER_FAIL=`
+process.stderr.write('FIXTURE_STARTUP_FAILURE: simulated crash\\n');
+process.exit(1);
+`;
+const FULLSTACK_SERVER_HEALTH_NEVER_OK=`
+import {createServer} from 'node:http';
+const port=Number(process.env.PORT);
+const host=process.env.HOST||'127.0.0.1';
+createServer((req,res)=>{res.writeHead(500);res.end('nope');}).listen(port,host);
+`;
 
 test('Local web preview builds once, serves loopback only, stops and surfaces build failures',async t=>{
   const root=mkdtempSync(join(tmpdir(),'tf-preview-'));let calls=[];
@@ -49,3 +96,110 @@ test('Project actions enforce login, membership and task ownership before openin
   assert.equal((await post(`/projects/${pid}/open-folder`,{taskId:tid},a)).status,200);assert.equal(opens,2);
   assert.equal((await post(`/projects/${pid}/preview`,{taskId:tid},a)).status,409);
 });
+
+test('Pure static project (no package.json) is still served by the static preview server',async t=>{
+  const root=mkdtempSync(join(tmpdir(),'tf-preview-static-'));
+  writeFileSync(join(root,'index.html'),'<h1>Static proof</h1>');
+  const preview=createProjectPreview({npm:fakeNpm});
+  t.after(async()=>{await preview.close();rmSync(root,{recursive:true,force:true});});
+  const info=await preview.start('static-project',root);
+  assert.equal(info.kind,'static');
+  assert.match(await (await fetch(info.url)).text(),/Static proof/);
+  assert.equal((await fetch(info.url+'/.env')).status,404);
+});
+
+test('Fullstack project boots its own application server with isolated port, DB, env and one-time credentials',async t=>{
+  const root=mkdtempSync(join(tmpdir(),'tf-preview-fullstack-'));
+  writeFullstackFixture(root,FULLSTACK_SERVER_OK);
+  const dumpPath=join(root,'env-dump.json');
+  const key='fullstack-proj:fullstack-task:1';
+  process.env.TF_TEST_DUMP_PATH=dumpPath;
+  process.env.INBOX_TOKEN='secret-inbox-token';
+  process.env.LINE_CHANNEL_SECRET='secret-line-secret';
+  process.env.LINE_CHANNEL_ACCESS_TOKEN='secret-line-token';
+  process.env.OPENAI_API_KEY='secret-openai';
+  process.env.CODEX_API_KEY='secret-codex';
+  process.env.ANTHROPIC_API_KEY='secret-anthropic';
+  const preview=createProjectPreview({npm:fakeNpm});
+  t.after(async()=>{
+    await preview.close();
+    for(const k of ['TF_TEST_DUMP_PATH','INBOX_TOKEN','LINE_CHANNEL_SECRET','LINE_CHANNEL_ACCESS_TOKEN','OPENAI_API_KEY','CODEX_API_KEY','ANTHROPIC_API_KEY'])delete process.env[k];
+    rmDirSafe(root);
+    rmDirSafe(join('data/preview',previewDbSlug(key)));
+  });
+  const info=await preview.start(key,root);
+  assert.equal(info.kind,'fullstack');
+  assert.match(info.url,/^http:\/\/127\.0\.0\.1:\d+$/);
+  assert.notEqual(new URL(info.url).port,'4310');
+  assert.equal(info.cwd,root);
+  assert.equal(typeof info.pid,'number');
+  assert.equal(info.credentials.username,'taskflow-preview');
+  assert.ok(info.credentials.password&&info.credentials.password.length>10);
+
+  assert.equal((await fetch(info.url+'/api/health')).status,200);
+  const loginRes=await fetch(info.url+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  assert.equal(loginRes.status,200);
+  assert.equal((await fetch(info.url+'/api/state')).status,200);
+
+  const dbPath=previewDbPathFor(key);
+  assert.ok(existsSync(dbPath));
+  assert.notEqual(dbPath,resolve('data/taskflow.sqlite'));
+  assert.match(dbPath,/[\\/]data[\\/]preview[\\/]/);
+
+  const dump=JSON.parse(readFileSync(dumpPath,'utf8'));
+  assert.equal(dump.inboxToken,null);
+  assert.equal(dump.lineSecret,null);
+  assert.equal(dump.lineToken,null);
+  assert.equal(dump.openaiKey,null);
+  assert.equal(dump.codexKey,null);
+  assert.equal(dump.anthropicKey,null);
+  assert.equal(dump.dbFile,dbPath);
+
+  const info2=await preview.start(key+':second',root);
+  t.after(async()=>{await preview.stop(key+':second');rmDirSafe(join('data/preview',previewDbSlug(key+':second')));});
+  assert.notEqual(info2.credentials.password,info.credentials.password);
+
+  await preview.stop(key);
+  assert.equal(preview.status(key),null);
+  await assert.rejects(fetch(info.url));
+});
+
+test('stopProject() tears down every fullstack preview child process for that project',async t=>{
+  const rootA=mkdtempSync(join(tmpdir(),'tf-preview-fs-a-')),rootB=mkdtempSync(join(tmpdir(),'tf-preview-fs-b-'));
+  writeFullstackFixture(rootA,FULLSTACK_SERVER_OK);writeFullstackFixture(rootB,FULLSTACK_SERVER_OK);
+  const keyA='stopproj:taskA:1',keyB='stopproj:taskB:1';
+  const preview=createProjectPreview({npm:fakeNpm});
+  t.after(async()=>{
+    await preview.close();
+    rmDirSafe(rootA);rmDirSafe(rootB);
+    rmDirSafe(join('data/preview',previewDbSlug(keyA)));
+    rmDirSafe(join('data/preview',previewDbSlug(keyB)));
+  });
+  const [infoA,infoB]=await Promise.all([preview.start(keyA,rootA),preview.start(keyB,rootB)]);
+  assert.equal((await fetch(infoA.url+'/api/health')).status,200);
+  assert.equal((await fetch(infoB.url+'/api/health')).status,200);
+  await preview.stopProject('stopproj');
+  assert.equal(preview.status(keyA),null);assert.equal(preview.status(keyB),null);
+  await assert.rejects(fetch(infoA.url));await assert.rejects(fetch(infoB.url));
+});
+
+test('Fullstack preview surfaces collected stderr when the application server exits before health check passes',async t=>{
+  const root=mkdtempSync(join(tmpdir(),'tf-preview-fs-fail-'));
+  writeFullstackFixture(root,FULLSTACK_SERVER_FAIL);
+  const key='failboot:task:1';
+  const preview=createProjectPreview({npm:fakeNpm});
+  t.after(async()=>{await preview.close();rmDirSafe(root);rmDirSafe(join('data/preview',previewDbSlug(key)));});
+  await assert.rejects(preview.start(key,root),/FIXTURE_STARTUP_FAILURE: simulated crash/);
+  assert.equal(preview.status(key),null);
+});
+
+test('Fullstack preview health check timeout rejects and kills the child instead of hanging forever',{timeout:60000},async t=>{
+  const root=mkdtempSync(join(tmpdir(),'tf-preview-fs-timeout-'));
+  writeFullstackFixture(root,FULLSTACK_SERVER_HEALTH_NEVER_OK);
+  const key='healthtimeout:task:1';
+  const preview=createProjectPreview({npm:fakeNpm});
+  t.after(async()=>{await preview.close();rmDirSafe(root);rmDirSafe(join('data/preview',previewDbSlug(key)));});
+  await assert.rejects(preview.start(key,root),/健康檢查逾時/);
+  assert.equal(preview.status(key),null);
+});
+

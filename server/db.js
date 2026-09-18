@@ -10,7 +10,7 @@ export const hash = text => createHash('sha256').update(text).digest('hex');
 export function passwordHash(password) { const salt=randomBytes(16).toString('hex'); return `${salt}:${scryptSync(password,salt,64).toString('hex')}`; }
 export function passwordMatches(password, stored) { const [salt,value]=stored.split(':'); const computed=scryptSync(password,salt,64); const expected=Buffer.from(value,'hex'); return expected.length===computed.length && timingSafeEqual(computed,expected); }
 
-export function createStore(filename=resolve('data/taskflow.sqlite')) {
+export function createStore(filename=resolve(process.env.TASKFLOW_DB_FILE||'data/taskflow.sqlite')) {
   mkdirSync(dirname(filename),{recursive:true});
   const db=new DatabaseSync(filename);
   db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
