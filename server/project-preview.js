@@ -5,12 +5,26 @@ import {dirname,join,resolve,relative,isAbsolute,extname} from 'node:path';
 import {HttpError} from './domain.js';
 import {killTree} from './runner.js';
 
+const KNOWN_SERVER_DEPS=['express','fastify','koa','hapi','restify'];
+// Only a bare `node <relative-file>.js` start script is trusted enough to auto-spawn;
+// anything with flags, env prefixes or shell operators (&&, |, ;, >) falls back to vite/static.
+const SIMPLE_NODE_START=/^node\s+([\w.\-]+(?:\/[\w.\-]+)*\.js)$/;
 export function detectWebProject(path) {
-  try {
-    const pkg=JSON.parse(readFileSync(join(path,'package.json'),'utf8'));
-    if((pkg.dependencies?.vite||pkg.devDependencies?.vite)&&pkg.scripts?.build)return 'vite';
-    return null;
-  } catch {return existsSync(join(path,'index.html'))?'static':null;}
+  let pkg;
+  try {pkg=JSON.parse(readFileSync(join(path,'package.json'),'utf8'));}
+  catch {return existsSync(join(path,'index.html'))?'static':null;}
+  const deps={...pkg.dependencies,...pkg.devDependencies};
+  const hasViteBuild=!!deps.vite&&!!pkg.scripts?.build;
+  const startScript=typeof pkg.scripts?.start==='string'?pkg.scripts.start.trim():null;
+  if(hasViteBuild&&startScript){
+    const match=SIMPLE_NODE_START.exec(startScript);
+    const serverFile=match?.[1];
+    if(serverFile&&!isAbsolute(serverFile)&&!serverFile.split('/').includes('..')&&existsSync(join(path,serverFile))&&KNOWN_SERVER_DEPS.some(dep=>deps[dep])){
+      return 'fullstack';
+    }
+  }
+  if(hasViteBuild)return 'vite';
+  return null;
 }
 export function openFolder(path,{launch=spawn}={}) {
   if(!existsSync(path)||!statSync(path).isDirectory())throw new HttpError(404,'資料夾不存在');
