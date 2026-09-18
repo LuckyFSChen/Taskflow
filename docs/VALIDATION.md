@@ -119,3 +119,71 @@ Explorer 改用可見視窗啟動（windowsHide=false），並要求新視窗，
 - 環境限制列入報告，工具拒絕必須提供具體阻礙，不反覆索取相同同意。
 - npm test：98/98 通過，含問答配對、舊資料還原、工作副本保留、核對次數與核准邊界。
 - 空閒時重新啟動服務，本機 health 與公開恢復檢查成功。沒有變更 runnerEnabled 開關。
+
+## Browser Validation（Claude Code + Playwright MCP）（2026-09-18）
+
+詳細架構、安全限制與已知限制見 `docs/BROWSER-VALIDATION.md`；本節只記錄「實際執行結果」。
+
+### 環境確認
+- `claude --version`：2.1.276，本機可執行。
+- `@playwright/mcp@0.0.40`（devDependency）已安裝於 `node_modules/@playwright/mcp`；其 `package.json`
+  的 `exports` 欄位不公開 `./cli.js`，`resolvePlaywrightMcpEntry()` 改用套件根目錄推導路徑後可正確解析。
+- 直接對 Playwright MCP 送出 MCP `initialize` JSON-RPC 請求（不經過 `claude mcp add`，未寫入任何全域
+  或專案設定檔），收到 `{"serverInfo":{"name":"Playwright","version":"0.0.40"}}`，確認可連線。
+- `checkClaudeBrowserCapability()` 回傳 `{"available":true,"provider":"playwright-mcp","cli":"claude","error":null}`。
+
+### TaskFlow spawn 出來的 Claude 也看得到同一個 MCP（本次最重要的驗證項目）
+既有 `cliAdapter` 呼叫 Claude 時使用 `--strict-mcp-config --setting-sources ''`，完全不依賴使用者
+本機的 `claude mcp add`／`~/.claude.json`／專案 `.mcp.json`；Browser 驗證延續同一機制，每次呼叫都用
+`--mcp-config` 內嵌「只有一個 playwright server」的設定。因此「手動開的 claude 看得到 MCP，TaskFlow
+spawn 的看不到」這個落差問題不存在——兩者本來就是兩條獨立路徑，TaskFlow 這邊永遠自帶設定。已用
+`server/browser-validation-smoke.js`（見下）證實：TaskFlow 的 `runner.js` 真正 spawn 出的 `claude`
+子行程，確實能呼叫 `mcp__playwright__browser_*` 工具。
+
+### 真實整合測試：`node scripts/browser-validation-smoke.js`
+直接呼叫 `createRunner()`／`cliAdapter()`（未 mock），驅動一個「按鈕點擊後顯示彈窗」的靜態 HTML
+fixture，經由 TaskFlow 既有 `project-preview.js` 提供本機預覽網址，交給真實 `claude -p` 子行程搭配
+Playwright MCP 驗證：
+
+| 情境 | Preview URL | 結果 | 真實工具呼叫 |
+| --- | --- | --- | --- |
+| 按鈕正常運作（pass fixture） | http://127.0.0.1:41515 | `browserValidation.status="passed"`，task 狀態 `completed` | `mcp__playwright__browser_navigate`、`browser_click`、`browser_console_messages`、`browser_network_requests`，共 4 次 |
+| 按鈕 onclick 直接 throw（fail fixture，對應「故意加入 runtime browser error」） | http://127.0.0.1:43257 | `browserValidation.status="failed"`，`consoleErrors` 記錄兩筆真實錯誤訊息，task 狀態轉入 `repair_planning`（round=1） | 同上 4 種工具 |
+
+兩種情境的 `browserValidation.toolUsed` 均為 `true`、`toolCallCount=4`，證實不是 AI 自稱測試過，
+而是 TaskFlow 從 `stream-json` 的 `tool_use` 事件實際數出來的呼叫次數（`reconcileBrowserValidation`）。
+pass 情境的 summary／evidence 具體引用了 accessibility snapshot 顯示的「Dialog visible」文字節點；
+fail 情境具體引用了 `Error: browser-validation-test` 的實際 console 訊息與 `#dialog` 的
+`style.display` 仍為 `none`。
+
+### 反造假 deterministic guard（自動測試，`tests/browser-validation.test.js`）
+用假 adapter 模擬「AI 在 `summary`／`browserValidation` 都宣稱 `passed:true`，但 stream-json 沒有任何
+`mcp__playwright__*` 的 tool_use 事件」，最終 `result.passed` 仍被強制改為 `false`，task 進入
+`waiting_input` 並走既有的「驗證工具存取失敗」跳過流程，不會被判定通過。另外用假
+`checkBrowserCapability` 模擬 Playwright MCP 不可用，同樣得到 `status="blocked"`、
+`passed=false`，不會是 silent pass。9 個新測試全數通過（需求判定、反造假、blocked 流程、
+repair 核准後重新驗證並通過）。
+
+### 修復重驗（fail → fix → pass）
+`tests/browser-validation.test.js` 的第三個整合測試（假 adapter，涵蓋完整 Repair Approval 流程）
+證實：第一次審核回報 `browserValidation.status="failed"` → 自動進入 `repair_planning` →
+`awaiting_repair_approval` → 使用者 `approveRepair` 核准 → 執行修正 → 重新走 `review` 階段 →
+第二次 `browserValidation.status="passed"`，task 最終轉為 `completed`。修正輪次與人工核准關卡
+沿用既有機制，沒有讓 AI 自己無限重試。
+
+### 前端 UI
+`/api/state` 新增 `integrations.browser`（`{configured, provider, available, error}`）；設定頁
+「服務連線」面板顯示「Browser 驗證（Playwright MCP）」列（本機測得 `Ready`，綠色徽章）。任務詳情
+的「角色紀錄」在 `browserValidation.required` 為真時，於驗證證據下方顯示 Browser 驗證區塊
+（狀態徽章、Preview URL、工具呼叫次數、checks 清單、console／network 錯誤、notes）；已用真實瀏覽器
+（Playwright，非 MCP，獨立於受測系統）開啟登入後的畫面截圖確認渲染正確，且未產生非預期的
+console error（唯一出現的是登入前 `/api/state` 回傳 401，屬預期行為）。
+
+### 回歸測試
+- `npm test`：147/147 通過（含新增的 9 個 Browser Validation 測試；既有 138 個測試全數維持通過，
+  `resultSchema` 新增的 `browserValidation` 欄位有預設值，不影響舊測試資料或舊任務讀取）。
+- `npm run build`：`vue-tsc --noEmit && vite build` 成功。
+
+### 已知限制
+僅 Chromium headless；不含視覺回歸比對；Codex 引擎的步驟不接 Browser MCP；需求判定為關鍵字
+啟發式，可能有少量假陽性／假陰性。詳見 `docs/BROWSER-VALIDATION.md` 的 Known limitations。

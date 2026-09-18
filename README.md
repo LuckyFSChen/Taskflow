@@ -22,7 +22,7 @@ npm start
 ## 使用順序
 1. 設定 → 新增專案：輸入本機資料夾的絕對路徑與代號。預設勾選「不存在時建立資料夾」，可建立多層新路徑；既有資料夾內容會保留。選擇專門的工作專案，不要選整個磁碟或個人目錄。
 2. 新增成員並勾選可用專案。成員只能看自己的任務；管理者可看所有任務。
-3. 在本機分別完成 `codex login` 與 `claude` 的登入。CLI 路徑可設定於 `.env` 的 CODEX_BIN / CLAUDE_BIN。
+3. 在本機分別完成 `codex login` 與 `claude` 的登入。CLI 路徑可設定於 `.env` 的 CODEX_BIN / CLAUDE_BIN。若要讓前端任務使用實際 Browser 驗證，另外執行 `npm run setup:browser`（詳見 `docs/BROWSER-VALIDATION.md`）；未設定也能使用平台，只是網頁 UI 任務的獨立驗證會回報「Browser MCP 不可用」並導向人工跳過流程，不影響非網頁任務。
 4. 設定 → 啟用 AI 自動領取任務。這會使用你登入的帳號及額度，不會自動切到 API 計費。
 5. 發布任務，選擇類型、專案、優先級與引擎。AI 先唯讀規劃；確認計畫與驗收後核准。
 6. 查看角色紀錄與活動。需要回答時補充需求；新版計畫必須重新審核。
@@ -73,7 +73,27 @@ node --test cloud-inbox/worker.test.js
 # 以下會真正使用已登入 AI 帳號的額度：
 node scripts/smoke-ai.js codex
 node scripts/smoke-ai.js claude
+node scripts/browser-validation-smoke.js
 ```
+
+## 前端驗證的四個層級（不要混為一談）
+
+TaskFlow 對前端的驗證分四種，彼此不能互相替代：
+
+1. **Build Validation**：`vue-tsc --noEmit && vite build` 成功，只代表型別檢查與打包
+   沒有錯誤，不代表頁面在瀏覽器裡能正確運作。
+2. **HTTP Validation**：`server/project-preview.js` 啟動本機預覽並回應 200，只代表
+   靜態檔案伺服得出來，不代表 Vue／React 有 mount、按鈕可點、互動正確。
+3. **Browser Functional Validation**（新）：`requiresBrowserValidation=true` 的任務，
+   由 Claude Code 透過 Playwright MCP 實際在 Chromium 開啟 Preview URL、操作 DOM、
+   檢查 console／network，見 `docs/BROWSER-VALIDATION.md`。這是目前唯一能證明
+   「按鈕真的可點、彈窗真的會開」的方式。
+4. **Manual Visual Validation**：像素級、跨裝置的人工視覺驗收，目前仍需要人工用
+   瀏覽器實際查看；`browser_take_screenshot` 只作為 Browser Functional Validation
+   失敗時的輔助證據，不是像素比對。
+
+「HTTP 200」與「Build 成功」都不能寫成「Browser tested」；只有真的執行了 Browser
+MCP 工具（有 `mcp__playwright__browser_*` 的 tool_use 紀錄）才能算。
 
 ## 第一版的明確限制
 - 雲端收件匣已部署；LINE channel 的密鑰與 webhook 尚待設定，需完成後才能使用真實 LINE。Vue 工作台尚未配置公網隧道。
