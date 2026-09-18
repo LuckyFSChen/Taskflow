@@ -63,3 +63,84 @@
 .health-alert p{margin:0;font-size:.8125rem;line-height:1.7;color:inherit;overflow-wrap:anywhere}
 .health-alert .secondary{margin-left:auto;white-space:nowrap;color:#a2474a;border-color:#eec9c9}
 @media(max-width:600px){.health-groups{grid-template-columns:1fr;gap:16px}.health-head{align-items:flex-start}.health-actions{width:100%;justify-content:space-between}.health-alert{flex-wrap:wrap}.health-alert .secondary{margin-left:0;width:100%}}
+
+/* 建立任務：AI 模式與進階設定（Phase 6） */
+.ai-mode{margin-bottom:18px}
+.field-label{display:block;font-size:.875rem;font-weight:500;line-height:1.6}
+.choice-row{display:flex;gap:18px;flex-wrap:wrap;margin:7px 0 6px}
+.choice{display:flex;align-items:center;gap:7px;margin:0;font-weight:400;cursor:pointer;white-space:nowrap}
+/* 全域的 input{width:100%;min-height:42px} 會把 radio 撐成輸入框大小，
+   再把旁邊的文字擠到換行；與既有 checkbox 的處理方式一致。 */
+.choice input{width:16px;min-height:16px;flex:0 0 auto;margin:0;accent-color:var(--accent)}
+.ai-mode .subtle{margin:0}
+.advanced-toggle{display:flex;align-items:center;gap:6px;background:none;border:0;padding:6px 0;color:#5d7686;font-size:.875rem;font-weight:500;cursor:pointer}
+.advanced-toggle:hover{color:var(--accent)}
+.advanced-toggle svg{transition:transform .15s ease}
+.advanced-toggle svg.open{transform:rotate(90deg)}
+.advanced-panel{margin-top:10px;padding-top:16px;border-top:1px solid var(--line)}
+
+/* Task Detail 資訊分層（Phase 7）
+   概覽 / 執行進度 / 成果 / 技術資訊。技術資訊刻意用中性、低對比的樣式，
+   不跟「需要你處理」的區塊搶視覺，但也沒有被藏起來。 */
+.drawer-tabs button{display:inline-flex;align-items:center;gap:7px}
+.tab-count{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#f0d9a8;color:#8a6420;font-size:.6875rem;font-weight:600;line-height:18px}
+.drawer-tabs button.active .tab-count{background:#e8c477;color:#6f4f16}
+.detail-banner{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:#fff8e9;border:1px solid #f0e2c4;color:#8a6a2e;border-radius:9px;padding:13px 15px;margin-bottom:22px;font-size:.875rem;cursor:pointer}
+.detail-banner:hover{border-color:#e2cd9f}
+.detail-banner-action{display:inline-flex;align-items:center;gap:4px;white-space:nowrap;font-size:.8125rem;font-weight:600}
+.pending-actions{border:1px solid #f0e2c4;background:#fffdf7;border-radius:10px;padding:18px 20px;margin-bottom:24px}
+.pending-actions h3{display:flex;align-items:center;gap:8px;margin:0 0 12px;color:#8a6a2e;font-size:.9375rem}
+.pending-actions ul{list-style:none;padding:0;margin:0;display:grid;gap:12px}
+.pending-actions li strong{display:block;font-size:.875rem;color:#4b5666}
+.pending-actions li small{display:block;margin-top:4px;font-size:.8125rem;line-height:1.7;color:#8b93a1}
+.pending-actions .subtle{margin:14px 0 0}
+.detail-block{border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:24px 0}
+.detail-block h3{margin:0 0 14px}
+.detail-block label{margin:0}
+.detail-block .notice{margin-bottom:14px}
+/* 執行進度：狀態由現有資料推導，沒有百分比條，避免看起來像有人算過完成度。 */
+.progress-summary{border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:20px}
+.progress-summary strong{display:block;font-size:.9375rem}
+.progress-summary small{display:block;margin-top:6px;font-size:.8125rem;line-height:1.7;color:#8b93a1}
+.progress-steps{list-style:none;padding:0;margin:0 0 8px}
+.progress-steps li{display:flex;align-items:flex-start;gap:12px;padding:13px 0;border-bottom:1px solid #edf0f4}
+.progress-steps li:last-child{border-bottom:0}
+.progress-steps strong{display:block;font-size:.875rem;color:#4b5666}
+.progress-steps small{display:block;margin-top:5px;font-size:.75rem;line-height:1.7;color:#8b93a1;overflow-wrap:anywhere}
+.progress-mark{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;flex-shrink:0;border-radius:50%;background:#f0f3f7;color:#8b97a6;font-size:.8125rem;line-height:1}
+.progress-state{font-size:.75rem;color:#96a1af;white-space:nowrap;padding-top:4px}
+.progress-steps li.done .progress-mark{background:#e6f5ee;color:#268673}
+.progress-steps li.active .progress-mark{background:#eaf3fe;color:#2773b7}
+.progress-steps li.active strong{font-weight:650}
+.progress-steps li.blocked .progress-mark{background:#fff5df;color:#a67a2c}
+.progress-steps li.blocked .progress-state{color:#a67a2c}
+.progress-steps li.failed .progress-mark{background:#ffeded;color:#b64c4f}
+.progress-steps li.failed .progress-state{color:#b64c4f}
+.role-row{display:flex;align-items:flex-start;gap:12px;border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px}
+.role-row strong{display:block;font-size:.875rem}
+.role-row small{display:block;margin-top:5px;font-size:.75rem;line-height:1.7;color:#8b93a1;overflow-wrap:anywhere}
+/* 成果：驗證證據依角色分組，沒有證據就直接說沒有，不留空白區塊。 */
+.evidence-block{border:1px solid var(--line);border-radius:10px;padding:15px 17px;margin-bottom:12px}
+.evidence-block strong{font-size:.875rem}
+.evidence-block p{margin:7px 0 0}
+.evidence-block ul{margin:9px 0 0;padding-left:20px}
+.evidence-block li{font-size:.8125rem;color:#728497;line-height:1.9;overflow-wrap:anywhere}
+.browser-validation{border:1px solid var(--line);border-radius:10px;padding:15px 17px;margin-bottom:12px}
+.browser-validation .setting-row{border-top:0;padding-top:0;gap:10px;flex-wrap:wrap;justify-content:flex-start}
+.browser-validation ul{margin:10px 0 0;padding-left:20px}
+.browser-validation li{font-size:.8125rem;color:#728497;line-height:1.9;overflow-wrap:anywhere}
+/* 技術資訊：低調的等寬資料，不搶概覽的視覺。 */
+.tech-facts{display:grid;grid-template-columns:minmax(120px,auto) 1fr;gap:8px 18px;margin:0 0 22px;font-size:.8125rem}
+.tech-facts dt{color:#8b97a6}
+.tech-facts dd{margin:0;color:#4b5666;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.raw-block{background:#f5f7fa;border:1px solid var(--line);border-radius:8px;padding:12px;margin:8px 0 0;max-height:320px;overflow:auto;font-size:.75rem;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
+@media(max-width:600px){
+  .detail-banner{flex-wrap:wrap}
+  .detail-banner-action{margin-left:auto}
+  .pending-actions,.detail-block,.progress-summary{padding:15px 16px}
+  .progress-steps li{flex-wrap:wrap}
+  .progress-state{width:100%;padding-left:36px;padding-top:0}
+  .tech-facts{grid-template-columns:1fr;gap:3px}
+  .tech-facts dd{margin-bottom:9px}
+  .browser-validation .setting-row{flex-direction:column;align-items:flex-start}
+}

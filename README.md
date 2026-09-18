@@ -25,8 +25,36 @@ npm start
 3. 在本機分別完成 `codex login` 與 `claude` 的登入。CLI 路徑可設定於 `.env` 的 CODEX_BIN / CLAUDE_BIN。若要讓前端任務使用實際 Browser 驗證，另外執行 `npm run setup:browser`（詳見 `docs/BROWSER-VALIDATION.md`）；未設定也能使用平台，只是網頁 UI 任務的獨立驗證會回報「Browser MCP 不可用」並導向人工跳過流程，不影響非網頁任務。
 4. 設定 → 啟用 AI 自動領取任務。這會使用你登入的帳號及額度，不會自動切到 API 計費。
 5. 發布任務，選擇類型、專案、優先級與引擎。AI 先唯讀規劃；確認計畫與驗收後核准。
-6. 查看角色紀錄與活動。需要回答時補充需求；新版計畫必須重新審核。
-7. 完成後從成果頁下載工作副本檔案。交付核准只記錄成果版本，合併、部署與對外發送目前由人執行。
+6. 在任務詳情的「概覽」處理待辦、看「執行進度」確認做到哪裡；需要回答時補充需求，新版計畫必須重新審核。
+7. 完成後從「成果」分頁下載工作副本檔案。交付核准只記錄成果版本，合併、部署與對外發送目前由人執行。
+
+## Task Detail 的資訊分層
+
+任務詳情分成四個分頁，把「一般使用者需要的資訊」與「Agent／Developer 技術資訊」
+分開；Debug 能力沒有被移除，只是換了位置。分類與狀態推導集中在
+`src/task-detail-view.js`，Template 只負責畫出來（測試見
+`tests/task-detail-view.test.js`）。
+
+- **概覽**：最上方先列出「需要你處理」的每一件事，再依序放實際的操作區塊
+  （manual action、套件環境、成果報告不完整、驗證跳過、操作核准、修正方案核准、
+  待確認問題），接著才是任務狀態、原始需求、計畫摘要與驗收條件。
+  與「待我處理」列表不同的是：同時成立的待辦會全部列出，不只顯示第一個分類。
+- **執行進度**：把 Plan Step 與 Thread Status 組成一份看得懂的步驟清單
+  （整理需求 → 核准計畫 → 各執行步驟 → 修正輪次 → Browser 驗證 → 最終驗證），
+  每一項標成已完成／進行中／等待你處理／未通過／未驗證／尚未開始。
+  狀態只依現有的真實 state 推導，**不顯示任何完成百分比**；無法判斷的一律「尚未開始」。
+  沒有任務要求 Browser 驗證時，不會憑空長出那一列。
+- **成果**：成果檔案、可確認的驗證證據、Browser 驗證紀錄與發布核准。
+- **技術資訊**：Threads、Session ID、Engine、Plan version、Raw Result、
+  Browser MCP 詳細資料、Execution Log 與 Events。預設低調呈現，不搶主要視覺。
+
+在「概覽」以外的分頁，若還有待處理事項，頂部會顯示一條可點回概覽的提示；
+操作只在概覽提供一份，不重複做第二套按鈕。
+
+`node scripts/preview-task-detail.js` 會在 <http://127.0.0.1:14314> 啟動一份
+拋棄式 fixture（暫存 SQLite，帳號 admin／密碼 task-detail-ui-fixture），
+內含十種狀態各一個任務，供瀏覽器驗證使用。它不啟動 runner、不呼叫任何引擎、
+不送 LINE 通知，一小時後自動關閉並刪除暫存資料。需先 `npm run build`。
 
 ## 排程與恢復
 - 資料寫入 `data/taskflow.sqlite`。每 2.5 秒檢查任務，每 3 秒更新畫面。
@@ -74,6 +102,12 @@ node --test cloud-inbox/worker.test.js
 node scripts/smoke-ai.js codex
 node scripts/smoke-ai.js claude
 node scripts/browser-validation-smoke.js
+```
+
+UI 版面驗證（不使用任何 AI 額度，不啟動 runner）：
+```powershell
+npm run build
+node scripts/preview-task-detail.js   # http://127.0.0.1:14314
 ```
 
 ## 前端驗證的四個層級（不要混為一談）
