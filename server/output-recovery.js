@@ -23,6 +23,18 @@ import {resultSchema} from './domain.js';
 // 只有 result schema 的階段適用；plan／repair_plan 缺的是 steps 與 acceptance，
 // 沒有任何安全的補值方式，必須維持原本的 Output Issue。
 export const RECOVERABLE_PHASES=['execute','repair','review'];
+export function recoverablePhase(phase){return RECOVERABLE_PHASES.includes(phase);}
+
+// 還原失敗時「到底還缺什麼」以欄位代號回報（summary／evidence／…），讓 UI 能翻成
+// 使用者看得懂的字，而不是把 Zod 的原始訊息當成主要畫面。
+function missingFromIssues(issues){
+  const fields=[];
+  for(const issue of issues||[]){
+    const field=String(issue?.path?.[0]||'').trim();
+    if(field&&!fields.includes(field))fields.push(field);
+  }
+  return fields;
+}
 
 const SUMMARY_LIMIT=4000,LINE_LIMIT=400,EVIDENCE_LIMIT=40,ARTIFACT_LIMIT=50;
 
@@ -100,7 +112,7 @@ export function deterministicResultRecovery(raw){
 
   // 規則 1：summary 一定來自原始輸出，找不到就失敗。
   const summary=structured?text(structured.summary):text(value);
-  if(!summary)return {ok:false,reason:'原始輸出沒有可用的 summary，Recovery 失敗；不得自行虛構摘要。',notes,source:structured?'structured':'text'};
+  if(!summary)return {ok:false,reason:'原始輸出沒有可用的 summary，Recovery 失敗；不得自行虛構摘要。',missing:['summary'],notes,source:structured?'structured':'text'};
 
   const corpus=structured
     ?[text(structured.summary),...(Array.isArray(structured.evidence)?structured.evidence.filter(e=>typeof e==='string'):[text(structured.evidence)])].filter(Boolean).join('\n')
@@ -119,7 +131,7 @@ export function deterministicResultRecovery(raw){
   // evidence 補值的理由相同：宣稱做完卻拿不出任何證據的結果，必須讓人看過。
   // 原始輸出明確給了空陣列則屬於它自己的陳述，照樣沿用。
   const recoveredEvidence=evidence||extractEvidence(corpus);
-  if(!evidence&&!recoveredEvidence.length)return {ok:false,reason:'原始輸出沒有任何可確認的執行證據，Recovery 失敗；不得創造 evidence。',notes,source:structured?'structured':'text'};
+  if(!evidence&&!recoveredEvidence.length)return {ok:false,reason:'原始輸出沒有任何可確認的執行證據，Recovery 失敗；不得創造 evidence。',missing:['evidence'],notes,source:structured?'structured':'text'};
 
   const candidate={
     summary:summary.slice(0,SUMMARY_LIMIT),
@@ -134,8 +146,8 @@ export function deterministicResultRecovery(raw){
   if(!candidate.passed)notes.push('passed 未知時一律 false，不從「工作完成」之類的文字推論。');
 
   const checked=resultSchema.safeParse(candidate);
-  if(!checked.success)return {ok:false,reason:'還原後的結果仍不符合 Result Schema：'+checked.error.issues.map(i=>`${i.path.join('.')||'根物件'} ${i.message}`).join('；'),notes,source:structured?'structured':'text'};
-  return {ok:true,result:checked.data,notes,source:structured?'structured':'text'};
+  if(!checked.success)return {ok:false,reason:'還原後的結果仍不符合 Result Schema：'+checked.error.issues.map(i=>`${i.path.join('.')||'根物件'} ${i.message}`).join('；'),missing:missingFromIssues(checked.error.issues),notes,source:structured?'structured':'text'};
+  return {ok:true,result:checked.data,missing:[],notes,source:structured?'structured':'text'};
 }
 
 function saveRecovery(runDir,payload){
@@ -146,11 +158,11 @@ function saveRecovery(runDir,payload){
 
 // runner 的單一進入點。回傳 {ok:false} 時，呼叫端維持原本的 Output Issue 流程。
 export function recoverFormatFailure(error,{phase,runDir=error?.runDir}={}){
-  if(error?.code!=='OUTPUT_FORMAT')return {ok:false,reason:'不是輸出格式問題，不進行 Result Recovery。'};
-  if(!RECOVERABLE_PHASES.includes(phase))return {ok:false,reason:`${phase} 階段不套用 Result Recovery；計畫缺少的內容沒有安全的補值方式。`};
+  if(error?.code!=='OUTPUT_FORMAT')return {ok:false,reason:'不是輸出格式問題，不進行 Result Recovery。',missing:[],notes:[]};
+  if(!RECOVERABLE_PHASES.includes(phase))return {ok:false,reason:`${phase} 階段不套用 Result Recovery；計畫缺少的內容沒有安全的補值方式。`,missing:[],notes:[]};
   const recovery=deterministicResultRecovery(error.candidate!==undefined?error.candidate:error.rawResult);
-  saveRecovery(runDir,{ok:recovery.ok,source:recovery.source,reason:recovery.reason||null,notes:recovery.notes,result:recovery.result||null,at:new Date().toISOString(),issues:error.issues||[]});
-  if(!recovery.ok)return {ok:false,reason:recovery.reason,notes:recovery.notes};
-  return {ok:true,result:recovery.result,notes:recovery.notes,
+  saveRecovery(runDir,{ok:recovery.ok,source:recovery.source,reason:recovery.reason||null,missing:recovery.missing||[],notes:recovery.notes,result:recovery.result||null,at:new Date().toISOString(),issues:error.issues||[]});
+  if(!recovery.ok)return {ok:false,reason:recovery.reason,missing:recovery.missing||[],notes:recovery.notes};
+  return {ok:true,result:recovery.result,missing:[],notes:recovery.notes,
     message:`AI 回傳格式不完整，已從原始輸出還原結果（來源：${recovery.source==='text'?'原始文字':'結構化輸出'}），未重新執行任何工作。${recovery.notes.join('')}`};
 }

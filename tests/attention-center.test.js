@@ -59,7 +59,8 @@ test('沒有 report 時，環境問題原因只取訊息第一行',()=>{
 test('outputIssue 分類為格式不完整，且不把原始欄位錯誤顯示在列表',()=>{
   const category=attentionCategory(base({status:'waiting_input',outputIssue:{id:'o1',message:'AI 回傳格式仍不完整\nquestions：Required\nartifacts：Required\npassed：Required',issues:['questions：Required','artifacts：Required','passed：Required']}}));
   assert.equal(category.type,'output_issue');
-  assert.equal(category.title,'AI 已完成部分工作，但成果報告格式不完整');
+  assert.equal(category.title,'成果報告不完整');
+  assert.match(category.description,/不會重新執行已完成工作/);
   const shown=`${category.title} ${category.description} ${category.reason}`;
   assert.doesNotMatch(shown,/Required/);
   assert.doesNotMatch(shown,/questions|artifacts|passed/);

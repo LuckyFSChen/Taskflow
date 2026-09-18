@@ -251,3 +251,179 @@ test('無法還原時維持原本的 Output Issue，而且不重跑工作',async
   await runner.tick();
   assert.equal(executions,1,'Output Issue 待審核期間不得自動重跑');
 });
+
+// ===== Phase 5：Output Recovery UI 與人工處理流程 =====================================
+// 使用者按下「重新整理成果報告」時，TaskFlow 只能重讀已經存在的原始回傳。
+// 下面的測試除了驗證流程，也直接守住「不呼叫 Agent、不重跑已完成工作」這條紅線。
+import {createApp as createAppForOutput} from '../server/app.js';
+import {outputIssueRecoverable,recoveryCandidate,originalOutput} from '../server/output-issue.js';
+
+// 一個已經停在 Output Issue 的任務（例如 Phase 4 之前留下的紀錄）：計畫已核准、
+// 工作副本與執行紀錄都在，只有成果報告的格式不完整。
+function stuckTask(t,{raw,phase='execute',plan:taskPlan=plan,type='research'}){
+  const dir=mkdtempSync(join(tmpdir(),'tf-output5-'));
+  const s=createStore(join(dir,'db.sqlite'));
+  const owner=s.addUser('Owner','owner','test-password'),other=s.addUser('Other','other','test-password');
+  const source=join(dir,'source');mkdirSync(source);
+  const pid=id();
+  s.db.prepare('INSERT INTO projects VALUES (?,?,?,?)').run(pid,'demo','Demo',source);
+  s.db.prepare('INSERT INTO memberships VALUES (?,?)').run(owner.id,pid);
+  let adapterCalls=0;
+  const runner=createRunner(s,{recover:false,dataDir:join(dir,'runtime'),adapter:async o=>{
+    adapterCalls++;
+    if(o.readOnly)return {result:taskPlan};
+    return {result:{...good,summary:`${phase} 重跑`}};
+  }});
+  const task=createTask(s,owner,{title:'文件工作',description:'完成文件並驗證',projectId:pid,type});
+  task.plan=taskPlan;task.approvedVersion=1;task.status='waiting_input';
+  task.workspace=join(dir,'runtime','workspaces',task.id,'v1');mkdirSync(task.workspace,{recursive:true});
+  const runDir=join(dir,'runtime','runs','thread-1');
+  mkdirSync(runDir,{recursive:true});
+  writeFileSync(join(runDir,'original-output.json'),JSON.stringify({result:raw,error:'AI 回傳格式仍不完整',sessionId:'session-1'}));
+  const thread={id:'thread-1',taskId:task.id,version:1,round:0,phase,engine:'codex',role:phase==='review'?'獨立驗證':'作者',title:'建立文件',status:'failed',started:'2026-01-01T00:00:00.000Z',finished:'2026-01-01T00:05:00.000Z',summary:null,result:null,sessionId:'session-1',error:'AI 回傳格式仍不完整'};
+  s.saveThread(thread);
+  task.outputIssue={id:'issue-1',threadId:thread.id,phase,planVersion:1,message:'AI 回傳格式仍不完整\nquestions：Required',at:'2026-01-01T00:05:00.000Z',issues:['questions：Required'],runDir,recovery:null};
+  s.saveTask(task);
+  const app=createAppForOutput(s,runner,{dist:join(dir,'no-dist')});
+  const server=app.listen(0,'127.0.0.1');
+  for(const u of [owner,other])s.db.prepare('INSERT INTO sessions VALUES (?,?,?)').run(hash(u.id),u.id,Date.now()+60000);
+  t.after(()=>new Promise(r=>server.close(r)));
+  t.after(()=>runner.stop());
+  t.after(()=>{s.close();rmSync(dir,{recursive:true,force:true});});
+  const ready=new Promise(r=>server.once('listening',r));
+  const call=async(path,body,u=owner)=>{
+    await ready;
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/api/tasks/${task.id}${path}`,{
+      method:body===undefined?'GET':'POST',
+      headers:body===undefined?{cookie:'tf_session='+u.id}:{cookie:'tf_session='+u.id,'Content-Type':'application/json'},
+      body:body===undefined?undefined:JSON.stringify(body)});
+    return {status:response.status,body:await response.json()};
+  };
+  return {s,runner,task,owner,other,call,runDir,counts:()=>adapterCalls};
+}
+
+test('Phase 5：重新整理成果報告成功時清除 Output Issue，並依原本流程繼續下一個安全階段',async t=>{
+  const ctx=stuckTask(t,{raw:{summary:'修改 src/App.vue。npm run build 通過。',passed:true,artifacts:'src/App.vue'}});
+  const before=ctx.s.task(ctx.task.id);
+  assert.equal(outputIssueRecoverable(before),true,'原始回傳還在磁碟上時應該可以重新整理');
+
+  const {status,body}=await ctx.call('/output/recover',{issueId:'issue-1'});
+  assert.equal(status,200);
+  assert.equal(body.recovery.ok,true);
+  assert.equal(ctx.counts(),0,'重新整理成果報告不得呼叫任何引擎');
+
+  const after=ctx.s.task(ctx.task.id);
+  assert.ok(!after.outputIssue,'Schema 完整後必須清除 outputIssue');
+  const thread=ctx.s.threads(ctx.task.id).find(th=>th.id==='thread-1');
+  assert.equal(thread.status,'completed');
+  assert.equal(thread.result.summary,'修改 src/App.vue。npm run build 通過。');
+  assert.deepEqual(thread.result.evidence,['npm run build 通過'],'evidence 只能來自原始回傳');
+  assert.deepEqual(thread.result.artifacts,['src/App.vue']);
+  assert.equal(after.status,'queued','已通過的步驟依原本流程進入下一個安全階段');
+  assert.ok(ctx.s.events(ctx.task.id).some(e=>e.kind==='output_recovered'),'必須留下可追查的事件');
+});
+
+test('Phase 5：重新整理後只會前進到下一個安全階段，已完成的步驟不會被重跑',async t=>{
+  const ctx=stuckTask(t,{raw:{summary:'修改 src/App.vue。npm run build 通過。',passed:true}});
+  await ctx.call('/output/recover',{issueId:'issue-1'});
+  assert.equal(ctx.counts(),0);
+  ctx.s.setSetting('runnerEnabled',true);
+  await ctx.runner.tick();
+  const threads=ctx.s.threads(ctx.task.id);
+  assert.equal(threads.filter(th=>th.phase==='execute').length,1,'已完成的執行步驟不得被重新執行');
+  assert.equal(threads.filter(th=>th.phase==='review').length,1,'應接續到既有的獨立驗證階段');
+  assert.equal(ctx.counts(),1,'唯一的引擎呼叫來自下一個階段，不是重跑');
+});
+
+test('Phase 5：還原後 passed=false 不會直接 Completed，而是進入既有 Review／Validation 流程',async t=>{
+  const ctx=stuckTask(t,{phase:'review',raw:{summary:'驗證完成。npm test 通過。'}});
+  const {body}=await ctx.call('/output/recover',{issueId:'issue-1'});
+  assert.equal(body.recovery.ok,true);
+  const after=ctx.s.task(ctx.task.id);
+  assert.notEqual(after.status,'completed','recovered passed=false 絕不能直接完成任務');
+  assert.equal(after.status,'repair_planning','未通過的驗證走既有的修正方案流程');
+  assert.ok(after.validationFailure,'必須保留這次驗證結果供既有流程使用');
+  assert.equal(ctx.counts(),0);
+});
+
+test('Phase 5：Recovery 失敗時維持 Output Issue，並回報目前仍缺少哪些內容',async t=>{
+  const ctx=stuckTask(t,{raw:{summary:'修改完成，已經處理好了。'}});   // 沒有任何可確認的執行證據
+  const {status,body}=await ctx.call('/output/recover',{issueId:'issue-1'});
+  assert.equal(status,200);
+  assert.equal(body.recovery.ok,false);
+  assert.deepEqual(body.recovery.missing,['evidence']);
+  assert.doesNotMatch(JSON.stringify(body.recovery),/npm run build/,'不得為了湊齊格式而創造證據');
+
+  const after=ctx.s.task(ctx.task.id);
+  assert.ok(after.outputIssue,'還原失敗必須保持 Output Issue');
+  assert.equal(after.status,'waiting_input');
+  assert.deepEqual(after.outputIssue.recovery.missing,['evidence']);
+  assert.equal(outputIssueRecoverable(after),false,'已經失敗過的還原不再提供注定失敗的按鈕');
+  assert.equal(body.outputIssue.recoverable,false);
+  assert.equal(ctx.counts(),0,'失敗的還原同樣不得呼叫引擎');
+  assert.equal(ctx.s.threads(ctx.task.id).find(th=>th.id==='thread-1').status,'failed','失敗時不得偽造已完成的工作階段');
+});
+
+test('Phase 5：plan 階段的 Output Issue 不套用還原，仍只能補充需求並重新規劃',async t=>{
+  const ctx=stuckTask(t,{phase:'plan',raw:{summary:'計畫摘要'}});
+  assert.equal(outputIssueRecoverable(ctx.s.task(ctx.task.id)),false);
+  const {body}=await ctx.call('/output/recover',{issueId:'issue-1'});
+  assert.equal(body.recovery.ok,false);
+  assert.match(body.recovery.reason,/重新規劃/);
+  assert.ok(ctx.s.task(ctx.task.id).outputIssue);
+  assert.equal(ctx.counts(),0);
+});
+
+test('Phase 5：查看原始回傳只顯示已保存的內容，不做任何解讀',async t=>{
+  const ctx=stuckTask(t,{raw:{summary:'修改完成',questions:[]}});
+  const {status,body}=await ctx.call('/output/original');
+  assert.equal(status,200);
+  assert.equal(body.available,true);
+  assert.equal(body.sessionId,'session-1');
+  assert.match(body.raw,/修改完成/);
+  assert.deepEqual(body.issues,['questions：Required']);
+  assert.equal(ctx.counts(),0);
+});
+
+test('Phase 5：只有任務擁有者能重新整理，且過期的問題編號會被拒絕',async t=>{
+  const ctx=stuckTask(t,{raw:{summary:'修改 src/App.vue。npm run build 通過。'}});
+  assert.equal((await ctx.call('/output/recover',{issueId:'issue-1'},ctx.other)).status,404);
+  assert.equal((await ctx.call('/output/original',undefined,ctx.other)).status,404);
+  assert.equal((await ctx.call('/output/recover',{issueId:'stale'})).status,409);
+  assert.equal((await ctx.call('/output/recover',{issueId:'issue-1'})).status,200);
+  // 還原成功後 Output Issue 已經不存在，重複點擊不會再套用一次。
+  assert.equal((await ctx.call('/output/recover',{issueId:'issue-1'})).status,409);
+  assert.equal(ctx.counts(),0);
+});
+
+test('Phase 5：送到瀏覽器的 Output Issue 不含伺服器磁碟路徑，但帶著能否重新整理的結論',async t=>{
+  const ctx=stuckTask(t,{raw:{summary:'修改 src/App.vue。npm run build 通過。'}});
+  const {body}=await ctx.call('/output/original');
+  assert.ok(body.available);
+  const state=await ctx.call('/output/recover',{issueId:'stale'});
+  assert.equal(state.status,409);
+  const task=ctx.s.task(ctx.task.id);
+  assert.ok(task.outputIssue.runDir,'伺服器端仍保留 runDir 以便重新整理');
+  assert.equal(recoveryCandidate(task.outputIssue).summary,'修改 src/App.vue。npm run build 通過。');
+  assert.equal(originalOutput(task.outputIssue).sessionId,'session-1');
+});
+
+test('Phase 5：自動還原失敗的結論會寫進 Output Issue，使用者直接看到仍缺少什麼',async t=>{
+  const dir=fixture(t,false),s=createStore(join(dir,'db.sqlite'));
+  t.after(()=>{s.close();rmSync(dir,{recursive:true,force:true});});
+  const u=s.addUser('Owner','owner','test-password'),pid=id(),source=join(dir,'source');mkdirSync(source);
+  s.db.prepare('INSERT INTO projects VALUES (?,?,?,?)').run(pid,'demo','Demo',source);
+  s.db.prepare('INSERT INTO memberships VALUES (?,?)').run(u.id,pid);
+  const runner=createRunner(s,{recover:false,dataDir:join(dir,'runtime'),adapter:async o=>{
+    if(o.readOnly)return {result:{...plan,steps:[{title:'建立文件',role:'作者',instructions:'寫入文件'}]}};
+    return {result:{questions:[],artifacts:[]}};   // 沒有 summary
+  }});
+  t.after(()=>runner.stop());s.setSetting('runnerEnabled',true);
+  const task=createTask(s,u,{title:'文件工作',description:'完成文件並驗證',projectId:pid,type:'research'});
+  await runner.tick();approveTask(s,u,task.id,1);await runner.tick();
+  const after=s.task(task.id);
+  assert.ok(after.outputIssue);
+  assert.equal(after.outputIssue.recovery.ok,false);
+  assert.deepEqual(after.outputIssue.recovery.missing,['summary']);
+  assert.equal(outputIssueRecoverable(after),false);
+});

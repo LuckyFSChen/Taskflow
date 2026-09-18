@@ -78,6 +78,55 @@ export function cliAdapter({engine,prompt,cwd,schema,readOnly,runDir,onEvent,onP
   });
 }
 export function runnerLimit(store){const value=store.setting('runnerMaxConcurrent',1);return Number.isSafeInteger(value)&&value>=1&&value<=32?value:1;}
+
+// 一般執行與 Output Recovery 共用的 deterministic guards。抽出來的唯一理由是：
+// 還原後的結果必須走「完全相同」的安全檢查，不能因為它來自 Recovery 就寬鬆。
+// 這裡不呼叫任何引擎，只依既有證據調整 result。
+export function applyResultGuards(result,{phase,browserEvidence,browserRequirement,workingDirectory,threadId,planVersion}){
+  if(!['execute','repair','review'].includes(phase))return result;
+  // Deterministic guard: what the AI narrates in browserValidation is reconciled against
+  // the actual mcp__playwright__* tool_use events observed in the stream-json transcript.
+  // AI says passed=true + browser required but never actually executed → still not passed.
+  result.browserValidation=reconcileBrowserValidation(result.browserValidation,browserEvidence,browserRequirement);
+  if(phase==='review'&&result.browserValidation.required&&(!result.browserValidation.executed||result.browserValidation.passed!==true)){
+    result.passed=false;
+    // Route a blocked (unavailable/unused) Browser MCP through the existing tool-access-failure
+    // skip flow, so a human explicitly decides to wait or accept it as unverified — never silent pass.
+    if(result.browserValidation.status==='blocked')result.evidence=[...result.evidence,`驗證工具存取失敗：Browser MCP（${result.browserValidation.error||'unavailable'}）`];
+  }
+  // Deterministic guard: an approval/elevation/policy block is environment-restricted,
+  // not a program failure — never let it fall into the ordinary failed/repair-retry path.
+  const manualAction=detectManualActionRequirement({summary:result.summary,evidence:result.evidence,selfReport:result.userActionRequired});
+  if(manualAction){result.passed=false;result.userActionRequired=buildUserActionRequest({detection:manualAction,selfReport:result.userActionRequired,workingDirectory,phase,threadId,planVersion,rawMessage:[result.summary,...(result.evidence||[])].join('\n')});}
+  return result;
+}
+
+// 一個階段的結果決定任務下一步。Output Recovery 也走這裡，確保「依原本流程繼續
+// 下一個安全階段」不是另寫一套判斷：passed=false 永遠不會變成 completed，
+// review 未通過仍然進入既有的 Validation／Repair 流程。
+export function applyPhaseResult(store,t,thread,phase,result,{wasPaused=false}={}){
+  if(result.userActionRequired?.required){
+    t.validationReviewPending=false;t.questions=[];t.userActionRequired=result.userActionRequired;t.status='waiting_input';
+    store.event(t.id,'needs_user_action',`偵測到需要使用者手動操作：${t.userActionRequired.reason}`,thread.id);
+    store.notify(t,`需要你的協助：目前執行環境無法完成此操作，請依步驟手動執行後回報。\n${t.userActionRequired.instructions}`);
+  }
+  else if(phase==='plan'){t.plan=result;t.questions=result.questions;t.status=result.questions.length?'waiting_input':'awaiting_approval';store.notify(t,result.questions.length?`需要你回答：\n${result.questions.join('\n')}`:`計畫 v${t.planVersion} 已完成，請點「查看任務」閱讀並審核。`);}
+  else if(phase==='repair_plan'){
+    t.repairPlan={...result,id:id(),round:t.round,planVersion:t.planVersion};t.approvedRepairId=null;t.repairApproval=null;t.status='awaiting_repair_approval';
+    store.notify(t,`第 ${t.round} 輪修正方案已提出，請查看驗證問題、原因與解法，核准後才會修正。`);
+  }
+  else if(phase==='review'){
+    t.validationReviewPending=false;
+    if(result.passed&&result.evidence.length&&!result.questions.length){t.status='completed';t.artifactVersion=id();store.notify(t,t.validationSkips?.some(s=>s.planVersion===t.planVersion)?'其餘驗證完成；部分工具受限項目經同意跳過，仍標示未驗證。可於網頁查看成果。':'驗證完成，可於網頁查看成果。');}
+    else if(toolAccessFailure(result)){t.validationFailure={...result,threadId:thread.id,at:now()};t.questions=[];t.status='waiting_input';store.notify(t,'驗證工具存取失敗，請查看任務選擇「跳過受限驗證並繼續」或「不跳過，等待處理」。');}
+    else {t.round++;t.validationFailure={...result,threadId:thread.id,at:now()};t.repairPlan=null;t.approvedRepairId=null;t.repairApproval=null;t.repairFeedback='';t.status='repair_planning';store.event(t.id,'repair_analysis',`驗證未通過，先分析第 ${t.round} 輪修正方案，未核准前不修正`);store.notify(t,'驗證未通過，正在分析問題與修正方案；方案完成後等待你審核。');}
+  }
+  else if(result.questions.length){t.questions=result.questions;t.status='waiting_input';store.notify(t,`需要確認：\n${result.questions.join('\n')}`);}
+  else if(!result.passed){t.status='waiting_input';if(toolAccessFailure(result)){t.questions=[];store.notify(t,'步驟驗證受限，尚未通過。請開啟任務選擇是否跳過受限檢查；保留原計畫與成果。');}else{t.questions=['此步驟未通過驗收：'+result.summary];store.notify(t,t.questions[0]);}}else t.status='queued';
+  if(wasPaused&&['queued','running','repair_planning','awaiting_repair_approval'].includes(t.status)){t.resumeStatus='queued';t.status='paused';}
+  store.saveTask(t);store.event(t.id,'finished',`${thread.role}：${result.summary}`,thread.id);
+  return t;
+}
 export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),recover=true,clock=Date.now,previews=createProjectPreview(),checkBrowserCapability=checkClaudeBrowserCapability}={}) {
   const active=new Map();let stopping=false;
   if(recover)for(const t of store.tasks()){const active=store.threads(t.id).filter(x=>x.status==='running');if(active.length||t.status==='running'){if(['completed','cancelled'].includes(t.status)){for(const th of active){th.status='cancelled';th.finished=now();store.saveThread(th);}continue;}for(const th of active){th.status='failed';th.error='上次執行中斷，需人工確認';th.finished=now();store.saveThread(th);}t.status='paused';t.error='偵測到未完成的執行；請檢查工作紀錄後重試或補充需求。';t.resumeStatus=t.plan?'queued':'planning';store.saveTask(t);store.event(t.id,'recovery',t.error);}}
@@ -176,7 +225,9 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
       // 原樣往外拋，維持既有的 Output Issue 流程。
       let output=await validatedOutput(adapter,adapterOptions,validator).catch(error=>{
         const recovery=recoverFormatFailure(error,{phase});
-        if(!recovery.ok)throw error;
+        // 還原失敗的結論一併帶進 Output Issue：使用者看到的是「目前仍缺少什麼」，
+        // 而且已經自動試過的還原不會再讓他按一次注定失敗的按鈕。
+        if(!recovery.ok){error.recovery={ok:false,reason:recovery.reason,missing:recovery.missing||[],notes:recovery.notes||[],at:now()};throw error;}
         store.event(t.id,'output_recovered',recovery.message,thread.id);
         return {result:recovery.result,sessionId:error.sessionId};
       });
@@ -186,45 +237,11 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
       }
       if((store.task(t.id).controlVersion||0)!==controlVersion){thread.status='cancelled';thread.finished=now();thread.summary='工作已由使用者結束，晚到的 AI 結果未套用。';store.saveThread(thread);return;}
       const result=['plan','repair_plan'].includes(phase)?planSchema.parse(output.result):resultSchema.parse(output.result);
-      if(['execute','repair','review'].includes(phase)){
-        // Deterministic guard: what the AI narrates in browserValidation is reconciled against
-        // the actual mcp__playwright__* tool_use events observed in the stream-json transcript.
-        // AI says passed=true + browser required but never actually executed → still not passed.
-        result.browserValidation=reconcileBrowserValidation(result.browserValidation,output.browserEvidence,browserRequirement);
-        if(phase==='review'&&result.browserValidation.required&&(!result.browserValidation.executed||result.browserValidation.passed!==true)){
-          result.passed=false;
-          // Route a blocked (unavailable/unused) Browser MCP through the existing tool-access-failure
-          // skip flow, so a human explicitly decides to wait or accept it as unverified — never silent pass.
-          if(result.browserValidation.status==='blocked')result.evidence=[...result.evidence,`驗證工具存取失敗：Browser MCP（${result.browserValidation.error||'unavailable'}）`];
-        }
-        // Deterministic guard: an approval/elevation/policy block is environment-restricted,
-        // not a program failure — never let it fall into the ordinary failed/repair-retry path.
-        const manualAction=detectManualActionRequirement({summary:result.summary,evidence:result.evidence,selfReport:result.userActionRequired});
-        if(manualAction){result.passed=false;result.userActionRequired=buildUserActionRequest({detection:manualAction,selfReport:result.userActionRequired,workingDirectory:t.workspace,phase,threadId:thread.id,planVersion:t.planVersion,rawMessage:[result.summary,...(result.evidence||[])].join('\n')});}
-      }
+      applyResultGuards(result,{phase,browserEvidence:output.browserEvidence,browserRequirement,workingDirectory:t.workspace,threadId:thread.id,planVersion:t.planVersion});
       thread.status='completed';thread.finished=now();thread.result=result;thread.summary=result.summary;thread.sessionId=output.sessionId;store.saveThread(thread);
       const current=store.task(t.id);if(current.status==='cancelled'||(current.status==='paused'&&current.error==='已中止執行，請檢查工作副本後恢復。'))return;
       const wasPaused=current.status==='paused';Object.assign(t,current);t.error=null;
-      if(result.userActionRequired?.required){
-        t.validationReviewPending=false;t.questions=[];t.userActionRequired=result.userActionRequired;t.status='waiting_input';
-        store.event(t.id,'needs_user_action',`偵測到需要使用者手動操作：${t.userActionRequired.reason}`,thread.id);
-        store.notify(t,`需要你的協助：目前執行環境無法完成此操作，請依步驟手動執行後回報。\n${t.userActionRequired.instructions}`);
-      }
-      else if(phase==='plan'){t.plan=result;t.questions=result.questions;t.status=result.questions.length?'waiting_input':'awaiting_approval';store.notify(t,result.questions.length?`需要你回答：\n${result.questions.join('\n')}`:`計畫 v${t.planVersion} 已完成，請點「查看任務」閱讀並審核。`);}
-      else if(phase==='repair_plan'){
-        t.repairPlan={...result,id:id(),round:t.round,planVersion:t.planVersion};t.approvedRepairId=null;t.repairApproval=null;t.status='awaiting_repair_approval';
-        store.notify(t,`第 ${t.round} 輪修正方案已提出，請查看驗證問題、原因與解法，核准後才會修正。`);
-      }
-      else if(phase==='review'){
-        t.validationReviewPending=false;
-        if(result.passed&&result.evidence.length&&!result.questions.length){t.status='completed';t.artifactVersion=id();store.notify(t,t.validationSkips?.some(s=>s.planVersion===t.planVersion)?'其餘驗證完成；部分工具受限項目經同意跳過，仍標示未驗證。可於網頁查看成果。':'驗證完成，可於網頁查看成果。');}
-        else if(toolAccessFailure(result)){t.validationFailure={...result,threadId:thread.id,at:now()};t.questions=[];t.status='waiting_input';store.notify(t,'驗證工具存取失敗，請查看任務選擇「跳過受限驗證並繼續」或「不跳過，等待處理」。');}
-        else {t.round++;t.validationFailure={...result,threadId:thread.id,at:now()};t.repairPlan=null;t.approvedRepairId=null;t.repairApproval=null;t.repairFeedback='';t.status='repair_planning';store.event(t.id,'repair_analysis',`驗證未通過，先分析第 ${t.round} 輪修正方案，未核准前不修正`);store.notify(t,'驗證未通過，正在分析問題與修正方案；方案完成後等待你審核。');}
-      }
-      else if(result.questions.length){t.questions=result.questions;t.status='waiting_input';store.notify(t,`需要確認：\n${result.questions.join('\n')}`);}
-      else if(!result.passed){t.status='waiting_input';if(toolAccessFailure(result)){t.questions=[];store.notify(t,'步驟驗證受限，尚未通過。請開啟任務選擇是否跳過受限檢查；保留原計畫與成果。');}else{t.questions=['此步驟未通過驗收：'+result.summary];store.notify(t,t.questions[0]);}}else t.status='queued';
-      if(wasPaused&&['queued','running','repair_planning','awaiting_repair_approval'].includes(t.status)){t.resumeStatus='queued';t.status='paused';}
-      store.saveTask(t);store.event(t.id,'finished',`${thread.role}：${result.summary}`,thread.id);
+      applyPhaseResult(store,t,thread,phase,result,{wasPaused});
     }catch(e){if((store.task(t.id).controlVersion||0)!==controlVersion){if(thread){thread.status='cancelled';thread.finished=now();thread.error='使用者已變更任務狀態，工作已停止。';store.saveThread(thread);}return;}const reset=thread?parseEngineLimit(e.message,clock()):null;
       if(thread){thread.status=reset?'rate_limited':'failed';thread.finished=now();thread.error=e.message;thread.sessionId=e.sessionId||thread.sessionId;store.saveThread(thread);}const current=store.task(t.id);
       const manualAction=thread&&['execute','repair','review'].includes(thread.phase)?detectManualActionRequirement({message:e.message}):null;
@@ -240,7 +257,7 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
       }
       if(['OUTPUT_FORMAT','DEPENDENCY_PREFLIGHT'].includes(e.code)&&!['cancelled','paused','completed'].includes(current.status)){
         const issue={id:id(),threadId:thread?.id,phase:thread?.phase,planVersion:current.planVersion,message:e.message,at:now()};
-        if(e.code==='OUTPUT_FORMAT')current.outputIssue={...issue,issues:e.issues||[],runDir:e.runDir};else current.environmentIssue={...issue,report:e.report};
+        if(e.code==='OUTPUT_FORMAT')current.outputIssue={...issue,issues:e.issues||[],runDir:e.runDir,recovery:e.recovery||null};else current.environmentIssue={...issue,report:e.report};
         current.status='waiting_input';current.error=e.message;store.saveTask(current);store.event(t.id,'blocked',e.message,thread?.id||null);store.notify(current,e.message);return;
       }
       if(reset&&!['cancelled','paused','completed'].includes(current.status)){

@@ -20,6 +20,7 @@ import {changeTaskStatus} from './task-status.js';
 import {createProjectPreview,detectWebProject,openFolder} from './project-preview.js';
 import {checkClaudeBrowserCapability} from './browser-capability.js';
 import {createSystemHealth} from './system-health.js';
+import {recoverTaskOutput,taskOriginalOutput,outputIssueRecoverable} from './output-issue.js';
 
 export function allowedOrigins(publicOrigin=process.env.PUBLIC_ORIGIN) {
   const configured=new URL(publicOrigin||`http://127.0.0.1:${process.env.PORT||4310}`).origin;
@@ -73,6 +74,8 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/projects/:id/preview/stop',async(req,res)=>{const target=projectTarget(req);await previews.stop(target.key);res.json({ok:true});});
   const visibleProjects=user=>{const projects=store.db.prepare('SELECT * FROM projects').all().filter(p=>store.hasProject(user,p.id));return projects.map(p=>user.role==='admin'?p:{id:p.id,name:p.name,code:p.code});};
   function decorated(t){const threads=store.threads(t.id).filter(th=>th.version===t.planVersion).map(th=>({...th,...threadPresentation(th)}));return {...t,validationSkipRequest:validationSkipRequest(store,t),executionApproval:executionApproval(store,t),manualAction:manualActionRequest(store,t),
+    // runDir 是伺服器磁碟路徑，不送到瀏覽器；改送「這個問題現在能不能重新整理」這個結論。
+    outputIssue:t.outputIssue?{...t.outputIssue,runDir:undefined,recoverable:outputIssueRecoverable(t)}:t.outputIssue,
     // Distinct, explicit status a UI/automation consumer can branch on for "needs a human to act
     // outside the app" — never collapse this into the generic waiting_input/failed states.
     displayStatus:t.userActionRequired?.status==='pending'?MANUAL_ACTION_DISPLAY_STATUS:t.status,
@@ -88,6 +91,14 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/tasks',(req,res)=>res.status(201).json(decorated(store.transaction(()=>createTaskWithProject(store,req.user,req.body)))));
   app.get('/api/tasks/:id',(req,res)=>{const t=requireTask(store,req.user,req.params.id);res.json({...decorated(t),events:store.events(t.id)});});
   app.post('/api/tasks/:id/preflight/retry',(req,res)=>{const t=requireTask(store,req.user,req.params.id);if(!t.environmentIssue||t.environmentIssue.id!==req.body.issueId||t.environmentIssue.planVersion!==t.planVersion||t.status!=='waiting_input')throw new HttpError(409,'環境問題已變更，請重新查看');t.environmentIssue=null;t.dependencyPreflight=null;t.error=null;t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'awaiting_approval';t.controlVersion=(t.controlVersion||0)+1;store.saveTask(t);store.event(t.id,'preflight_approved',`${req.user.name} 核准重新檢查套件環境；通過前不執行工作`);res.json(decorated(t));});
+  // 只執行 deterministic recovery（讀已存在的原始回傳並重新整理格式）。這條路徑
+  // 沒有任何引擎呼叫，也永遠不會重跑已完成的工作。
+  app.post('/api/tasks/:id/output/recover',(req,res)=>{
+    const input=z.object({issueId:z.string().optional()}).strict().parse(req.body||{});
+    const outcome=store.transaction(()=>recoverTaskOutput(store,req.user,req.params.id,input));
+    res.json({...decorated(outcome.task),recovery:outcome.recovery});
+  });
+  app.get('/api/tasks/:id/output/original',(req,res)=>res.json(taskOriginalOutput(store,req.user,req.params.id)));
   app.post('/api/tasks/:id/status',(req,res)=>res.json(decorated(changeTaskStatus(store,runner,req.user,req.params.id,req.body))));
   app.post('/api/tasks/:id/repair/approve',(req,res)=>res.json(decorated(approveRepair(store,req.user,req.params.id,req.body.proposalId))));
   app.post('/api/tasks/:id/repair/revise',(req,res)=>res.json(decorated(reviseRepair(store,req.user,req.params.id,req.body.proposalId,req.body.answer))));
