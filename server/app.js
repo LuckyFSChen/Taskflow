@@ -12,11 +12,12 @@ import { id,hash,passwordHash,passwordMatches } from './db.js';
 import { HttpError,createTask,requireTask,approveTask,reviseTask } from './domain.js';
 import {executionApproval,decideExecutionApproval} from './execution-approval.js';
 import {validationSkipRequest,decideValidationSkip} from './validation-skip.js';
-import {manualActionRequest,decideManualAction,MANUAL_ACTION_DISPLAY_STATUS} from './manual-action.js';
+import {manualActionRequest,decideManualAction} from './manual-action.js';
 import { prepareProjectDirectory } from './project-directory.js';
 import {browseDirectory,createDirectory,availableDrives} from './directory-browser.js';
 import {createTaskWithProject} from './task-project.js';
-import {changeTaskStatus} from './task-status.js';
+import {changeTaskStatus,taskDisplayStatus} from './task-status.js';
+import {gitIssueRequest,decideGitIssue,gitIssuePending,closePendingRequestsOnCancel} from './git-issue.js';
 import {createProjectPreview,detectWebProject,openFolder} from './project-preview.js';
 import {checkClaudeBrowserCapability} from './browser-capability.js';
 import {createSystemHealth} from './system-health.js';
@@ -78,11 +79,14 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/projects/:id/preview/stop',async(req,res)=>{const target=projectTarget(req);await previews.stop(target.key);res.json({ok:true});});
   const visibleProjects=user=>{const projects=store.db.prepare('SELECT * FROM projects').all().filter(p=>store.hasProject(user,p.id));return projects.map(p=>user.role==='admin'?p:{id:p.id,name:p.name,code:p.code});};
   function decorated(t){const threads=store.threads(t.id).filter(th=>th.version===t.planVersion).map(th=>({...th,...threadPresentation(th)}));return {...t,validationSkipRequest:validationSkipRequest(store,t),executionApproval:executionApproval(store,t),manualAction:manualActionRequest(store,t),
+    // Git 守門的待確認請求（未提交修改、受保護分支…）。原始的 t.gitIssue 仍隨 spread 送出，
+    // 讓 UI 也能顯示「已確認／已處理」的歷程；gitRequest 只在真的還要使用者處理時才存在。
+    gitRequest:gitIssueRequest(store,t),
     // runDir 是伺服器磁碟路徑，不送到瀏覽器；改送「這個問題現在能不能重新整理」這個結論。
     outputIssue:t.outputIssue?{...t.outputIssue,runDir:undefined,recoverable:outputIssueRecoverable(t)}:t.outputIssue,
     // Distinct, explicit status a UI/automation consumer can branch on for "needs a human to act
     // outside the app" — never collapse this into the generic waiting_input/failed states.
-    displayStatus:t.userActionRequired?.status==='pending'?MANUAL_ACTION_DISPLAY_STATUS:t.status,
+    displayStatus:taskDisplayStatus(t),
     // repositoryPath／workingDirectory 是伺服器磁碟路徑，和 workspace 一樣不送到瀏覽器；
     // 只送使用者真正需要判讀的 Git 座標：從哪個分支開出、目前在哪個分支、哪兩個 commit。
     git:t.git?{mode:t.git.mode,baseBranch:t.git.baseBranch,workingBranch:t.git.workingBranch,baseCommit:t.git.baseCommit,headCommit:t.git.headCommit}:t.git,
@@ -104,14 +108,18 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/tasks',(req,res)=>res.status(201).json(decorated(store.transaction(()=>createTaskWithProject(store,req.user,req.body)))));
   app.get('/api/tasks/:id',(req,res)=>{const t=requireTask(store,req.user,req.params.id);res.json({...decorated(t),events:store.events(t.id)});});
   app.post('/api/tasks/:id/preflight/retry',(req,res)=>{const t=requireTask(store,req.user,req.params.id);if(!t.environmentIssue||t.environmentIssue.id!==req.body.issueId||t.environmentIssue.planVersion!==t.planVersion||t.status!=='waiting_input')throw new HttpError(409,'環境問題已變更，請重新查看');t.environmentIssue=null;t.dependencyPreflight=null;t.error=null;t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'awaiting_approval';t.controlVersion=(t.controlVersion||0)+1;store.saveTask(t);store.event(t.id,'preflight_approved',`${req.user.name} 核准重新檢查套件環境；通過前不執行工作`);res.json(decorated(t));});
-  // Git 安全守門（未提交修改、受保護分支、巢狀版本庫…）只能由使用者處理完後手動重新檢查。
-  // 這條路徑不執行任何 git 寫入指令，只是清掉問題旗標讓 runner 重跑同一份檢查。
+  // Git 安全守門（未提交修改、受保護分支、巢狀版本庫…）的三個人工出路。沿用既有的
+  // gitIssue／resumeStatus 機制與這條既有路徑，不另外開 /git/approve、/git/retry：
+  //   action='recheck'（預設，向後相容原本只帶 issueId 的呼叫）真的重跑 git status
+  //   action='approve' 確認保留未提交修改並繼續（記下指紋，同一組修改不再重複詢問）
+  //   action='cancel'  取消任務並關閉待確認項目
+  // 這條路徑不會執行任何破壞性 git 指令：不 reset、不 clean、不 stash、不 checkout、不刪檔。
   app.post('/api/tasks/:id/git/recheck',(req,res)=>{
-    const t=requireTask(store,req.user,req.params.id);
-    if(!t.gitIssue||t.gitIssue.id!==req.body.issueId||t.status!=='waiting_input')throw new HttpError(409,'Git 問題已變更，請重新查看');
-    t.gitIssue=null;t.error=null;t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'planning';t.controlVersion=(t.controlVersion||0)+1;
-    store.saveTask(t);store.event(t.id,'git_rechecked',`${req.user.name} 已處理 Git 狀態並要求重新檢查；通過前不執行工作`);
-    res.json(decorated(t));
+    const input=z.object({issueId:z.string().max(200).optional(),action:z.enum(['approve','recheck','cancel']).default('recheck')}).strict().parse(req.body||{});
+    // 不包在 store.transaction 裡：這條路徑在「確認前修改又變了」或「git 檢查失敗」時會
+    // 先更新待確認清單／留下事件紀錄，再回報 409 要求使用者重新查看。包進交易會把那些
+    // 更新一起回滾，使用者就會看到過期的清單。
+    res.json(decorated(decideGitIssue(store,req.user,req.params.id,input,{gitWorkspace,runner})));
   });
   // Phase 3：自動流程到「驗證完成」就停住，之後每一步都要人按下去。這些路徑只會執行使用者
   // 選的那一個動作；TaskFlow 不替他切換分支、不解衝突，也不在沒被要求時刪掉任何分支。
@@ -147,9 +155,10 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/tasks/:id/user-action/decision',(req,res)=>res.json(decorated(store.transaction(()=>decideManualAction(store,req.user,req.params.id,req.body)))));
   app.post('/api/tasks/:id/action',(req,res)=>{const t=requireTask(store,req.user,req.params.id),action=z.enum(['pause','resume','cancel','stop','retry','publish-approve']).parse(req.body.action),active=store.threads(t.id).some(x=>x.status==='running');
     if(action==='pause'){if(!['planning','repair_planning','awaiting_repair_approval','rate_limited','queued','running'].includes(t.status))throw new HttpError(409,'此狀態無法暫停');t.resumeStatus=t.status==='planning'?'planning':'queued';t.status='paused';}
-    if(['resume','retry'].includes(action)&&(t.outputIssue||t.environmentIssue||t.gitIssue||t.userActionRequired?.status==='pending'))throw new HttpError(409,'請先審核問題處理方案；不能直接重跑工作');
+    if(['resume','retry'].includes(action)&&(t.outputIssue||t.environmentIssue||gitIssuePending(t)||t.userActionRequired?.status==='pending'))throw new HttpError(409,'請先審核問題處理方案；不能直接重跑工作');
     if(action==='resume'||action==='retry'){if(!['paused','failed'].includes(t.status)||active)throw new HttpError(409,'尚無法恢復，請等待目前工作結束');t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'planning';t.error=null;}
-    if(action==='cancel'){if(['completed','cancelled'].includes(t.status))throw new HttpError(409,'任務已結束');t.status='cancelled';runner.stopTask(t.id);}
+    // 取消時一併關閉待處理的人工請求，否則已取消的任務會繼續顯示「待我處理」。
+    if(action==='cancel'){if(['completed','cancelled'].includes(t.status))throw new HttpError(409,'任務已結束');t.status='cancelled';t.resumeStatus=null;closePendingRequestsOnCancel(t,req.user);runner.stopTask(t.id);}
     if(action==='stop'){if(!active)throw new HttpError(409,'目前沒有正在執行的工作');t.status='paused';t.error='已中止執行，請檢查工作副本後恢復。';runner.stopTask(t.id);}
     if(action==='publish-approve'){if(t.status!=='completed'||t.manualCompletion||!t.artifactVersion||req.body.artifactVersion!==t.artifactVersion)throw new HttpError(409,'成果版本不符');t.publishApproval={by:req.user.id,at:new Date().toISOString(),artifactVersion:t.artifactVersion};}
     store.saveTask(t);store.event(t.id,action,action==='publish-approve'?`${req.user.name} 核准此版成果發布；尚未執行對外發布`:`${req.user.name}：${action}`);res.json(decorated(t));});

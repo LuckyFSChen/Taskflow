@@ -103,6 +103,9 @@ export function canRetryWithApproval(ua){
 export function manualActionRequest(store,task){
   const ua=task.userActionRequired;
   if(!ua||ua.status!=='pending')return null;
+  // 已結束的任務不再有待處理請求：舊資料裡確實存在「已取消但 userActionRequired 還是 pending」
+  // 的任務，若照樣送出請求，UI 會繼續顯示待我處理，也會讓人按下一個不該還能按的按鈕。
+  if(['cancelled','completed'].includes(task.status))return null;
   return {id:hash(JSON.stringify([ua.threadId,task.planVersion,task.controlVersion||0,ua])),...ua,retryable:canRetryWithApproval(ua)};
 }
 export function decideManualAction(store,user,taskId,{requestId,decision,note}={}){

@@ -30,9 +30,26 @@ function firstQuestion(task) {
 }
 
 // 分類的判斷順序刻意與顯示順序（priority）分開：
-// manualAction / environmentIssue / outputIssue 都會讓 status 變成 waiting_input，
+// gitRequest / manualAction / environmentIssue / outputIssue 都會讓 status 變成 waiting_input，
 // 必須先判斷，才不會被歸類成一般的「等待回答」。
 const RULES = [
+  {
+    // Git 守門排在最前面：它在任務開始執行前就擋住一切，而且以前完全沒有分類，
+    // 會被歸成「AI 需要你補充資訊」——使用者照著回答也永遠解不開。
+    match: task => !!task.gitRequest || task.displayStatus === 'waiting_git_confirmation',
+    build: task => ({
+      type: 'git_issue',
+      title: task.gitRequest?.title || '需要確認 Git 修改',
+      description: task.gitRequest?.reason === 'dirty_working_tree'
+        ? '專案有未提交修改。TaskFlow 不會刪除、reset、clean 或覆蓋它們；請確認保留並繼續，或自行處理後重新檢查。'
+        : 'Git 狀態需要你確認後才能繼續；TaskFlow 不會自行改動你的版本庫。',
+      reason: task.gitRequest?.reason === 'dirty_working_tree'
+        ? `${task.gitRequest.fileCount ?? (task.gitRequest.files || []).length} 個檔案尚未提交`
+        : shorten(task.gitRequest?.message || task.error),
+      action: '查看 Git 修改',
+      priority: 3,
+    }),
+  },
   {
     match: task => !!task.manualAction || task.displayStatus === 'waiting_user_action',
     build: task => ({
@@ -150,6 +167,10 @@ const RULES = [
  */
 export function attentionCategory(task) {
   if (!task) return null;
+  // 已結束的任務不需要任何人處理。取消或標記完成時殘留的旗標（outputIssue、manualAction、
+  // gitIssue…）不得讓它繼續出現在「待我處理」——這正是「任務已取消卻仍顯示待我處理」的成因。
+  // 後端的 displayStatus（server/task-status.js）採同一優先序。
+  if (['cancelled', 'completed'].includes(task.status)) return null;
   const rule = RULES.find(r => r.match(task));
   return rule ? rule.build(task) : null;
 }

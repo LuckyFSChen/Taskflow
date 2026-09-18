@@ -20,7 +20,9 @@ branch 與 commit 記錄，不再靠複製資料夾。
    ├── 不是 repository → git init + main + .gitignore + 初始 commit
    ├── 是 repository   → 只讀取狀態，絕不重新 init、不改動 main
    ▼
-git status --porcelain 有未提交修改？ → 停止，等使用者處理
+git status --porcelain 有未提交修改？
+   ├── 指紋與 task.gitDirtyApproval 相同 → 使用者已確認，繼續（檔案一個都不動）
+   └── 否則 → 停止，等使用者確認（保留修改並繼續／重新檢查／取消任務）
    ▼
 git worktree add data/worktrees/<taskId> -b taskflow/<shortId>-<slug> <目前分支>
    ▼
@@ -42,7 +44,7 @@ Agent 在 worktree 內修改檔案
 
 | 情況 | 行為 |
 | --- | --- |
-| 專案有未提交修改 | 任務停在 `waiting_input`，帶 `gitIssue.reason = dirty_working_tree` 與檔案清單。**不** reset、不 clean、不 stash、不把你的修改混進任務 |
+| 專案有未提交修改 | 任務停在 `waiting_input`，帶 `gitIssue.reason = dirty_working_tree`、檔案清單與指紋，UI 出現三個可操作選項。**不** reset、不 clean、不 stash、不把你的修改混進任務 |
 | 工作目錄被切到 main／master／production／release／develop | 停止，`protected_branch`，訊息為「Git safety check failed.」 |
 | 工作目錄被切到其他分支 | 停止，`branch_changed`；TaskFlow 不會自動切回去 |
 | 工作目錄處於 detached HEAD | 停止，`detached_head` |
@@ -50,9 +52,54 @@ Agent 在 worktree 內修改檔案
 | repository 還沒有任何 commit | 停止，`no_commits`；請先自行完成第一次 commit |
 | 工作目錄已被手動刪除 | 停止，`worktree_missing` |
 
-被擋下時任務停在 `waiting_input` 並發出通知；處理完後呼叫
-`POST /api/tasks/:id/git/recheck`（body：`{"issueId": "<gitIssue.id>"}`）重新檢查。
-這條 API 不執行任何 git 寫入指令，只是清掉旗標讓 runner 重跑同一份檢查。
+被擋下時任務停在 `waiting_input`（不是 `failed`：這是「需要你決策」，不是執行失敗）並發出通知，
+同時把被擋下來之前的狀態記在 `gitIssue.resumeStatus` 與 `task.resumeStatus`，處理完才能回到原本的
+流程（規劃中被擋回到 `planning`、修正方案分析中被擋回到 `repair_planning`、執行中被擋回到 `queued`）。
+
+### 未提交修改的人工處理閉環
+
+任務詳情頁會出現「需要確認 Git 修改」區塊：完整檔案清單、TaskFlow 的不作為承諾，以及三個動作。
+三個動作共用既有路徑 `POST /api/tasks/:id/git/recheck`，body：
+
+```json
+{ "issueId": "<gitRequest.requestId 或 gitIssue.id>", "action": "approve | recheck | cancel" }
+```
+
+`action` 省略時等於 `recheck`（舊的呼叫方式照樣可用）。這條 API 不執行任何 git 寫入指令，
+只會讀 `git status`：不 reset、不 clean、不 stash、不 checkout、不 commit、不刪除任何檔案。
+
+| action | 行為 |
+| --- | --- |
+| `approve` | **保留修改並繼續**。重新讀一次 `git status` 確認畫面上那組修改沒變（變了就更新清單並要求重新確認，不代替你核准沒看過的修改），把指紋寫進 `task.gitDirtyApproval`，任務回到 `resumeStatus`。只有 `dirty_working_tree` 可以這樣解除 |
+| `recheck` | **我已自行處理，重新檢查**。真的重跑 `git status`：乾淨就關閉 blocker 並回到 `resumeStatus`；仍 dirty 只更新同一筆 blocker 的檔案清單與指紋（不建立第二個 blocker），維持等待 |
+| `cancel` | 取消任務，並把 `gitIssue`／`userActionRequired` 的 `status` 一起改成 `cancelled`，UI 不再顯示「待我處理」 |
+
+### 指紋：同一組修改只問一次
+
+`gitIssue.fingerprint` 是 `git status --porcelain` **完整**輸出（不是顯示用的前 30 筆）正規化排序後的
+SHA-256，untracked（`??`）與 staged／unstaged 一視同仁納入計算。
+
+```
+第一次      git status = A → fingerprint = hash(A) → 要求確認
+使用者確認   gitDirtyApproval.fingerprint = hash(A)
+下一輪派工   hash(A) === approved → 不再阻塞（活動紀錄寫下「已依你的確認保留 N 項未提交修改」）
+又有新修改   hash(B) !== approved → 再次要求確認
+```
+
+沒有這個指紋就會出現「按了繼續，下一輪又被同一組修改擋住」的無限循環。
+
+「保留修改並繼續」不代表 TaskFlow 會在你的主工作樹上工作：任務分支照樣從**最後一次 commit**
+開出、在獨立的 worktree 執行，你那些未提交修改留在專案目錄裡原樣不動，也不會被帶進任務。
+
+`git status` 本身執行失敗時一律回報 `git_status_failed`，**不會**被當成「工作目錄乾淨」——
+讀不到狀態時假設乾淨等於關掉守門。
+
+### 顯示狀態優先序
+
+`decorated().displayStatus`（`server/task-status.js` 的 `taskDisplayStatus`）：
+`cancelled` → `completed` → `waiting_git_confirmation`（Git 待確認）→ `waiting_user_action`
+（需要你在本機操作）→ `task.status`。已結束的狀態永遠贏過待處理項目，所以「任務已取消卻仍顯示
+待我處理」不會再發生，連舊資料（`gitIssue` 沒有 `status` 欄位）也一樣。
 
 ### 永遠不會自動執行的指令
 
@@ -86,9 +133,29 @@ Agent 在 worktree 內修改檔案
     "baseCommit": "abc123…",
     "headCommit": "abc123…"
   },
-  "gitIssue": null
+  "gitIssue": {
+    "id": "…",
+    "reason": "dirty_working_tree",
+    "status": "pending | approved | resolved | cancelled",
+    "files": ["M README.md", "?? scratch.txt"],
+    "fileCount": 14,
+    "fingerprint": "sha256…",
+    "resumeStatus": "planning",
+    "planVersion": 1,
+    "at": "…"
+  },
+  "gitDirtyApproval": {
+    "approvedAt": "…", "approvedBy": "…", "fingerprint": "sha256…",
+    "files": ["M README.md"], "fileCount": 14
+  },
+  "gitIssueHistory": []
 }
 ```
+
+`gitIssue` 不再是「有／沒有」：處理完之後會留在任務上（`approved`／`resolved`／`cancelled`）供 UI
+顯示歷程，**是否還擋著任務一律用 `gitIssuePending(task)` 判斷**，不要用 `!!task.gitIssue`。
+API 另外送出 `gitRequest`（只有真的還需要你處理時才存在，含 `requestId`、`approvable`、
+`title`、`files`、`fileCount`）給前端渲染。
 
 `task.workspace` 仍是唯一的「工作目錄」欄位，預覽、Browser Validation、指令授權比對都沿用它，
 所以其餘流程不需要改。API 回應只送出 `mode`／`baseBranch`／`workingBranch`／`baseCommit`／
@@ -296,7 +363,7 @@ revert 若發生衝突會還原為撤銷前的狀態，再交給人處理。
 ## 測試
 
 ```bash
-node --test tests/git-workspace.test.js tests/git-runner.test.js tests/git-review.test.js
+node --test tests/git-workspace.test.js tests/git-runner.test.js tests/git-review.test.js tests/git-issue.test.js
 ```
 
 Phase 1：新專案建立版本庫且機密不進入歷史、既有專案不重新 init 也不改 main、未提交修改時停止且
@@ -306,6 +373,14 @@ Phase 1：新專案建立版本庫且機密不進入歷史、既有專案不重�
 Phase 2：有修改才 commit、沒修改不留空 commit、機密與 `.taskflow/` 不進版、刪除與改名都被保存、
 commit 前重跑分支守門、規劃階段不 commit、`passed=false` 與引擎失敗的階段一樣保存成果但任務不會
 變成完成、`headCommit` 與 `artifactCommit` 正確對應。
+
+Git 守門的人工處理閉環（`tests/git-issue.test.js`）：dirty working tree 進入待確認而非失敗且不呼叫
+Agent、待我處理與詳情頁都有可操作選項、確認後回到原本狀態且相同指紋不再阻塞、確認後又新增
+untracked 檔案會以新指紋再問一次、自行 commit 後重新檢查即解除、仍 dirty 只更新同一筆 blocker、
+取消任務會關閉待確認項目、已取消（含舊資料）永遠顯示 `cancelled` 而非待我處理、`git status`
+失敗如實回報而不推論乾淨、受保護分支這類問題不能用「保留修改並繼續」跳過、過期請求被擋下、
+`/git/recheck` 三種 action 與舊呼叫方式相容。每一項都同時檢查使用者的檔案沒有被動到
+（內容不變、`git stash list` 為空、專案目錄仍在原分支）。
 
 Phase 3：`--no-ff` 合併與成果真的進入專案、手動完成與成果版本不符會被擋下、正式分支不乾淨或不在
 base branch 時不合併且不替使用者切換分支、衝突時完全不動正式分支（HEAD 不變、無 `MERGE_HEAD`）、

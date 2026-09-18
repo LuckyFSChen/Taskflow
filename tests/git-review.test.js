@@ -13,6 +13,9 @@ import { legacyWorkspaceStatus, migrateLegacyWorkspace } from '../server/git-mig
 const plan = { summary: '建立文件', acceptance: ['有文件'], questions: [], steps: [{ title: '撰寫文件', role: '作者', instructions: '完成文件' }] };
 const good = { summary: '驗證完成', questions: [], artifacts: ['result.md'], passed: true, evidence: ['已讀取 result.md'] };
 const run = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+// 合併後由 git checkout 產生的檔案，在 core.autocrlf=true 的 Windows 上會被改寫成 CRLF；
+// 這裡檢查的是內容，不是換行字元。
+const readText = path => readFileSync(path, 'utf8').replaceAll('\r\n', '\n');
 const f2events = (store, tid) => store.events(tid).map(e => e.message);
 
 // 跑完一個真實的任務流程（規劃 → 核准 → 執行 → 獨立驗證），停在「已完成、等待人工審核」。
@@ -66,7 +69,7 @@ test('核准並 Merge：--no-ff 合併後預設清理分支與工作目錄', asy
   assert.equal(merged.gitMerge.baseBranch, 'main');
   assert.equal(merged.gitMerge.by, f.owner.id);
   assert.equal(merged.publishApproval.artifactVersion, f.task.artifactVersion);
-  assert.equal(readFileSync(join(f.source, 'result.md'), 'utf8'), 'delivered\n', '成果必須真的進到專案');
+  assert.equal(readText(join(f.source, 'result.md')), 'delivered\n', '成果必須真的進到專案');
   assert.equal(run(f.source, 'log', '-1', '--format=%P').split(' ').length, 2);
   assert.match(run(f.source, 'log', '-1', '--format=%b'), /成果版本/);
 

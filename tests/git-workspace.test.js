@@ -12,6 +12,9 @@ import {
 const git = createGitRunner();
 const workspace = createGitWorkspace({ git });
 const run = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+// 經過 git checkout（worktree、merge）才出現的檔案，在 core.autocrlf=true 的 Windows 上會被
+// 改寫成 CRLF。這些斷言檢查的是「內容對不對」，不是換行字元，所以比對前統一換行。
+const readText = path => readFileSync(path, 'utf8').replaceAll('\r\n', '\n');
 const sandbox = t => { const root = mkdtempSync(join(tmpdir(), 'tf-git-')); t.after(() => rmSync(root, { recursive: true, force: true })); return root; };
 const project = root => { const path = join(root, 'project'); mkdirSync(path, { recursive: true }); return path; };
 const taskId = '184abcde-0000-4000-8000-000000000001';
@@ -97,6 +100,53 @@ test('未提交修改：停止任務並列出檔案，不清除也不 stash 使�
   assert.ok(existsSync(join(path, 'scratch.txt')));
   assert.equal(run(path, 'stash', 'list'), '');
   assert.ok(!existsSync(join(root, 'worktrees')) || !existsSync(join(root, 'worktrees', taskId)));
+});
+
+test('使用者確認過的未提交修改：指紋相同才放行，而且一個檔案都不動', t => {
+  const root = sandbox(t), path = project(root);
+  existingRepo(path);
+  writeFileSync(join(path, 'README.md'), '# edited by user\n');
+  writeFileSync(join(path, 'scratch.txt'), 'wip\n');
+
+  const blocked = (() => { try { workspace.prepare({ projectPath: path, taskId, title: 'Approved', worktreesDir: join(root, 'worktrees') }); return null; } catch (e) { return e; } })();
+  const approvedFingerprint = blocked.details.fingerprint;
+  assert.ok(approvedFingerprint, '守門必須提供可以再次比對的指紋');
+  assert.equal(blocked.details.fileCount, 2);
+
+  // 指紋不符（例如舊的核准）不得放行。
+  assert.throws(
+    () => workspace.prepare({ projectPath: path, taskId, title: 'Approved', worktreesDir: join(root, 'worktrees'), approvedDirtyFingerprint: 'stale-fingerprint' }),
+    e => e.reason === 'dirty_working_tree',
+  );
+
+  // 指紋相符：任務可以開始，使用者的未提交修改留在原處，不進入任務分支。
+  const prepared = workspace.prepare({ projectPath: path, taskId, title: 'Approved', worktreesDir: join(root, 'worktrees'), approvedDirtyFingerprint: approvedFingerprint });
+  assert.equal(prepared.git.mode, 'worktree');
+  assert.ok(prepared.events.some(e => e.kind === 'git_dirty_approved' && /不 reset、不 clean、不 stash、不刪除、不覆蓋/.test(e.message)));
+  assert.equal(readFileSync(join(path, 'README.md'), 'utf8'), '# edited by user\n', '使用者的修改必須原封不動');
+  assert.ok(existsSync(join(path, 'scratch.txt')));
+  assert.equal(run(path, 'stash', 'list'), '');
+  assert.equal(run(path, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main');
+  assert.equal(readText(join(prepared.git.workingDirectory, 'README.md')), '# existing\n', '任務分支自最後一次 commit 開出，未提交修改不會被帶進去');
+  assert.ok(!existsSync(join(prepared.git.workingDirectory, 'scratch.txt')));
+
+  // 之後又有新修改：因為 worktree 已存在（reusing），這個任務不再重跑 dirty 守門，
+  // 但使用者的新檔案同樣不會被動到。
+  writeFileSync(join(path, 'later.txt'), 'more\n');
+  workspace.prepare({ projectPath: path, taskId, title: 'Approved', worktreesDir: join(root, 'worktrees') });
+  assert.ok(existsSync(join(path, 'later.txt')));
+});
+
+test('git status 讀取失敗時不得回報「乾淨」', t => {
+  const root = sandbox(t), path = project(root);
+  existingRepo(path);
+  const failing = (cwd, args) => {
+    if (args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree') return { ok: true, stdout: 'true\n', stderr: '' };
+    if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return { ok: true, stdout: `${path}\n`, stderr: '' };
+    if (args[0] === 'status') return { ok: false, stdout: '', stderr: 'fatal: detected dubious ownership' };
+    return { ok: true, stdout: '', stderr: '' };
+  };
+  assert.throws(() => inspectRepository(path, { git: failing }), e => e.reason === 'git_status_failed' && /不會假設工作目錄是乾淨的/.test(e.message));
 });
 
 test('重複執行同一任務會沿用既有 worktree，且不再被未提交修改擋住', t => {
@@ -269,7 +319,7 @@ test('核准合併：--no-ff 保留任務邊界，成果進入正式分支', t =
   const outcome = workspace.merge({ repositoryPath: task.repositoryPath, baseBranch: task.baseBranch, workingBranch: task.workingBranch, subject: `taskflow: 合併 ${task.workingBranch}`, body: '經使用者核准' });
 
   assert.equal(outcome.merged, true);
-  assert.equal(readFileSync(join(path, 'result.md'), 'utf8'), 'delivered\n');
+  assert.equal(readText(join(path, 'result.md')), 'delivered\n');
   assert.equal(run(path, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main');
   assert.equal(run(path, 'rev-list', '--count', '--merges', 'HEAD'), '1', '必須是 merge commit，不是 fast-forward');
   assert.equal(run(path, 'rev-list', '--count', '--parents', '-1', 'HEAD').split(' ').length, 1);

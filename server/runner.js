@@ -15,6 +15,7 @@ import {detectManualActionRequirement,buildUserActionRequest} from './manual-act
 import {resolveCliExecutable} from './cli-executable.js';
 import {detectWebProject,createProjectPreview} from './project-preview.js';
 import {createGitWorkspace,DEFAULT_PROTECTED_BRANCHES} from './git-workspace.js';
+import {gitIssuePending} from './git-issue.js';
 import {deriveBrowserValidationRequirement,checkClaudeBrowserCapability,browserMcpServerSpec,browserMcpConfig,browserAllowedTools,isBrowserToolName,categorizeBrowserTool,reconcileBrowserValidation,defaultBrowserValidation} from './browser-capability.js';
 
 const blocked=name=> /^(node_modules|\.git|\.env(?:\..*)?|data|dist|build|\.venv|venv|\.ssh|\.aws|\.codex|\.claude|\.taskflow|first-login\.txt)$/i.test(name)||/\.(pem|key|pfx|sqlite(?:-wal|-shm)?)$/i.test(name);
@@ -145,7 +146,9 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
     if(t.workspace)return branchGuard();
     const gitMode=store.setting('gitWorkspaceEnabled',true);
     if(gitMode&&gitWorkspace.available(project.path)){
-      const prepared=gitWorkspace.prepare({projectPath:project.path,taskId:t.id,title:t.title,worktreesDir:join(dataDir,'worktrees'),protectedBranches:protectedBranches()});
+      // 使用者明確確認過的未提交修改，指紋一致時不再阻塞（見 git-issue.js）。
+      // 指紋不同代表又有新的修改，prepare() 會照樣擋下來重新詢問。
+      const prepared=gitWorkspace.prepare({projectPath:project.path,taskId:t.id,title:t.title,worktreesDir:join(dataDir,'worktrees'),protectedBranches:protectedBranches(),approvedDirtyFingerprint:t.gitDirtyApproval?.fingerprint||null});
       t.git=prepared.git;t.workspace=prepared.git.workingDirectory;persistWorkspace();
       for(const e of prepared.events)store.event(t.id,e.kind,e.message);
       return branchGuard();
@@ -206,7 +209,7 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
   }
   async function runTask(t,slot){let thread;const controlVersion=t.controlVersion||0;
     try {
-      if(t.outputIssue||t.environmentIssue||t.gitIssue||t.userActionRequired?.status==='pending')return;
+      if(t.outputIssue||t.environmentIssue||gitIssuePending(t)||t.userActionRequired?.status==='pending')return;
       const project=store.project(t.projectId);if(!project||!existsSync(project.path))throw new Error('專案資料夾不存在');
       const all=store.threads(t.id).filter(x=>x.version===t.planVersion);
       let phase,step,eng;
@@ -310,9 +313,31 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
       // Git 安全守門不是一般執行失敗，也不是「需要手動執行指令」：它代表使用者的內容有風險，
       // 必須由人確認。排在最前面，避免被其他錯誤分類搶走。
       if(e.code==='GIT_SAFETY'&&!['cancelled','paused','completed'].includes(current.status)){
-        current.gitIssue={id:id(),reason:e.reason,message:e.message,files:e.details?.files||[],planVersion:current.planVersion,at:now()};
+        const files=e.details?.files||[],fileCount=e.details?.fileCount??files.length;
+        // 被擋下來之前的狀態要保存下來，處理完才能回到原本的流程（規劃中被擋就回到規劃，
+        // 修正方案分析中被擋就回到分析），而不是一律跳去 queued 把工作流跳錯。
+        const resumeStatus=['planning','repair_planning'].includes(current.status)?current.status:'queued';
+        // 同一個 blocker 只保留一筆：使用者已在處理中（pending）時不覆蓋既有的 id 與
+        // 建立時間，只更新最新的檔案清單與指紋，避免畫面上冒出重複的待確認項目。
+        const existing=gitIssuePending(current)&&current.gitIssue.reason===e.reason?current.gitIssue:null;
+        current.gitIssue={
+          id:existing?.id||id(),reason:e.reason,message:e.message,
+          files,fileCount,fingerprint:e.details?.fingerprint||null,branch:e.details?.branch||null,
+          status:'pending',resumeStatus:existing?.resumeStatus||resumeStatus,
+          planVersion:current.planVersion,threadId:thread?.id||null,
+          at:existing?.at||now(),...(existing?{refreshedAt:now()}:{}),
+        };
+        current.resumeStatus=current.gitIssue.resumeStatus;
+        // Git 守門是「需要你決策」，不是執行失敗：任務走 waiting_input + 人工請求，
+        // 這個工作階段也不標成 failed（它根本還沒開始執行）。
         current.status='waiting_input';current.error=e.message;store.saveTask(current);
-        store.event(t.id,'git_blocked',e.message,thread?.id||null);store.notify(current,e.message);return;
+        if(thread){thread.status='cancelled';thread.error=e.message;thread.stoppedReason='git_blocked';thread.summary='Git 守門要求你先確認，尚未開始執行這個階段。';store.saveThread(thread);}
+        store.event(t.id,'git_blocked',
+          e.reason==='dirty_working_tree'
+            ?`Git 工作目錄存在 ${fileCount} 個未提交修改，等待使用者確認。TaskFlow 不會 reset、clean、stash 或刪除任何檔案。\n${files.slice(0,30).join('\n')}`
+            :e.message,
+          thread?.id||null);
+        store.notify(current,e.message);return;
       }
       const manualAction=thread&&['execute','repair','review'].includes(thread.phase)?detectManualActionRequirement({message:e.message}):null;
       if(manualAction&&!['cancelled','paused','completed'].includes(current.status)){

@@ -8,6 +8,7 @@
 // Agent 實際工作的地方是 git worktree：與專案共用 .git 歷史，但工作樹完全獨立，
 // 所以使用者的專案目錄不會被 agent 改到，多個任務也能同時進行。
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -118,6 +119,19 @@ export function taskBranchName({ taskId, title = '', prefix = 'taskflow' }) {
   return name;
 }
 
+// 未提交修改的「快照指紋」：使用者確認過的那一組修改，之後每一輪都要能重新認出來，
+// 否則同一組修改會被反覆詢問（見 git-issue.js 的 approval 流程）。
+//
+// 三個刻意的選擇：
+//   1. 指紋取自 `git status --porcelain` 的**完整**輸出，不是顯示用的前 30 筆；否則
+//      第 31 個檔案改動不會改變指紋，等於偷偷放行沒被確認過的修改。
+//   2. untracked（`??`）與 staged／unstaged 一視同仁納入計算，新增檔案一定會改變指紋。
+//   3. 排序後再 hash，git 輸出順序變動不會被誤判成「有新修改」。
+export function dirtyFingerprint(dirty) {
+  const normalized = [...(dirty || [])].map(line => String(line).replace(/\s+/g, ' ').trim()).filter(Boolean).sort().join('\n');
+  return normalized ? createHash('sha256').update(normalized).digest('hex') : null;
+}
+
 export function inspectRepository(projectPath, { git }) {
   if (!existsSync(projectPath)) throw new GitSafetyError('project_missing', `專案資料夾不存在：${projectPath}`);
   const inside = git(projectPath, ['rev-parse', '--is-inside-work-tree'], { allowFailure: true });
@@ -127,13 +141,22 @@ export function inspectRepository(projectPath, { git }) {
   const branchResult = git(repositoryPath, ['branch', '--show-current'], { allowFailure: true });
   const headResult = git(repositoryPath, ['rev-parse', 'HEAD'], { allowFailure: true });
   const statusResult = git(repositoryPath, ['status', '--porcelain'], { allowFailure: true });
+  // `git status` 自己失敗時絕對不能回報 dirty: []：那會讓「讀不到狀態」被當成「工作目錄乾淨」，
+  // 於是守門形同關閉。讀不到就照實往外拋，由呼叫端當成 Git 檢查錯誤處理。
+  if (!statusResult.ok) {
+    throw new GitSafetyError('git_status_failed',
+      `無法讀取專案的 Git 狀態（git status 執行失敗），為安全起見已停止，不會假設工作目錄是乾淨的。\n\n${(statusResult.stderr || statusResult.error?.message || '').trim().slice(0, 300)}`,
+      { repositoryPath });
+  }
+  const dirty = statusResult.stdout.split('\n').map(line => line.trim()).filter(Boolean);
   return {
     isRepository: true,
     repositoryPath,
     nested: !samePath(repositoryPath, projectPath),
     branch: branchResult.ok ? firstLine(branchResult.stdout) || null : null,
     head: headResult.ok ? firstLine(headResult.stdout) || null : null,
-    dirty: statusResult.ok ? statusResult.stdout.split('\n').map(line => line.trim()).filter(Boolean) : [],
+    dirty,
+    dirtyFingerprint: dirtyFingerprint(dirty),
   };
 }
 
@@ -225,7 +248,8 @@ function worktreePaths(git, repositoryPath) {
 // 使用者的專案目錄也始終停在他自己的分支上。
 export function prepareTaskWorkspace({
   projectPath, taskId, title = '', worktreesDir,
-  protectedBranches = DEFAULT_PROTECTED_BRANCHES, defaultBranch = 'main', git,
+  protectedBranches = DEFAULT_PROTECTED_BRANCHES, defaultBranch = 'main',
+  approvedDirtyFingerprint = null, git,
 }) {
   const events = [];
   let state = inspectRepository(projectPath, { git });
@@ -254,10 +278,22 @@ export function prepareTaskWorkspace({
   const registered = worktreePaths(git, repositoryPath);
   const reusing = registered.some(path => samePath(path, workingDirectory));
 
+  // 未提交修改只有兩種出路：使用者自己處理掉，或使用者明確確認「保留這一組修改並繼續」。
+  // 第二種情況會帶著 approvedDirtyFingerprint 進來；指紋一致代表現在看到的就是他確認過的
+  // 那一組修改，可以繼續。指紋不同代表又有新的修改，必須重新確認，絕不自動放行。
+  // 注意：確認的語意是「TaskFlow 不動這些檔案」，不是「把它們帶進任務」——任務分支照樣
+  // 從最後一次 commit 開出，未提交修改留在使用者的專案目錄裡，原樣不動。
   if (!reusing && state.dirty.length) {
-    throw new GitSafetyError('dirty_working_tree',
-      `目前專案存在未提交修改。\n\nTaskFlow 不會自動修改或清除這些內容。\n\n請先確認後再開始任務。\n\n${state.dirty.slice(0, 30).join('\n')}`,
-      { files: state.dirty.slice(0, 30) });
+    if (approvedDirtyFingerprint && approvedDirtyFingerprint === state.dirtyFingerprint) {
+      events.push({
+        kind: 'git_dirty_approved',
+        message: `已依你的確認保留專案目錄中的 ${state.dirty.length} 項未提交修改：不 reset、不 clean、不 stash、不刪除、不覆蓋。任務分支自最後一次 commit（${String(state.head).slice(0, 8)}）開出，這些未提交修改不會進入任務工作副本。`,
+      });
+    } else {
+      throw new GitSafetyError('dirty_working_tree',
+        `目前專案存在未提交修改。\n\nTaskFlow 不會自動修改或清除這些內容。\n\n請先確認後再開始任務。\n\n${state.dirty.slice(0, 30).join('\n')}`,
+        { files: state.dirty.slice(0, 30), fileCount: state.dirty.length, fingerprint: state.dirtyFingerprint, branch: state.branch });
+    }
   }
 
   const workingBranch = taskBranchName({ taskId, title });
@@ -381,7 +417,7 @@ function assertMergeReady({ repositoryPath, baseBranch, git }) {
   if (state.dirty.length) {
     throw new GitSafetyError('dirty_working_tree',
       `${baseBranch} 目前存在未提交修改，已停止合併。\n\nTaskFlow 不會自動修改或清除這些內容。\n\n${state.dirty.slice(0, 30).join('\n')}`,
-      { files: state.dirty.slice(0, 30) });
+      { files: state.dirty.slice(0, 30), fileCount: state.dirty.length, fingerprint: state.dirtyFingerprint, branch: state.branch });
   }
   return state;
 }

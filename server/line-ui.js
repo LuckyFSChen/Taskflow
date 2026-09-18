@@ -7,6 +7,7 @@ import {lineProjectLocation,createLineProject} from './line-projects.js';
 import {createTaskWithProject,taskProjectLocation} from './task-project.js';
 import {changeTaskStatus} from './task-status.js';
 import {threadPresentation} from './thread-presentation.js';
+import {gitIssuePending} from './git-issue.js';
 
 export const menuButtons=[['發布任務','tf:new'],['建立專案','tf:create-project'],['任務進度','tf:status:0'],['待我審核','tf:pending:0'],['工作台','tf:web'],['重啟服務','tf:service-restart'],['最新網址','tf:service-url']];
 export function lineMessage(text,buttons=menuButtons){const message={type:'text',text:text.slice(0,4900)};if(buttons.length)message.quickReply={items:buttons.slice(0,13).map(([label,data])=>({type:'action',action:{type:'postback',label:label.slice(0,20),data,displayText:label.slice(0,100)}}))};return message;}
@@ -20,7 +21,9 @@ function progressSummary(store,task){
   if(task.plan?.steps?.length)text+=`｜${done}/${task.plan.steps.length} 步驟`;
   if(latest)text+=`\n最近角色：${latest.role||latest.phase}｜${threadPresentation(latest).statusLabel||statuses[latest.status]||latest.status}`;
   const skip=validationSkipRequest(store,task);
-  const next=skip?'選擇是否跳過受限驗證（仍記為未驗證）':executionApproval(store,task)?'核准或拒絕角色提出的操作':task.environmentIssue?'處理套件環境後核准重新檢查':task.outputIssue?'查看回傳格式問題與原始結果':task.status==='awaiting_approval'?'閱讀並核准計畫':task.status==='awaiting_repair_approval'?'閱讀並審核修正方案':task.status==='waiting_input'?(task.questions||[]).join('；')||'查看角色紀錄並處理阻塞':task.status==='failed'?task.error||'查看錯誤並決定處理方式':'';
+  // Git 守門在 LINE 上只說明狀況並指向網頁：確認保留未提交修改這種決定需要看到完整檔案清單，
+  // 不適合用一個 quick reply 按鈕代替。
+  const next=skip?'選擇是否跳過受限驗證（仍記為未驗證）':executionApproval(store,task)?'核准或拒絕角色提出的操作':gitIssuePending(task)?`在網頁確認 Git 未提交修改（${task.gitIssue.fileCount??(task.gitIssue.files||[]).length} 個檔案）：保留修改並繼續、我已自行處理重新檢查，或取消任務`:task.environmentIssue?'處理套件環境後核准重新檢查':task.outputIssue?'查看回傳格式問題與原始結果':task.status==='awaiting_approval'?'閱讀並核准計畫':task.status==='awaiting_repair_approval'?'閱讀並審核修正方案':task.status==='waiting_input'?(task.questions||[]).join('；')||'查看角色紀錄並處理阻塞':task.status==='failed'?task.error||'查看錯誤並決定處理方式':'';
   if(next)text+='\n待處理：'+next.slice(0,180);
   return text;
 }

@@ -16,6 +16,9 @@ import LineLinks from './LineLinks.vue';
 import ExecutionApproval from './ExecutionApproval.vue';
 import ValidationSkip from './ValidationSkip.vue';
 import ManualAction from './ManualAction.vue';
+// Git 守門（未提交修改／分支狀態）的人工確認區塊：以前這個情況只會顯示「需要處理」，
+// 沒有任何可以按的動作，任務因此永久卡住。
+import GitIssue from './GitIssue.vue';
 import NotificationManager from './NotificationManager.vue';
 import SystemHealth from './SystemHealth.vue';
 import OutputIssue from './OutputIssue.vue';
@@ -63,7 +66,7 @@ function applyAutoEngines(){const engines=taskEngineDefaults(newTask.type);newTa
 watch(()=>newTask.type,()=>{if(newTask.aiMode===AUTO)applyAutoEngines();});
 watch(()=>newTask.aiMode,mode=>{if(mode===AUTO)applyAutoEngines();else showAdvanced.value=true;});
 const projectForm=reactive({name:'',code:'',path:'',createIfMissing:true}),memberForm=reactive({name:'',username:'',password:'',projectIds:[] as string[]}),passwordForm=reactive({current:'',password:''});
-const statuses:Record<string,string>={planning:'等待規劃',awaiting_approval:'待審核',queued:'排隊中',running:'執行中',waiting_input:'等待回答',waiting_user_action:'需要你的協助',paused:'已暫停',completed:'已完成',repair_planning:'分析修正方案',awaiting_repair_approval:'待審核修正方案',rate_limited:'等待額度恢復',failed:'需要處理',cancelled:'已取消'};
+const statuses:Record<string,string>={planning:'等待規劃',awaiting_approval:'待審核',queued:'排隊中',running:'執行中',waiting_input:'等待回答',waiting_user_action:'需要你的協助',waiting_git_confirmation:'需要確認 Git 修改',paused:'已暫停',completed:'已完成',repair_planning:'分析修正方案',awaiting_repair_approval:'待審核修正方案',rate_limited:'等待額度恢復',failed:'需要處理',cancelled:'已取消'};
 const browserStatuses:Record<string,string>={not_required:'不需要',pending:'待執行',running:'執行中',passed:'通過',failed:'未通過',blocked:'受阻（未驗證）'};
 const priorities=['低','一般','高','緊急'];
 const nav=[{path:'/',label:'工作總覽',icon:LayoutDashboard},{path:'/attention',label:'待我處理',icon:Inbox},{path:'/tasks',label:'任務佇列',icon:ListTodo},{path:'/threads',label:'角色工作階段',icon:GitBranch},{path:'/settings',label:'平台設定',icon:Settings2}];
@@ -79,7 +82,10 @@ const completed=computed(()=>store.tasks.filter(t=>t.status==='completed').lengt
 const time=(value:string)=>value?new Intl.DateTimeFormat('zh-TW',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(new Date(value)):'—';
 const duration=(th:any)=>`${Math.max(0,Math.round(((th.finished?new Date(th.finished).getTime():Date.now())-new Date(th.started).getTime())/60000))} 分鐘`;
 const percent=(t:any)=>t.status==='completed'?100:t.totalSteps?Math.round(t.completedSteps/t.totalSteps*100):0;
-const statusLabel=(t:any)=>t.manualAction?'需要你的協助':t.manualCompletion?'手動完成':statuses[t.status];
+// 標題列的狀態一律沿用後端算好的 displayStatus（server/task-status.js 的優先序：
+// cancelled／completed 永遠贏過待處理項目），避免出現「任務已取消卻寫著待我處理」，
+// 也避免 Git 被擋住時只顯示「等待規劃」。
+const statusLabel=(t:any)=>t.status==='completed'&&t.manualCompletion?'手動完成':statuses[t.displayStatus||t.status]||statuses[t.status]||t.status;
 let interval:ReturnType<typeof setInterval>,toastTimer:ReturnType<typeof setTimeout>;
 function notify(message:string){toast.value=message;clearTimeout(toastTimer);toastTimer=setTimeout(()=>toast.value='',6000);}
 async function run(fn:()=>Promise<any>){if(busy.value)return;busy.value=true;try{await fn();await store.refresh();if(selected.value)await loadTask(selected.value.id);}catch(e:any){notify(e.message);}finally{busy.value=false;}}
@@ -190,6 +196,7 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
       <template v-if="tab==='overview'">
         <section v-if="detailPending.length" class="pending-actions" aria-label="需要你處理的事情"><h3><AlertCircle :size="17"/>需要你處理（{{detailPending.length}}）</h3><ul><li v-for="item in detailPending" :key="item.id"><strong>{{item.title}}</strong><small>{{item.description}}</small></li></ul><p class="subtle">以下依序列出可以處理的區塊。</p></section>
         <ManualAction :request="selected.manualAction" :skips="selected.manualActionSkips" :busy="busy" @decide="(decision,note)=>run(()=>api(`/tasks/${selected.id}/user-action/decision`,{requestId:selected.manualAction.id,decision,note}))"/>
+        <GitIssue :task="selected" :busy="busy" @decide="action=>run(()=>api(`/tasks/${selected.id}/git/recheck`,{issueId:selected.gitRequest.requestId,action}))"/>
         <section v-if="selected.environmentIssue" class="questions"><h3>套件環境處理方案待審核</h3><p class="prewrap">{{selected.environmentIssue.message}}</p><button v-if="selected.status==='waiting_input'" class="primary" :disabled="busy" @click="run(()=>api(`/tasks/${selected.id}/preflight/retry`,{issueId:selected.environmentIssue.id}))">環境已處理，核准重新檢查</button><p>檢查通過才繼續已核准的步驟；更換套件須在下方補充需求並重新審核計畫。</p></section>
         <OutputIssue :task="selected" :busy="busy" :raw="outputRaw" :recovery="outputRecovery" @recover="recoverOutput" @raw="loadOriginalOutput" @replan="focusRevise"/>
         <ValidationSkip :request="selected.validationSkipRequest" :skips="selected.validationSkips" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/validation/decision`,{requestId:selected.validationSkipRequest.id,decision}))"/>
@@ -207,7 +214,7 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
         <h3>原始需求</h3><p class="prewrap requirement">{{selected.description}}</p>
         <div v-if="!selected.plan" class="notice"><Clock3 :size="18"/>{{store.runner.enabled?'根節點將依順序整理計畫。':'AI 執行服務目前暫停；啟用後才會整理計畫。'}}</div>
         <template v-else><div class="section-heading"><h3>計畫摘要</h3><span class="count">v{{selected.planVersion}}</span></div><p class="prewrap">{{selected.plan.summary}}</p><h3>驗收條件</h3><ul class="acceptance"><li v-for="(a,i) in selected.plan.acceptance" :key="i"><ShieldCheck :size="16"/>{{a}}</li></ul><p class="subtle">每一步要做什麼、目前做到哪裡，在「執行進度」分頁。</p><button v-if="selected.status==='awaiting_approval'" class="primary full" :disabled="busy" @click="run(()=>api(`/tasks/${selected.id}/approve`,{version:selected.planVersion}))"><ShieldCheck :size="18"/>核准計畫 v{{selected.planVersion}} 並加入執行佇列</button></template>
-        <form v-if="!selected.validationSkipRequest&&!selected.executionApproval&&!selected.manualAction&&['waiting_input','awaiting_approval','paused','failed'].includes(selected.status)" @submit.prevent="run(async()=>{await api(`/tasks/${selected.id}/revise`,{answer});answer='';})"><label>回答問題或補充需求<textarea v-model="answer" class="revise-input" rows="3" minlength="2" maxlength="8000" required placeholder="補充後會建立新版計畫，重新請你審核。"/></label><button class="secondary" :disabled="busy">送出補充並重新規劃</button></form>
+        <form v-if="!selected.validationSkipRequest&&!selected.executionApproval&&!selected.manualAction&&!selected.gitRequest&&['waiting_input','awaiting_approval','paused','failed'].includes(selected.status)" @submit.prevent="run(async()=>{await api(`/tasks/${selected.id}/revise`,{answer});answer='';})"><label>回答問題或補充需求<textarea v-model="answer" class="revise-input" rows="3" minlength="2" maxlength="8000" required placeholder="補充後會建立新版計畫，重新請你審核。"/></label><button class="secondary" :disabled="busy">送出補充並重新規劃</button></form>
       </template>
 
       <!-- 執行進度：狀態全部由現有資料推導，沒有任何預估的完成百分比。 -->

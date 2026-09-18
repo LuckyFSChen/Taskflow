@@ -73,6 +73,12 @@ function questionsPending(task) {
 
 const PENDING_RULES = [
   {
+    id: 'git_issue',
+    match: task => !!task.gitRequest,
+    title: task => task.gitRequest?.title || '需要確認 Git 修改',
+    description: 'Git 工作目錄需要你確認後才會繼續。TaskFlow 不會刪除、reset、clean、stash 或覆蓋你的未提交修改。',
+  },
+  {
     id: 'manual_action',
     match: task => !!task.manualAction,
     title: task => (list(task.manualAction?.commands).length ? '需要你在本機執行指令' : '需要你完成一項本機操作'),
@@ -136,6 +142,8 @@ const PENDING_RULES = [
  */
 export function pendingActions(task) {
   if (!task) return [];
+  // 與「待我處理」列表一致：已取消／已完成的任務不再列出待處理事項，殘留的旗標只當成歷程。
+  if (['cancelled', 'completed'].includes(task.status)) return [];
   return PENDING_RULES
     .filter(rule => rule.match(task))
     .map(rule => ({ id: rule.id, title: rule.title(task), description: rule.description }));
@@ -182,6 +190,8 @@ function step(key, label, state, detail = '', note = '') {
 // 規劃：計畫存在就是已完成，不管後來有沒有被核准。
 function planStep(task) {
   if (task.plan) return step('plan', '整理需求與計畫', 'done', `計畫 v${task.planVersion}`);
+  // Git 守門在規劃開始前就擋住了，這一列必須說出真正的原因，否則會看起來像「尚未開始」。
+  if (task.gitRequest) return step('plan', '整理需求與計畫', 'blocked', task.gitRequest.title || '需要你確認 Git 狀態', '確認後才會開始規劃');
   if (task.status === 'planning') return step('plan', '整理需求與計畫', 'active', '正在唯讀分析需求');
   if (questionsPending(task)) return step('plan', '整理需求與計畫', 'blocked', 'AI 提出了待確認問題');
   return step('plan', '整理需求與計畫', 'pending');
@@ -202,7 +212,7 @@ function executionSteps(task) {
   if (!steps.length) return [];
   const done = Number.isInteger(task.completedSteps) ? task.completedSteps : 0;
   const running = runningThread(task, ['execute']);
-  const blocked = !!task.manualAction || !!task.environmentIssue || !!task.executionApproval;
+  const blocked = !!task.manualAction || !!task.environmentIssue || !!task.executionApproval || !!task.gitRequest;
   return steps.map((planStepItem, index) => {
     const key = `step-${index}`;
     const label = text(planStepItem?.title) || `步驟 ${index + 1}`;
