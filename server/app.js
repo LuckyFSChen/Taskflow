@@ -12,6 +12,7 @@ import { id,hash,passwordHash,passwordMatches } from './db.js';
 import { HttpError,createTask,requireTask,approveTask,reviseTask } from './domain.js';
 import {executionApproval,decideExecutionApproval} from './execution-approval.js';
 import {validationSkipRequest,decideValidationSkip} from './validation-skip.js';
+import {manualActionRequest,decideManualAction} from './manual-action.js';
 import { prepareProjectDirectory } from './project-directory.js';
 import {browseDirectory,createDirectory,availableDrives} from './directory-browser.js';
 import {createTaskWithProject} from './task-project.js';
@@ -70,7 +71,7 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/projects/:id/preview',async(req,res)=>{const target=projectTarget(req);res.json(await previews.start(target.key,target.path));});
   app.post('/api/projects/:id/preview/stop',async(req,res)=>{const target=projectTarget(req);await previews.stop(target.key);res.json({ok:true});});
   const visibleProjects=user=>{const projects=store.db.prepare('SELECT * FROM projects').all().filter(p=>store.hasProject(user,p.id));return projects.map(p=>user.role==='admin'?p:{id:p.id,name:p.name,code:p.code});};
-  function decorated(t){const threads=store.threads(t.id).filter(th=>th.version===t.planVersion).map(th=>({...th,...threadPresentation(th)}));return {...t,validationSkipRequest:validationSkipRequest(store,t),executionApproval:executionApproval(store,t),workspace:undefined,threads,ownerName:store.user(t.ownerId)?.name,projectName:store.project(t.projectId)?.name,completedSteps:threads.filter(th=>th.phase==='execute'&&th.status==='completed'&&th.result?.passed&&!th.result.questions?.length).length,totalSteps:t.plan?.steps.length||0};}
+  function decorated(t){const threads=store.threads(t.id).filter(th=>th.version===t.planVersion).map(th=>({...th,...threadPresentation(th)}));return {...t,validationSkipRequest:validationSkipRequest(store,t),executionApproval:executionApproval(store,t),manualAction:manualActionRequest(store,t),workspace:undefined,threads,ownerName:store.user(t.ownerId)?.name,projectName:store.project(t.projectId)?.name,completedSteps:threads.filter(th=>th.phase==='execute'&&th.status==='completed'&&th.result?.passed&&!th.result.questions?.length).length,totalSteps:t.plan?.steps.length||0};}
   app.get('/api/state',async(req,res)=>{
     const browser=await checkClaudeBrowserCapability().catch(error=>({available:false,provider:null,cli:'claude',error:error.message}));
     res.json({user:req.user,defaultProjectRoot:req.user.role==='admin'?store.setting('defaultProjectRoot',''):undefined,projects:visibleProjects(req.user),tasks:store.tasks(req.user).map(decorated),runner:{enabled:store.setting('runnerEnabled',false),...runner.status,maxConcurrent:runnerLimit(store),activeTaskIds:(runner.status.activeTaskIds||[]).filter(id=>store.tasks(req.user).some(t=>t.id===id)),activeTaskId:store.tasks(req.user).some(t=>t.id===runner.status.activeTaskId)?runner.status.activeTaskId:null},integrations:{lineConfigured:!!(process.env.INBOX_URL&&process.env.INBOX_TOKEN),lastSync:store.setting('inboxLastSuccess'),error:store.setting('inboxError'),notificationError:store.db.prepare("SELECT error FROM outbox WHERE sent=0 AND cancelled_at IS NULL AND error IS NOT NULL ORDER BY rowid DESC LIMIT 1").get()?.error||null,pendingNotifications:store.db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent=0 AND cancelled_at IS NULL').get().n,browser:{configured:!!browser.available,provider:browser.provider,available:browser.available,error:browser.error}}});
@@ -85,9 +86,10 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/tasks/:id/revise',(req,res)=>res.json(decorated(reviseTask(store,req.user,req.params.id,req.body.answer))));
   app.post('/api/tasks/:id/execution/decision',(req,res)=>res.json(decorated(store.transaction(()=>decideExecutionApproval(store,req.user,req.params.id,req.body)))));
   app.post('/api/tasks/:id/validation/decision',(req,res)=>res.json(decorated(store.transaction(()=>decideValidationSkip(store,req.user,req.params.id,req.body)))));
+  app.post('/api/tasks/:id/user-action/decision',(req,res)=>res.json(decorated(store.transaction(()=>decideManualAction(store,req.user,req.params.id,req.body)))));
   app.post('/api/tasks/:id/action',(req,res)=>{const t=requireTask(store,req.user,req.params.id),action=z.enum(['pause','resume','cancel','stop','retry','publish-approve']).parse(req.body.action),active=store.threads(t.id).some(x=>x.status==='running');
     if(action==='pause'){if(!['planning','repair_planning','awaiting_repair_approval','rate_limited','queued','running'].includes(t.status))throw new HttpError(409,'此狀態無法暫停');t.resumeStatus=t.status==='planning'?'planning':'queued';t.status='paused';}
-    if(['resume','retry'].includes(action)&&(t.outputIssue||t.environmentIssue))throw new HttpError(409,'請先審核問題處理方案；不能直接重跑工作');
+    if(['resume','retry'].includes(action)&&(t.outputIssue||t.environmentIssue||t.userActionRequired?.status==='pending'))throw new HttpError(409,'請先審核問題處理方案；不能直接重跑工作');
     if(action==='resume'||action==='retry'){if(!['paused','failed'].includes(t.status)||active)throw new HttpError(409,'尚無法恢復，請等待目前工作結束');t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'planning';t.error=null;}
     if(action==='cancel'){if(['completed','cancelled'].includes(t.status))throw new HttpError(409,'任務已結束');t.status='cancelled';runner.stopTask(t.id);}
     if(action==='stop'){if(!active)throw new HttpError(409,'目前沒有正在執行的工作');t.status='paused';t.error='已中止執行，請檢查工作副本後恢復。';runner.stopTask(t.id);}

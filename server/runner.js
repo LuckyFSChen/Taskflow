@@ -10,9 +10,10 @@ import { resolve,join,basename } from 'node:path';
 import { id,now } from './db.js';
 import { planSchema,resultSchema,planJson,resultJson } from './domain.js';
 import { commandPermissionArgs, developmentCommandRules } from './command-permissions.js';
+import {detectManualActionRequirement,buildUserActionRequest} from './manual-action.js';
 import {resolveCliExecutable} from './cli-executable.js';
 import {detectWebProject,createProjectPreview} from './project-preview.js';
-import {deriveBrowserValidationRequirement,checkClaudeBrowserCapability,browserMcpServerSpec,browserMcpConfig,browserAllowedTools,isBrowserToolName,categorizeBrowserTool,reconcileBrowserValidation} from './browser-capability.js';
+import {deriveBrowserValidationRequirement,checkClaudeBrowserCapability,browserMcpServerSpec,browserMcpConfig,browserAllowedTools,isBrowserToolName,categorizeBrowserTool,reconcileBrowserValidation,defaultBrowserValidation} from './browser-capability.js';
 
 const blocked=name=> /^(node_modules|\.git|\.env(?:\..*)?|data|dist|build|\.venv|venv|\.ssh|\.aws|\.codex|\.claude|\.taskflow|first-login\.txt)$/i.test(name)||/\.(pem|key|pfx|sqlite(?:-wal|-shm)?)$/i.test(name);
 export function snapshot(source,dest,{excludePaths=[]}={}) {
@@ -101,7 +102,7 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
   }
   async function runTask(t,slot){let thread;const controlVersion=t.controlVersion||0;
     try {
-      if(t.outputIssue||t.environmentIssue)return;
+      if(t.outputIssue||t.environmentIssue||t.userActionRequired?.status==='pending')return;
       const project=store.project(t.projectId);if(!project||!existsSync(project.path))throw new Error('專案資料夾不存在');
       const all=store.threads(t.id).filter(x=>x.version===t.planVersion);
       let phase,step,eng;
@@ -124,6 +125,8 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
       if(phase==='review'&&t.repairPlan)prompt+=`\n本輪核准的修正方案與重新驗證標準：${JSON.stringify(t.repairPlan)}。請同時驗證原始驗收條件與本輪修正標準，逐項列出證據。`;
       if(phase==='repair')prompt+=`\n只能依這份已核准修正方案執行：${JSON.stringify(t.repairPlan)}。修正後交由獨立驗證，不可自行擴大範圍。`;
       prompt+='\n套件政策：若安裝或下載被拒絕，立即停止依賴該套件的工作，回報確切失敗與處理建議。不得擅自替换套件、略過驗收或自製替代實作；變更方案須先經使用者審核。';
+      if(['execute','repair'].includes(phase))prompt+='\n手動操作原則：若必要指令因執行環境的核准機制、權限提升、系統管理員權限或政策限制而無法執行（例如工具回報 requires approval、requires elevation、administrator privileges、access denied、blocked by policy 等），這不是程式錯誤，不要反覆嘗試相同或等效的指令（換套件管理器、換 shell 包裝方式都算同一操作）。改為在 summary 與 evidence 中如實引用被拒絕的訊息，並在 userActionRequired 回傳 required=true、actionType（例如 run_command）、commands（使用者需要手動執行的確切指令，依序列出）、workingDirectory（絕對路徑）、instructions（給使用者的具體操作說明；一般情況請建議使用一般權限即可，只有確定需要才提及系統管理員）、requiresAdministrator（true/false，不確定則省略）、verification（之後如何驗證這項操作已完成）。passed 仍應為 false，但不代表需要重新規劃或改變方案。';
+      if(phase==='review')prompt+='\n若某項驗收因執行環境的核准、權限或政策限制而無法完成（不是實作本身有問題），不要當作一般失敗、也不要要求重新規劃；在 userActionRequired 回傳同樣的結構化資訊（reason、actionType、commands、workingDirectory、instructions、verification），並在 summary 中明確指出這是環境限制而非實作問題。若使用者已回報「已手動完成」相關操作，只需驗證其結果（例如檢查檔案、資料庫或指令輸出），不要重新執行相同或等效的指令。';
       prompt+=clarificationPrompt(t,store.threads(t.id));
       if(['execute','repair','review'].includes(phase)&&t.validationSkips?.length)prompt+=`\n使用者同意跳過的工具受限檢查：${JSON.stringify(t.validationSkips.filter(s=>s.planVersion===t.planVersion))}。僅跳過報告中因工具存取失敗而無法執行的項目，summary 必須逐項標示「未驗證／經同意跳過」，不得聲稱這些項目通過，不要再嘗試被工具拒絕的存取。其他驗收項目仍須實際檢查；功能錯誤不能跳過。passed 表示其餘必要檢查是否通過，若其餘項目未通過仍回 false。`;
       let browserRequirement={required:false,requiresInteraction:false,reason:null,previewUrl:null,capability:null,previewError:null};
@@ -175,11 +178,20 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
           // skip flow, so a human explicitly decides to wait or accept it as unverified — never silent pass.
           if(result.browserValidation.status==='blocked')result.evidence=[...result.evidence,`驗證工具存取失敗：Browser MCP（${result.browserValidation.error||'unavailable'}）`];
         }
+        // Deterministic guard: an approval/elevation/policy block is environment-restricted,
+        // not a program failure — never let it fall into the ordinary failed/repair-retry path.
+        const manualAction=detectManualActionRequirement({summary:result.summary,evidence:result.evidence,selfReport:result.userActionRequired});
+        if(manualAction){result.passed=false;result.userActionRequired=buildUserActionRequest({detection:manualAction,selfReport:result.userActionRequired,workingDirectory:t.workspace,phase,threadId:thread.id,planVersion:t.planVersion});}
       }
       thread.status='completed';thread.finished=now();thread.result=result;thread.summary=result.summary;thread.sessionId=output.sessionId;store.saveThread(thread);
       const current=store.task(t.id);if(current.status==='cancelled'||(current.status==='paused'&&current.error==='已中止執行，請檢查工作副本後恢復。'))return;
       const wasPaused=current.status==='paused';Object.assign(t,current);t.error=null;
-      if(phase==='plan'){t.plan=result;t.questions=result.questions;t.status=result.questions.length?'waiting_input':'awaiting_approval';store.notify(t,result.questions.length?`需要你回答：\n${result.questions.join('\n')}`:`計畫 v${t.planVersion} 已完成，請點「查看任務」閱讀並審核。`);}
+      if(result.userActionRequired?.required){
+        t.validationReviewPending=false;t.questions=[];t.userActionRequired=result.userActionRequired;t.status='waiting_input';
+        store.event(t.id,'needs_user_action',`偵測到需要使用者手動操作：${t.userActionRequired.reason}`,thread.id);
+        store.notify(t,`需要你的協助：目前執行環境無法完成此操作，請依步驟手動執行後回報。\n${t.userActionRequired.instructions}`);
+      }
+      else if(phase==='plan'){t.plan=result;t.questions=result.questions;t.status=result.questions.length?'waiting_input':'awaiting_approval';store.notify(t,result.questions.length?`需要你回答：\n${result.questions.join('\n')}`:`計畫 v${t.planVersion} 已完成，請點「查看任務」閱讀並審核。`);}
       else if(phase==='repair_plan'){
         t.repairPlan={...result,id:id(),round:t.round,planVersion:t.planVersion};t.approvedRepairId=null;t.repairApproval=null;t.status='awaiting_repair_approval';
         store.notify(t,`第 ${t.round} 輪修正方案已提出，請查看驗證問題、原因與解法，核准後才會修正。`);
@@ -196,6 +208,17 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
       store.saveTask(t);store.event(t.id,'finished',`${thread.role}：${result.summary}`,thread.id);
     }catch(e){if((store.task(t.id).controlVersion||0)!==controlVersion){if(thread){thread.status='cancelled';thread.finished=now();thread.error='使用者已變更任務狀態，工作已停止。';store.saveThread(thread);}return;}const reset=thread?parseEngineLimit(e.message,clock()):null;
       if(thread){thread.status=reset?'rate_limited':'failed';thread.finished=now();thread.error=e.message;thread.sessionId=e.sessionId||thread.sessionId;store.saveThread(thread);}const current=store.task(t.id);
+      const manualAction=thread&&['execute','repair','review'].includes(thread.phase)?detectManualActionRequirement({message:e.message}):null;
+      if(manualAction&&!['cancelled','paused','completed'].includes(current.status)){
+        current.userActionRequired=buildUserActionRequest({detection:manualAction,selfReport:null,workingDirectory:t.workspace,phase:thread.phase,threadId:thread.id,planVersion:current.planVersion});
+        thread.status='completed';thread.finished=now();thread.error=null;
+        thread.result={summary:current.userActionRequired.reason,questions:[],artifacts:[],passed:false,evidence:[e.message.slice(0,2000)],browserValidation:defaultBrowserValidation(),userActionRequired:current.userActionRequired};
+        store.saveThread(thread);
+        current.status='waiting_input';current.error=null;store.saveTask(current);
+        store.event(t.id,'needs_user_action',`偵測到需要使用者手動操作：${current.userActionRequired.reason}`,thread.id);
+        store.notify(current,`需要你的協助：目前執行環境無法完成此操作，請依步驟手動執行後回報。\n${current.userActionRequired.instructions}`);
+        return;
+      }
       if(['OUTPUT_FORMAT','DEPENDENCY_PREFLIGHT'].includes(e.code)&&!['cancelled','paused','completed'].includes(current.status)){
         const issue={id:id(),threadId:thread?.id,phase:thread?.phase,planVersion:current.planVersion,message:e.message,at:now()};
         if(e.code==='OUTPUT_FORMAT')current.outputIssue={...issue,issues:e.issues||[],runDir:e.runDir};else current.environmentIssue={...issue,report:e.report};

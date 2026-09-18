@@ -10,7 +10,7 @@ export function changeTaskStatus(store,runner,user,tid,input){
   const active=store.threads(tid).some(t=>t.status==='running');
   if(status==='reopen'&&active)throw new HttpError(409,'AI 工作正在停止，請稍後再恢復。');
   let next=status;
-  if(status==='reopen'&&(task.outputIssue||task.environmentIssue))throw new HttpError(409,'請先審核問題處理方案；格式問題需補充後重新規劃，環境問題請使用重新檢查。');
+  if(status==='reopen'&&(task.outputIssue||task.environmentIssue||task.userActionRequired?.status==='pending'))throw new HttpError(409,'請先審核問題處理方案；格式問題需補充後重新規劃，環境問題請使用重新檢查，需要你協助的操作請先回報結果。');
   if(status==='reopen'){
     next=!task.plan?'planning':task.questions?.length?'waiting_input':task.approvedVersion===task.planVersion?'queued':'awaiting_approval';
     // Preserve repair progress and its separate approval gate when resuming.
