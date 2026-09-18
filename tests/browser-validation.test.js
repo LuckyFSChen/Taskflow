@@ -47,15 +47,72 @@ test('reconcileBrowserValidation ignores a claimed pass when no real tool_use ev
   assert.equal(result.toolUsed,false);
   assert.match(result.error,/未偵測到 Browser MCP 工具呼叫/);
 });
-test('reconcileBrowserValidation accepts a pass backed by real tool_use evidence',()=>{
+test('reconcileBrowserValidation accepts a pass backed by real navigate tool_use evidence',()=>{
   const requirement={required:true,previewUrl:'http://127.0.0.1:1'};
   const claimed={required:true,status:'passed',executed:true,passed:true,toolUsed:true,toolCallCount:3,url:'http://127.0.0.1:1',checks:[],consoleErrors:[],networkErrors:[],notes:'',error:null};
-  const result=reconcileBrowserValidation(claimed,{toolUsed:true,toolCallCount:3},requirement);
+  const result=reconcileBrowserValidation(claimed,{toolUsed:true,toolCallCount:3,categories:{navigate:1,console:2}},requirement);
   assert.equal(result.executed,true);assert.equal(result.passed,true);assert.equal(result.status,'passed');assert.equal(result.toolCallCount,3);
 });
 test('reconcileBrowserValidation resets everything to not_required when the task did not need it',()=>{
-  const result=reconcileBrowserValidation({required:true,status:'passed',executed:true,passed:true,toolUsed:true,toolCallCount:9,url:'x',checks:[],consoleErrors:[],networkErrors:[],notes:'',error:null},{toolUsed:true,toolCallCount:9},{required:false});
+  const result=reconcileBrowserValidation({required:true,status:'passed',executed:true,passed:true,toolUsed:true,toolCallCount:9,url:'x',checks:[],consoleErrors:[],networkErrors:[],notes:'',error:null},{toolUsed:true,toolCallCount:9,categories:{navigate:1,interact:1}},{required:false});
   assert.deepEqual(result,defaultBrowserValidation());
+});
+
+// --- Stricter evidence: any mcp__playwright__* call used to count as "executed", even a lone
+// console/screenshot call with no navigate. TaskFlow now requires real navigate evidence, and for
+// interaction-required tasks, real interact evidence too — the AI's own executed/passed claim is
+// never authoritative. ---------------------------------------------------------------------------
+test('1) No Browser tool call at all → blocked, passed=false',()=>{
+  const requirement={required:true,requiresInteraction:false,previewUrl:'http://127.0.0.1:1'};
+  const claimed={...defaultBrowserValidation(),required:true,status:'passed',executed:true,passed:true};
+  const result=reconcileBrowserValidation(claimed,{toolCallCount:0,categories:{}},requirement);
+  assert.equal(result.executed,false);assert.equal(result.passed,false);assert.equal(result.status,'blocked');
+});
+test('2) Only console tool called, no navigate → blocked, executed=false (a single non-navigate call must not count as "executed")',()=>{
+  const requirement={required:true,requiresInteraction:false,previewUrl:'http://127.0.0.1:1'};
+  const claimed={...defaultBrowserValidation(),required:true,status:'passed',executed:true,passed:true};
+  const result=reconcileBrowserValidation(claimed,{toolCallCount:1,categories:{console:1}},requirement);
+  assert.equal(result.executed,false);assert.equal(result.passed,false);assert.equal(result.status,'blocked');
+  assert.match(result.error,/未偵測到 Browser navigate 工具呼叫/);
+});
+test('2b) Only screenshot tool called, no navigate → blocked',()=>{
+  const requirement={required:true,requiresInteraction:false,previewUrl:'http://127.0.0.1:1'};
+  const claimed={...defaultBrowserValidation(),required:true,status:'passed',executed:true,passed:true};
+  const result=reconcileBrowserValidation(claimed,{toolCallCount:1,categories:{inspect:1}},requirement);
+  assert.equal(result.executed,false);assert.equal(result.status,'blocked');
+});
+test('3) Navigate present, non-interaction task → real Browser executed, AI pass/fail claim decides the outcome',()=>{
+  const requirement={required:true,requiresInteraction:false,previewUrl:'http://127.0.0.1:1'};
+  const passing=reconcileBrowserValidation({...defaultBrowserValidation(),required:true,passed:true},{toolCallCount:1,categories:{navigate:1}},requirement);
+  assert.equal(passing.executed,true);assert.equal(passing.passed,true);assert.equal(passing.status,'passed');
+  const failing=reconcileBrowserValidation({...defaultBrowserValidation(),required:true,passed:false},{toolCallCount:1,categories:{navigate:1}},requirement);
+  assert.equal(failing.executed,true);assert.equal(failing.passed,false);assert.equal(failing.status,'failed');
+});
+test('4) Navigate present but interaction task has no interact call → executed=true, passed=false, status=failed',()=>{
+  const requirement={required:true,requiresInteraction:true,previewUrl:'http://127.0.0.1:1'};
+  const claimed={...defaultBrowserValidation(),required:true,status:'passed',executed:true,passed:true};
+  const result=reconcileBrowserValidation(claimed,{toolCallCount:1,categories:{navigate:1}},requirement);
+  assert.equal(result.executed,true);assert.equal(result.passed,false);assert.equal(result.status,'failed');
+  assert.match(result.error,/未偵測到 Browser interact 工具呼叫/);
+});
+test('5) Navigate + interact present for an interaction task → real pass is honoured',()=>{
+  const requirement={required:true,requiresInteraction:true,previewUrl:'http://127.0.0.1:1'};
+  const claimed={...defaultBrowserValidation(),required:true,passed:true};
+  const result=reconcileBrowserValidation(claimed,{toolCallCount:2,categories:{navigate:1,interact:1}},requirement);
+  assert.equal(result.executed,true);assert.equal(result.passed,true);assert.equal(result.status,'passed');
+});
+test('AI-supplied executed/passed is never authoritative on its own: navigate+interact present but AI claims passed=false → failed, not passed',()=>{
+  const requirement={required:true,requiresInteraction:true,previewUrl:'http://127.0.0.1:1'};
+  const claimed={...defaultBrowserValidation(),required:true,status:'passed',executed:true,passed:false};
+  const result=reconcileBrowserValidation(claimed,{toolCallCount:2,categories:{navigate:1,interact:1}},requirement);
+  assert.equal(result.passed,false);assert.equal(result.status,'failed');
+});
+test('deriveBrowserValidationRequirement flags requiresInteraction for button/click/form tasks, not for plain layout/content tasks',()=>{
+  assert.equal(deriveBrowserValidationRequirement({webKind:'vite',title:'新增按鈕',description:'點擊按鈕後顯示彈窗'}).requiresInteraction,true);
+  assert.equal(deriveBrowserValidationRequirement({webKind:'vite',title:'Add a submit form',description:'user fills a form and clicks submit'}).requiresInteraction,true);
+  const layoutOnly=deriveBrowserValidationRequirement({webKind:'vite',title:'調整頁面標題字體',description:'頁面上方標題文字的字體大小與行距需要調整，屬於純視覺排版微調'});
+  assert.equal(layoutOnly.required,true);
+  assert.equal(layoutOnly.requiresInteraction,false);
 });
 
 // --- Runner-level integration: the guard is actually wired into the review phase --------

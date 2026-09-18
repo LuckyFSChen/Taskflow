@@ -58,6 +58,26 @@ const failReport=await runScenario('fail-scenario',FAIL_HTML);
 console.log('\n=== Summary ===');
 console.log('Pass scenario browserValidation:',JSON.stringify(passReport.reviewResult?.browserValidation));
 console.log('Fail scenario browserValidation:',JSON.stringify(failReport.reviewResult?.browserValidation));
-const ok=passReport.reviewResult?.browserValidation?.toolUsed===true&&failReport.reviewResult?.browserValidation?.toolUsed===true;
-console.log(ok?'REAL BROWSER MCP EVIDENCE: toolUsed=true on both real Claude Code review calls.':'WARNING: did not observe real Browser MCP tool_use evidence.');
+
+// toolUsed=true alone is too weak a claim — a lone browser_console_messages call with no
+// navigate would also set it. Require the real per-category evidence TaskFlow itself counted
+// from the stream-json transcript: at least one navigate call and, since this fixture's task
+// is an interaction task (a button that must be clicked), at least one interact call too.
+function checkEvidence(label,bv){
+  const categories=bv?.categories||{};
+  const checks=[
+    ['toolCallCount >= 2',(bv?.toolCallCount||0)>=2],
+    ['categories.navigate >= 1 (real browser_navigate observed)',(categories.navigate||0)>=1],
+    ['categories.interact >= 1 (real browser_click/type/... observed)',(categories.interact||0)>=1],
+  ];
+  const failed=checks.filter(([,ok])=>!ok);
+  console.log(`[${label}] evidence checks:`,checks.map(([d,ok])=>`${ok?'✓':'✗'} ${d}`).join('; '));
+  return failed.length===0;
+}
+const passEvidenceOk=checkEvidence('pass-scenario',passReport.reviewResult?.browserValidation);
+const failEvidenceOk=checkEvidence('fail-scenario',failReport.reviewResult?.browserValidation);
+const ok=passEvidenceOk&&failEvidenceOk;
+console.log(ok
+  ?'REAL BROWSER MCP EVIDENCE: navigate >= 1 and interact >= 1 independently confirmed on both real Claude Code review calls (not just toolUsed=true).'
+  :'WARNING: did not observe real navigate+interact Browser MCP tool_use evidence on both scenarios.');
 process.exitCode=ok?0:1;
