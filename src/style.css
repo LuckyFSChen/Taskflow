@@ -14,3 +14,23 @@
 .project-directory-field{display:flex;gap:8px;align-items:center}.project-directory-field input{min-width:0;cursor:pointer}.project-directory-field button{flex-shrink:0}
 
 @media(max-width:600px){.task-table-row>.task-status-select{grid-column:3;grid-row:1;min-width:0}}
+
+
+/* 待我處理 */
+.nav-count.attention{background:#f5c451;color:#3a2a08;font-weight:600;min-width:20px;text-align:center}
+.attention-lead{margin:0;padding:16px 24px 0;font-size:.875rem;color:var(--muted)}
+.attention-list{display:grid;gap:16px}
+.attention-card{padding:20px 22px;display:grid;gap:10px;border-left:3px solid #d9dfe7}
+.attention-card.plan_approval,.attention-card.repair_approval,.attention-card.execution_approval{border-left-color:var(--accent)}
+.attention-card.manual_action,.attention-card.validation_skip,.attention-card.environment_issue{border-left-color:#e0a83c}
+.attention-card.output_issue,.attention-card.waiting_answer{border-left-color:#5b8bd0}
+.attention-card.task_failed{border-left-color:#c8595c}
+.attention-card-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.attention-project{display:inline-flex;align-items:center;gap:6px;font-size:.8125rem;font-weight:600;color:var(--muted)}
+.attention-card h3{margin:0;font-size:1.0625rem}
+.attention-kind{margin:0;display:flex;align-items:center;gap:7px;font-size:.9375rem;font-weight:600;color:#8a6212}
+.attention-card.plan_approval .attention-kind,.attention-card.repair_approval .attention-kind,.attention-card.execution_approval .attention-kind{color:#0a6a60}
+.attention-card.task_failed .attention-kind{color:#b64c4f}
+.attention-reason{margin:0;font-size:.875rem;color:#55627a;white-space:pre-wrap;overflow-wrap:anywhere}
+.attention-card-foot{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:2px}
+@media(max-width:850px){.sidebar nav a{position:relative}.nav-count.attention{display:inline-flex;position:absolute;top:7px;right:9px;min-width:18px;padding:0 5px;font-size:.6875rem;line-height:18px}}

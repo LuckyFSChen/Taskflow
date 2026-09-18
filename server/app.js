@@ -19,6 +19,7 @@ import {createTaskWithProject} from './task-project.js';
 import {changeTaskStatus} from './task-status.js';
 import {createProjectPreview,detectWebProject,openFolder} from './project-preview.js';
 import {checkClaudeBrowserCapability} from './browser-capability.js';
+import {createSystemHealth} from './system-health.js';
 
 export function allowedOrigins(publicOrigin=process.env.PUBLIC_ORIGIN) {
   const configured=new URL(publicOrigin||`http://127.0.0.1:${process.env.PORT||4310}`).origin;
@@ -32,7 +33,7 @@ export function allowedOrigins(publicOrigin=process.env.PUBLIC_ORIGIN) {
   return [...allowed];
 }
 
-export function createApp(store,runner,{dist=resolve('dist'),previews=createProjectPreview(),folderOpener=openFolder}={}) {
+export function createApp(store,runner,{dist=resolve('dist'),previews=createProjectPreview(),folderOpener=openFolder,health=createSystemHealth(store)}={}) {
   const app=express(),attempts=new Map();app.disable('x-powered-by');
   app.use((req,res,next)=>{res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','same-origin');res.setHeader('X-Frame-Options','DENY');res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");next();});
   app.use('/api',express.json({limit:'100kb'}));
@@ -80,6 +81,10 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     const browser=await checkClaudeBrowserCapability().catch(error=>({available:false,provider:null,cli:'claude',error:error.message}));
     res.json({user:req.user,defaultProjectRoot:req.user.role==='admin'?store.setting('defaultProjectRoot',''):undefined,projects:visibleProjects(req.user),tasks:store.tasks(req.user).map(decorated),runner:{enabled:store.setting('runnerEnabled',false),...runner.status,maxConcurrent:runnerLimit(store),activeTaskIds:(runner.status.activeTaskIds||[]).filter(id=>store.tasks(req.user).some(t=>t.id===id)),activeTaskId:store.tasks(req.user).some(t=>t.id===runner.status.activeTaskId)?runner.status.activeTaskId:null},integrations:{lineConfigured:!!(process.env.INBOX_URL&&process.env.INBOX_TOKEN),lastSync:store.setting('inboxLastSuccess'),error:store.setting('inboxError'),notificationError:store.db.prepare("SELECT error FROM outbox WHERE sent=0 AND cancelled_at IS NULL AND error IS NOT NULL ORDER BY rowid DESC LIMIT 1").get()?.error||null,pendingNotifications:store.db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent=0 AND cancelled_at IS NULL').get().n,browser:{configured:!!browser.available,provider:browser.provider,available:browser.available,error:browser.error}}});
   });
+  // Read-only environment report every signed-in member can see: the dashboard warning
+  // and 平台設定 both read it. ?refresh=1 is a manual re-check, still rate limited inside
+  // the provider so a polling client can never spawn CLI processes continuously.
+  app.get('/api/system/health',async(req,res)=>res.json(await health.get({force:req.query.refresh==='1'})));
   app.post('/api/tasks',(req,res)=>res.status(201).json(decorated(store.transaction(()=>createTaskWithProject(store,req.user,req.body)))));
   app.get('/api/tasks/:id',(req,res)=>{const t=requireTask(store,req.user,req.params.id);res.json({...decorated(t),events:store.events(t.id)});});
   app.post('/api/tasks/:id/preflight/retry',(req,res)=>{const t=requireTask(store,req.user,req.params.id);if(!t.environmentIssue||t.environmentIssue.id!==req.body.issueId||t.environmentIssue.planVersion!==t.planVersion||t.status!=='waiting_input')throw new HttpError(409,'環境問題已變更，請重新查看');t.environmentIssue=null;t.dependencyPreflight=null;t.error=null;t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'awaiting_approval';t.controlVersion=(t.controlVersion||0)+1;store.saveTask(t);store.event(t.id,'preflight_approved',`${req.user.name} 核准重新檢查套件環境；通過前不執行工作`);res.json(decorated(t));});
