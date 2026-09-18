@@ -187,3 +187,48 @@ console error（唯一出現的是登入前 `/api/state` 回傳 401，屬預期�
 ### 已知限制
 僅 Chromium headless；不含視覺回歸比對；Codex 引擎的步驟不接 Browser MCP；需求判定為關鍵字
 啟發式，可能有少量假陽性／假陰性。詳見 `docs/BROWSER-VALIDATION.md` 的 Known limitations。
+
+## Browser Validation：deterministic guard 加嚴（只看「呼叫過任何工具」不夠嚴格）（2026-09-18）
+
+原本 `reconcileBrowserValidation()` 只用 `toolCallCount > 0` 判斷「有沒有測」，代表只要
+Claude 呼叫過任一個 `mcp__playwright__browser_*`（例如只呼叫 `browser_console_messages`，
+從未 `navigate`），就可能被算成已執行。修正為：
+
+1. `toolCallCount === 0` → `blocked`（不變）。
+2. 有工具呼叫、但真實 `categories.navigate` 是 0（沒有任何 `browser_navigate` 類工具呼叫）
+   → 一樣 `executed=false, passed=false, status="blocked"`，並明確回報
+   「未偵測到 Browser navigate 工具呼叫，不能證明已實際開啟 Preview URL」。
+3. 新增 `deriveBrowserValidationRequirement()` 的 `requiresInteraction` 判定（按鈕／點擊／
+   表單／選單等互動關鍵字）；`requiresInteraction=true` 但真實 `categories.interact` 是 0
+   （沒有任何 click／type／fill／select 等互動工具呼叫）→
+   `executed=true, passed=false, status="failed"`，回報
+   「此任務需要實際 UI 互動，但未偵測到 Browser interact 工具呼叫」。
+4. AI 自己回報的 `executed`／`passed` 不再是權威來源：`executed` 完全由 TaskFlow 依
+   navigate／interact 的真實證據推導；只有通過上述三關才會採用 AI 回報的 `passed`
+   決定最終 `status`。
+5. `browserValidation` 新增 `categories`（TaskFlow 自己統計的
+   `{navigate, interact, console, network, inspect, other}` 次數），保留到最終結果，
+   不是驗完就丟；讓人工與 `scripts/browser-validation-smoke.js` 都能直接核對「真的
+   navigate 過」「真的 interact 過」，不必只信任 `toolUsed`。
+
+### 自動測試
+`tests/browser-validation.test.js` 新增：只有 console／只有 screenshot（無 navigate）→
+`blocked`；navigate 但非互動任務 → 依 AI 實際結果判定 pass/fail；navigate 但互動任務缺
+interact → `failed`；navigate+interact → 可通過；navigate+interact 但 AI 自稱
+`passed=false` → 仍是 `failed`（AI 的 pass/fail 判斷仍受尊重，但 `executed` 絕不是 AI
+說了算）；`deriveBrowserValidationRequirement` 的 `requiresInteraction` 判定。加嚴後
+**17** 個 Browser Validation 測試全數通過；`npm test` 總計 **155/155** 通過；
+`npm run build` 成功。
+
+### 真實整合測試（加嚴後重新驗證）
+重新執行 `node scripts/browser-validation-smoke.js`（已加強為同時檢查
+`toolCallCount>=2`、`categories.navigate>=1`、`categories.interact>=1`，不再只看
+`toolUsed`）：
+
+| 情境 | categories | 結果 |
+| --- | --- | --- |
+| pass-scenario（按鈕正常顯示彈窗） | `{"navigate":1,"interact":1,"console":1,"network":1}` | 三項證據檢查全數 ✓，`status="passed"` |
+| fail-scenario（onclick 直接 throw） | `{"navigate":1,"interact":1,"other":1,"console":1}` | 三項證據檢查全數 ✓，`status="failed"`，task 進入 `repair_planning` |
+
+兩種情境都確認 Claude 真的呼叫了 `browser_navigate` 與 `browser_click`（而不只是呼叫過
+某個瀏覽器工具），證實加嚴後的 guard 在真實 Claude Code + Playwright MCP 呼叫下運作正常。

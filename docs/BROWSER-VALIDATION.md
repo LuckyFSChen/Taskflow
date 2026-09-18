@@ -31,6 +31,11 @@ TaskFlow 不會自建瀏覽器自動化引擎，也不會用 `Start-Process chro
    （component、button、modal、form、navigation、按鈕、彈窗、表單、導航、互動……）。
    命中才是 `required=true`；否則預設 `false`（例如同一個 repo 裡的後端 API、SQL
    migration、CLI script 不會被強迫跑瀏覽器）。
+3. `required=true` 時，再用較窄的一組互動關鍵字（button、click、modal、dialog、form、
+   input、select、dropdown、submit、drag、drop、hover、navigation、按鈕、點擊、彈窗、
+   表單、輸入、送出、選單、拖曳、互動）判斷 `requiresInteraction`。命中時，除了開啟
+   Preview URL，還必須觀察到真實的 `interact` 分類工具呼叫（click／type／fill／
+   select……）才算通過，只開頁面、只讀 console 不算數（見下方 deterministic guard）。
 
 這是自動推導，Planner 不需要每次手動產出這個欄位。
 
@@ -126,15 +131,32 @@ TaskFlow 自己控制、固定叫 `playwright`），再用工具名稱的字尾�
 
 ## 證據與反造假（deterministic guard）
 
-Claude 在 `resultSchema.browserValidation` 裡「自己說」測過瀏覽器不算數。
-`server/runner.js` 會解析 `stream-json` 裡的 `tool_use` 事件，只要工具名稱符合
-`mcp__playwright__browser_*`，就記一次真實呼叫（`browserEvidence.toolCallCount`）。
+Claude 在 `resultSchema.browserValidation` 裡「自己說」測過瀏覽器不算數，AI 自己回報的
+`executed`/`passed` 也只當作描述，不是權威來源。`server/runner.js` 會解析
+`stream-json` 裡的 `tool_use` 事件，只要工具名稱符合 `mcp__playwright__browser_*`，
+就記一次真實呼叫（`browserEvidence.toolCallCount`），並用 `categorizeBrowserTool()`
+分類成 `navigate`／`interact`／`console`／`network`／`inspect`／`other`
+（`browserEvidence.categories`）。
 
-`reconcileBrowserValidation(claimed, evidence, requirement)`
-（`server/browser-capability.js`）用這個真實計數覆寫 AI 回報的
-`toolUsed`/`toolCallCount`；如果 `required=true` 但真實呼叫次數是 0，不論 AI
-在 `summary`/`browserValidation.passed` 裡怎麼宣稱，都會被強制改成
-`executed:false, passed:false, status:"blocked"`。
+單純「呼叫過任何一個 Browser MCP 工具」門檻太低——例如只呼叫
+`browser_console_messages`、從未 `navigate`，也會被算成「測過」。
+`reconcileBrowserValidation(claimed, evidence, requirement)`（`server/browser-capability.js`）
+因此採更嚴格的判定，且完全不信任 AI 回傳的 `executed`／`passed`：
+
+1. `toolCallCount === 0` → `executed:false, passed:false, status:"blocked"`。
+2. 有工具呼叫，但 `categories.navigate` 沒有出現至少一次
+   （代表沒有真的 `browser_navigate` 開啟過 Preview URL）→ 同樣
+   `executed:false, passed:false, status:"blocked"`。
+3. 需求推導出 `requiresInteraction:true`（任務涉及按鈕／點擊／表單等互動）時，
+   `categories.interact` 也必須至少一次，否則 `executed:true, passed:false,
+   status:"failed"`（已經開啟頁面，但沒有真的做互動）。
+4. 以上都通過，才會採用 AI 回報的 `passed`（`true`/`false`）決定
+   `status` 是 `"passed"` 還是 `"failed"`；`executed` 一律由 TaskFlow 自己依
+   navigate／interact 證據推導，不會直接採信 AI 填的 `executed:true`。
+
+`browserValidation.categories` 會保留在最終結果裡（不是只用完即丟），方便人工或
+`scripts/browser-validation-smoke.js` 直接核對「真的有 navigate、真的有 interact」，
+而不是只看 `toolUsed`。
 
 最終的 deterministic guard（只套用在 `review` 階段，也就是獨立驗證）：
 
@@ -170,6 +192,7 @@ consoleErrors／networkErrors／url，讓 Repair 不必重新用工具猜一次�
   passed: boolean | null;
   toolUsed: boolean;
   toolCallCount: number;
+  categories: Record<string, number>; // 例如 {navigate:1, interact:2, console:1}，TaskFlow 自己統計，不是 AI 填的
   url: string | null;
   checks: { description: string; passed: boolean }[];
   consoleErrors: string[];

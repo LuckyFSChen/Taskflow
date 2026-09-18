@@ -18,11 +18,15 @@ const require_=createRequire(import.meta.url);
 // inside the same repository.
 const UI_KEYWORDS=/\b(vue|react|component|html|css|javascript|typescript ui|ui\b|button|modal|dialog|form|navigation|route|routing|frontend|front-end|responsive|login page|dashboard|table|drag|drop|dropdown|menu|sidebar|layout|render|dom\b|click|screen|page)\b|前端|介面|使用者介面|按鈕|彈窗|對話框|表單|導覽|導航|路由|頁面|畫面|元件|組件|互動|下拉|選單|側邊欄|版面|渲染|點擊|登入畫面|儀表板|拖曳|響應式/i;
 
+// Subset of UI_KEYWORDS that specifically implies the AI must *do* something to the page
+// (not just load it) — used to require real interact-category tool evidence, not only navigate.
+const INTERACTION_KEYWORDS=/\b(button|click|modal|dialog|form|input|select|dropdown|submit|drag|drop|hover|navigation)\b|按鈕|點擊|彈窗|表單|輸入|送出|選單|拖曳|互動/i;
+
 export function deriveBrowserValidationRequirement({webKind,title='',description='',plan=null}={}){
-  if(!webKind)return {required:false,reason:'非網頁專案，不需要 Browser 驗證。'};
+  if(!webKind)return {required:false,requiresInteraction:false,reason:'非網頁專案，不需要 Browser 驗證。'};
   const text=[title,description,JSON.stringify(plan||{})].join('\n');
-  if(UI_KEYWORDS.test(text))return {required:true,reason:'網頁專案且需求涉及前端／UI／互動，需實際 Browser 驗證。'};
-  return {required:false,reason:'網頁專案但需求未涉及前端 UI／互動，預設不需要 Browser 驗證。'};
+  if(UI_KEYWORDS.test(text))return {required:true,requiresInteraction:INTERACTION_KEYWORDS.test(text),reason:'網頁專案且需求涉及前端／UI／互動，需實際 Browser 驗證。'};
+  return {required:false,requiresInteraction:false,reason:'網頁專案但需求未涉及前端 UI／互動，預設不需要 Browser 驗證。'};
 }
 
 export function resolvePlaywrightMcpEntry(){
@@ -77,21 +81,29 @@ export function categorizeBrowserTool(name){
 }
 
 export function defaultBrowserValidation(){
-  return {required:false,status:'not_required',executed:false,passed:null,toolUsed:false,toolCallCount:0,url:null,checks:[],consoleErrors:[],networkErrors:[],notes:'',error:null};
+  return {required:false,status:'not_required',executed:false,passed:null,toolUsed:false,toolCallCount:0,categories:{},url:null,checks:[],consoleErrors:[],networkErrors:[],notes:'',error:null};
 }
 
-// The deterministic guard described in the spec: what the AI *claims* in its
-// structured output never overrides what the stream-json transcript actually
-// shows. If TaskFlow did not observe a real mcp__playwright__* tool_use event,
-// the result is forced to blocked/failed regardless of the AI's narration.
+// The deterministic guard described in the spec: what the AI *claims* in its structured
+// output (including its own `executed`/`passed`) never overrides what the stream-json
+// transcript actually shows. Any mcp__playwright__* tool call used to count as "executed" —
+// that was too weak, since a single browser_console_messages call with no navigate would
+// pass. TaskFlow now requires real navigate-category evidence (and, for tasks whose
+// requirement says a UI interaction is needed, real interact-category evidence too) before
+// it will ever call Browser Validation executed, let alone passed.
 export function reconcileBrowserValidation(claimed,evidence,requirement){
   if(!requirement?.required)return defaultBrowserValidation();
   const base=claimed&&typeof claimed==='object'?{...claimed}:defaultBrowserValidation();
-  const toolCallCount=evidence?.toolCallCount||0,toolUsed=toolCallCount>0;
-  const merged={...base,required:true,toolUsed,toolCallCount,url:base.url||requirement.previewUrl||null};
-  if(!toolUsed)return {...merged,executed:false,passed:false,status:'blocked',error:merged.error||'未偵測到 Browser MCP 工具呼叫（如 mcp__playwright__browser_navigate），不能證明已實際使用瀏覽器驗證。'};
-  if(!merged.executed)return {...merged,passed:false,status:merged.status==='blocked'?'blocked':'failed'};
-  return {...merged,status:merged.passed?'passed':(merged.status==='blocked'?'blocked':'failed')};
+  const toolCallCount=evidence?.toolCallCount||0;
+  const categories=evidence?.categories||{};
+  const navigated=(categories.navigate||0)>0;
+  const interacted=(categories.interact||0)>0;
+  const merged={...base,required:true,toolUsed:toolCallCount>0,toolCallCount,categories,url:base.url||requirement.previewUrl||null};
+  if(toolCallCount===0)return {...merged,executed:false,passed:false,status:'blocked',error:merged.error||'未偵測到 Browser MCP 工具呼叫，不能證明已實際使用瀏覽器驗證。'};
+  if(!navigated)return {...merged,executed:false,passed:false,status:'blocked',error:'未偵測到 Browser navigate 工具呼叫，不能證明已實際開啟 Preview URL。'};
+  if(requirement.requiresInteraction&&!interacted)return {...merged,executed:true,passed:false,status:'failed',error:'此任務需要實際 UI 互動，但未偵測到 Browser interact 工具呼叫。'};
+  const passed=base.passed===true;
+  return {...merged,executed:true,passed,status:base.status==='blocked'?'blocked':(passed?'passed':'failed')};
 }
 
 function probeMcpServer(spec,{timeoutMs=8000,spawnProcess=spawn}={}){
@@ -117,6 +129,11 @@ function probeMcpServer(spec,{timeoutMs=8000,spawnProcess=spawn}={}){
   });
 }
 
+// NOTE: this only confirms the Claude CLI exists and the Playwright MCP server responds to an
+// MCP `initialize` handshake — it does not launch Chromium, so it cannot prove the browser
+// itself can actually start. Callers must not present this as "Browser Validation passed" or
+// "Ready" for a specific task; per-task pass/fail still comes only from reconcileBrowserValidation
+// against real tool_use evidence observed during that task's own review.
 let cached=null;
 export async function checkClaudeBrowserCapability({env=process.env,execFileImpl,spawnProcess,cache=true,cliExecutable=resolveCliExecutable('claude',{env})}={}){
   if(cache&&cached&&Date.now()-cached.at<60000)return cached.value;
