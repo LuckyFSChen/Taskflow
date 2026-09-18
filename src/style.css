@@ -34,3 +34,32 @@
 .attention-reason{margin:0;font-size:.875rem;color:#55627a;white-space:pre-wrap;overflow-wrap:anywhere}
 .attention-card-foot{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:2px}
 @media(max-width:850px){.sidebar nav a{position:relative}.nav-count.attention{display:inline-flex;position:absolute;top:7px;right:9px;min-width:18px;padding:0 5px;font-size:.6875rem;line-height:18px}}
+
+/* 系統狀態（平台設定）與首頁執行環境提醒 */
+.health-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.health-head h2{margin:0}
+.health-actions{display:flex;align-items:center;gap:12px}
+.health-overall{display:inline-flex;align-items:center;gap:6px;font-size:.8125rem;font-weight:600;color:#7b8998}
+.health-overall.ok{color:#268673}
+.health-overall.warning{color:#a67a2c}
+.health-overall.error{color:#b64c4f}
+.health-mark{font-style:normal;font-weight:700;line-height:1.6}
+.health-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 22px;margin-top:18px}
+.health-group{display:grid;gap:10px;align-content:start}
+.health-item{display:flex;gap:10px;align-items:flex-start;background:#f9fbfc;border:1px solid var(--line);border-left-width:3px;border-radius:9px;padding:12px 14px}
+.health-item strong{display:block;font-size:.875rem}
+.health-item small{display:block;margin-top:4px;line-height:1.7;overflow-wrap:anywhere}
+.health-item.ok{border-left-color:#3e9d84}
+.health-item.ok .health-mark{color:#268673}
+.health-item.warning{border-left-color:#e0a83c}
+.health-item.warning .health-mark{color:#a67a2c}
+.health-item.error{border-left-color:#c8595c}
+.health-item.error .health-mark{color:#b64c4f}
+.health-item.unknown{border-left-color:#c3ccd6}
+.health-item.unknown .health-mark{color:#7b8998}
+.notice.error{background:#fdeeee;color:#a2474a;border-color:#f2d3d3}
+.health-alert{align-items:center}
+.health-alert strong{display:block;font-size:.9375rem;margin-bottom:4px}
+.health-alert p{margin:0;font-size:.8125rem;line-height:1.7;color:inherit;overflow-wrap:anywhere}
+.health-alert .secondary{margin-left:auto;white-space:nowrap;color:#a2474a;border-color:#eec9c9}
+@media(max-width:600px){.health-groups{grid-template-columns:1fr;gap:16px}.health-head{align-items:flex-start}.health-actions{width:100%;justify-content:space-between}.health-alert{flex-wrap:wrap}.health-alert .secondary{margin-left:0;width:100%}}
