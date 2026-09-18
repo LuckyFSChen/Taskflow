@@ -1,0 +1,117 @@
+import {hash,now,id} from './db.js';
+import {HttpError,requireTask} from './domain.js';
+import {recordClarification} from './clarifications.js';
+
+// Unambiguous: the execution environment itself refused the operation, not the code.
+const STRONG_PATTERNS=[
+  /this command requires approval/i,
+  /requires approval/i,
+  /requires elevation/i,
+  /elevation required/i,
+  /operation requires elevation/i,
+  /administrator privileges/i,
+  /requires administrator/i,
+  /run as administrator/i,
+  /sudo required/i,
+  /not in (?:the )?allowed(?: command)? list/i,
+  /command is not permitted/i,
+  /blocked by (?:execution )?policy/i,
+  /execution blocked by policy/i,
+  /policy denied/i,
+  /sandbox (?:denied|blocked)/i,
+  /interactive login required/i,
+  /mfa required/i,
+  /browser confirmation required/i,
+  /requires (?:a )?browser (?:login|authorization|confirmation)/i,
+  /oauth (?:login|authorization) required/i,
+  /you haven'?t granted it yet/i,
+];
+// Ambiguous alone (a Linux file-permission issue may be fixable by the agent itself),
+// only counted alongside language that points at command/tool execution being denied.
+const WEAK_PATTERNS=[/access is denied/i,/permission denied/i,/not allowed/i,/not permitted/i];
+const WEAK_CONTEXT=/\b(bash|shell|command|cli|npx|npm|pnpm|yarn|tool|execute|approval|policy|sandbox|elevat|allow[- ]?list)\b/i;
+
+function detectRequiresAdministrator(text){
+  if(/administrator privileges|requires administrator|run as administrator|sudo required|elevation required|requires elevation|operation requires elevation/i.test(text))return true;
+  if(/requires approval|not in (?:the )?allowed(?: command)? list|command is not permitted|blocked by (?:execution )?policy|execution blocked by policy|policy denied|sandbox (?:denied|blocked)/i.test(text))return false;
+  return null;
+}
+
+// Deterministic, rule-based classification. The LLM's own self-report (userActionRequired
+// in the structured result) is only ever a secondary, corroborated signal here — never the
+// sole basis for stopping retries; the regex layer is authoritative whenever it matches.
+export function detectManualActionRequirement({message,summary,evidence,selfReport}={}){
+  const text=[message,summary,...(evidence||[]),selfReport?.reason,selfReport?.instructions].filter(Boolean).join('\n');
+  if(text){
+    const strong=STRONG_PATTERNS.find(p=>p.test(text));
+    if(strong)return {category:'approval_required',match:strong.exec(text)[0],requiresAdministrator:detectRequiresAdministrator(text)};
+    const weak=WEAK_PATTERNS.find(p=>p.test(text));
+    if(weak&&WEAK_CONTEXT.test(text))return {category:'permission_error',match:weak.exec(text)[0],requiresAdministrator:detectRequiresAdministrator(text)};
+  }
+  if(selfReport?.required&&(selfReport.commands?.length||selfReport.instructions))return {category:'agent_reported',match:selfReport.reason||selfReport.instructions,requiresAdministrator:selfReport.requiresAdministrator??null};
+  return null;
+}
+export function classifyExecutionFailure(context){
+  const detection=detectManualActionRequirement(context);
+  if(!detection)return 'execution_error';
+  return detection.category==='approval_required'?'approval_required':detection.category==='agent_reported'?'user_action_required':'permission_error';
+}
+function fingerprintCommand(command){
+  return String(command).replace(/^(?:npx|npm exec|npm run|npm|pnpm exec|pnpm run|pnpm|yarn run|yarn|cmd \/c|powershell(?:\.exe)?)\s+/i,'').split(/\s+/).filter(w=>!w.startsWith('-')).join(' ').toLowerCase().trim();
+}
+// First-version equivalent-operation fingerprint: cwd + normalized command intents,
+// ignoring package-manager wrapper and flags (npx prisma migrate ≈ pnpm prisma migrate dev).
+export function fingerprintOperation(cwd,commands){
+  return hash(JSON.stringify([String(cwd||'').toLowerCase(),(commands||[]).map(fingerprintCommand).sort()]));
+}
+export function buildUserActionRequest({detection,selfReport,workingDirectory,phase,threadId,planVersion}){
+  const sr=selfReport?.required?selfReport:null;
+  const commands=sr?.commands?.length?sr.commands:[];
+  const workingDirectoryResolved=sr?.workingDirectory||workingDirectory||null;
+  return {
+    required:true,
+    reason:sr?.reason||`偵測到執行環境阻擋此操作（${detection.match}）`,
+    actionType:sr?.actionType||'run_command',
+    commands,
+    workingDirectory:workingDirectoryResolved,
+    instructions:sr?.instructions||'請在本機終端機（Windows 請先用一般 PowerShell，不必預設要求系統管理員）執行以上指令；若未列出指令，請查看此步驟的活動紀錄取得實際指令。完成後請回報「我已執行完成」。',
+    verification:sr?.verification?.length?sr.verification:[],
+    requiresAdministrator:sr?.requiresAdministrator??detection.requiresAdministrator??null,
+    status:'pending',
+    category:detection.category,
+    fingerprint:fingerprintOperation(workingDirectoryResolved,commands),
+    phase,threadId,planVersion,at:now(),
+  };
+}
+export function manualActionRequest(store,task){
+  const ua=task.userActionRequired;
+  if(!ua||ua.status!=='pending')return null;
+  return {id:hash(JSON.stringify([ua.threadId,task.planVersion,task.controlVersion||0,ua])),...ua};
+}
+export function decideManualAction(store,user,taskId,{requestId,decision,note}={}){
+  const task=requireTask(store,user,taskId),request=manualActionRequest(store,task);
+  if(!['completed','failed','skip'].includes(decision))throw new HttpError(400,'請選擇「已完成」、「執行失敗」或「略過」');
+  if(!request||request.id!==requestId||store.threads(taskId).some(t=>t.status==='running'))throw new HttpError(409,'此請求已變更或已處理，請重新查看');
+  if(decision==='failed'&&(typeof note!=='string'||!note.trim()))throw new HttpError(400,'請貼上執行後看到的錯誤訊息');
+  const ua=task.userActionRequired,commandsText=ua.commands.join('\n')||'（請參閱此步驟的活動紀錄取得實際指令）';
+  task.manualActionHistory=[...(task.manualActionHistory||[]),{...ua,decision,note:note?String(note).trim().slice(0,4000):null,resolvedAt:now(),resolvedBy:user.id}];
+  if(decision==='completed'){
+    recordClarification(task,store.threads(taskId),[`使用者已於本機完成以下操作：\n${commandsText}`],`已完成。請只驗證結果（${ua.verification.join('；')||'依原驗收條件檢查'}），不要重新執行相同或等效的指令。`);
+    task.userActionRequired=null;task.validationReviewPending=true;task.status='queued';task.error=null;
+  } else if(decision==='failed'){
+    recordClarification(task,store.threads(taskId),[`使用者嘗試執行以下操作：\n${commandsText}`],`執行失敗，錯誤訊息如下：\n${note.trim().slice(0,4000)}\n請分析原因並修正設定或程式；不要再次嘗試已被平台拒絕的原指令本身。`);
+    task.userActionRequired=null;task.status='queued';task.error=null;
+  } else {
+    const thread=store.threads(taskId).find(t=>t.id===ua.threadId);
+    if(thread?.result)store.saveThread({...thread,result:{...thread.result,passed:true,manualActionSkipped:true,evidence:[...(thread.result.evidence||[]),`使用者已選擇略過（因執行環境限制無法執行，未驗證）：${commandsText}`]}});
+    task.manualActionSkips=[...(task.manualActionSkips||[]),{...ua,skippedAt:now(),skippedBy:user.id}];
+    recordClarification(task,store.threads(taskId),[`以下操作因執行環境限制而略過：\n${commandsText}`],'使用者選擇略過；此項目未驗證，不得聲稱通過，其餘驗收仍須實際檢查。');
+    task.userActionRequired=null;
+    if(ua.phase==='review'){task.status='completed';task.artifactVersion=id();store.notify(task,'驗證完成；其中一項因執行環境限制經你同意略過（未驗證），其餘驗收已通過。');}
+    else{task.status='queued';task.error=null;}
+  }
+  task.controlVersion=(task.controlVersion||0)+1;
+  store.saveTask(task);
+  store.event(taskId,'user_action_decision',`${user.name} ${{completed:'回報已完成手動操作',failed:'回報手動操作執行失敗',skip:'略過此手動操作'}[decision]}`);
+  return task;
+}
