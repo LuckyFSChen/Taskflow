@@ -12,7 +12,7 @@ import { id,hash,passwordHash,passwordMatches } from './db.js';
 import { HttpError,createTask,requireTask,approveTask,reviseTask } from './domain.js';
 import {executionApproval,decideExecutionApproval} from './execution-approval.js';
 import {validationSkipRequest,decideValidationSkip} from './validation-skip.js';
-import {manualActionRequest,decideManualAction} from './manual-action.js';
+import {manualActionRequest,decideManualAction,MANUAL_ACTION_DISPLAY_STATUS} from './manual-action.js';
 import { prepareProjectDirectory } from './project-directory.js';
 import {browseDirectory,createDirectory,availableDrives} from './directory-browser.js';
 import {createTaskWithProject} from './task-project.js';
@@ -71,7 +71,11 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/projects/:id/preview',async(req,res)=>{const target=projectTarget(req);res.json(await previews.start(target.key,target.path));});
   app.post('/api/projects/:id/preview/stop',async(req,res)=>{const target=projectTarget(req);await previews.stop(target.key);res.json({ok:true});});
   const visibleProjects=user=>{const projects=store.db.prepare('SELECT * FROM projects').all().filter(p=>store.hasProject(user,p.id));return projects.map(p=>user.role==='admin'?p:{id:p.id,name:p.name,code:p.code});};
-  function decorated(t){const threads=store.threads(t.id).filter(th=>th.version===t.planVersion).map(th=>({...th,...threadPresentation(th)}));return {...t,validationSkipRequest:validationSkipRequest(store,t),executionApproval:executionApproval(store,t),manualAction:manualActionRequest(store,t),workspace:undefined,threads,ownerName:store.user(t.ownerId)?.name,projectName:store.project(t.projectId)?.name,completedSteps:threads.filter(th=>th.phase==='execute'&&th.status==='completed'&&th.result?.passed&&!th.result.questions?.length).length,totalSteps:t.plan?.steps.length||0};}
+  function decorated(t){const threads=store.threads(t.id).filter(th=>th.version===t.planVersion).map(th=>({...th,...threadPresentation(th)}));return {...t,validationSkipRequest:validationSkipRequest(store,t),executionApproval:executionApproval(store,t),manualAction:manualActionRequest(store,t),
+    // Distinct, explicit status a UI/automation consumer can branch on for "needs a human to act
+    // outside the app" — never collapse this into the generic waiting_input/failed states.
+    displayStatus:t.userActionRequired?.status==='pending'?MANUAL_ACTION_DISPLAY_STATUS:t.status,
+    workspace:undefined,threads,ownerName:store.user(t.ownerId)?.name,projectName:store.project(t.projectId)?.name,completedSteps:threads.filter(th=>th.phase==='execute'&&th.status==='completed'&&th.result?.passed&&!th.result.questions?.length).length,totalSteps:t.plan?.steps.length||0};}
   app.get('/api/state',async(req,res)=>{
     const browser=await checkClaudeBrowserCapability().catch(error=>({available:false,provider:null,cli:'claude',error:error.message}));
     res.json({user:req.user,defaultProjectRoot:req.user.role==='admin'?store.setting('defaultProjectRoot',''):undefined,projects:visibleProjects(req.user),tasks:store.tasks(req.user).map(decorated),runner:{enabled:store.setting('runnerEnabled',false),...runner.status,maxConcurrent:runnerLimit(store),activeTaskIds:(runner.status.activeTaskIds||[]).filter(id=>store.tasks(req.user).some(t=>t.id===id)),activeTaskId:store.tasks(req.user).some(t=>t.id===runner.status.activeTaskId)?runner.status.activeTaskId:null},integrations:{lineConfigured:!!(process.env.INBOX_URL&&process.env.INBOX_TOKEN),lastSync:store.setting('inboxLastSuccess'),error:store.setting('inboxError'),notificationError:store.db.prepare("SELECT error FROM outbox WHERE sent=0 AND cancelled_at IS NULL AND error IS NOT NULL ORDER BY rowid DESC LIMIT 1").get()?.error||null,pendingNotifications:store.db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent=0 AND cancelled_at IS NULL').get().n,browser:{configured:!!browser.available,provider:browser.provider,available:browser.available,error:browser.error}}});

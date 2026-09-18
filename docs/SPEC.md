@@ -18,6 +18,7 @@
 - Express REST API，前端輪詢每 3 秒讀取可見資料與事件，避免隧道斷線遺失狀態。
 - 資料表：users、sessions、projects、memberships、tasks、threads、events、inbox、outbox、settings。
 - 任務狀態：planning、awaiting_approval、queued、running、waiting_input、paused、completed、failed、cancelled。thread 狀態：queued、running、completed、failed。
+- 執行環境的核准／sandbox／allowlist／權限政策阻擋（例如 CLI 回報 requires approval、sandbox denied、not in allowed list）不是一般程式失敗：偵測後任務維持 `waiting_input`，但 API 回傳的 decorated task 另外帶出 `displayStatus:'waiting_user_action'`（UI／Reviewer 應以此欄位判斷，不得視為 failed，也不得自動重試同一指令）。`task.userActionRequired` 保留 reason、commands、workingDirectory、message（原始 stderr／工具證據）、instructions 等欄位供人工操作與後續稽核；使用者回報「已完成」後只重新進入獨立驗證，不直接視為通過。
 - 規劃結果必須通過 JSON schema；包含目標、驗收、待確認問題、子任務（角色／引擎／依賴）。子任務序列執行，驗證是獨立 thread。
 - 核准綁定 planVersion；修改需求會使舊核准失效。執行中不可直接改需求或引擎，需先停止。
 - 暫停停止新派工，當前工作可結束；中止終止 process tree 並將任務轉為需檢查狀態。重新啟動將 interrupted 工作標為等待處理，不盲目重放未知外部副作用。

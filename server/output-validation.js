@@ -24,17 +24,35 @@ function normalize(value,schema){
   }
   return copy;
 }
+// Only for the execute/repair/review result schema (identified by its unique 'passed' field —
+// the plan schema never has it). questions/artifacts/passed have unambiguous, always-safe
+// defaults when the engine's structured output simply omits them; summary and evidence carry
+// substantive content that must come from the actual work and are never invented here, so a
+// response genuinely missing those still fails closed afterwards.
+function fillSafeResultDefaults(value){
+  value=extract(value);
+  if(!value||typeof value!=='object'||Array.isArray(value))return value;
+  const copy=structuredClone(value);
+  if(copy.questions===undefined)copy.questions=[];
+  if(copy.artifacts===undefined)copy.artifacts=[];
+  if(copy.passed===undefined)copy.passed=false;
+  return copy;
+}
 export async function validatedOutput(adapter,options,validator){
   let output,raw,originalError;
   try{output=await adapter(options);raw=output.result;}
   catch(error){if(error.code!=='OUTPUT_FORMAT')throw error;originalError=error;raw=error.rawResult;output={sessionId:error.sessionId};}
   mkdirSync(options.runDir,{recursive:true});
   writeFileSync(join(options.runDir,'original-output.json'),JSON.stringify({result:raw??null,error:originalError?.message||null,sessionId:output.sessionId||null},null,2));
+  const isResultSchema=Array.isArray(options.schema?.required)&&options.schema.required.includes('passed');
+  const steps=isResultSchema
+    ?[candidate=>extract(candidate),candidate=>normalize(candidate,options.schema),candidate=>fillSafeResultDefaults(candidate)]
+    :[candidate=>extract(candidate),candidate=>normalize(candidate,options.schema)];
   let candidate=raw,checked=validator.safeParse(candidate);
-  for(let attempt=1;!checked.success&&attempt<=2;attempt++){
-    candidate=attempt===1?extract(candidate):normalize(candidate,options.schema);
+  for(let attempt=1;!checked.success&&attempt<=steps.length;attempt++){
+    candidate=steps[attempt-1](candidate);
     writeFileSync(join(options.runDir,`format-repair-${attempt}.json`),JSON.stringify(candidate??null,null,2));
-    options.onEvent?.(`純格式修復 ${attempt}/2：未重新執行工作或補寫內容`);
+    options.onEvent?.(attempt<steps.length||!isResultSchema?`純格式修復 ${attempt}/${steps.length}：未重新執行工作或補寫內容`:`純格式修復 ${attempt}/${steps.length}：安全補上缺少的 questions/artifacts/passed 預設值，不臆測 summary 或 evidence`);
     checked=validator.safeParse(candidate);
   }
   if(!checked.success){

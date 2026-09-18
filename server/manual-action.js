@@ -64,16 +64,25 @@ function fingerprintCommand(command){
 export function fingerprintOperation(cwd,commands){
   return hash(JSON.stringify([String(cwd||'').toLowerCase(),(commands||[]).map(fingerprintCommand).sort()]));
 }
-export function buildUserActionRequest({detection,selfReport,workingDirectory,phase,threadId,planVersion}){
+// The task-level status a runtime consumer (UI, LINE, reviewer) can check to unambiguously
+// recognize "a human needs to act", distinct from the generic waiting_input used for
+// ordinary plan questions or approvals — see manualActionRequest()/decorated task display.
+export const MANUAL_ACTION_DISPLAY_STATUS='waiting_user_action';
+export function buildUserActionRequest({detection,selfReport,workingDirectory,phase,threadId,planVersion,rawMessage}){
   const sr=selfReport?.required?selfReport:null;
   const commands=sr?.commands?.length?sr.commands:[];
   const workingDirectoryResolved=sr?.workingDirectory||workingDirectory||null;
+  const message=(rawMessage||detection.match||null);
   return {
     required:true,
     reason:sr?.reason||`偵測到執行環境阻擋此操作（${detection.match}）`,
     actionType:sr?.actionType||'run_command',
     commands,
     workingDirectory:workingDirectoryResolved,
+    // Raw stderr/tool evidence behind the detection, preserved verbatim (truncated) so a human
+    // or the agent re-verifying later can see exactly what the environment refused — never
+    // overwritten or discarded by later format-repair or retry logic.
+    message:message?String(message).slice(0,2000):null,
     instructions:sr?.instructions||'請在本機終端機（Windows 請先用一般 PowerShell，不必預設要求系統管理員）執行以上指令；若未列出指令，請查看此步驟的活動紀錄取得實際指令。完成後請回報「我已執行完成」。',
     verification:sr?.verification?.length?sr.verification:[],
     requiresAdministrator:sr?.requiresAdministrator??detection.requiresAdministrator??null,

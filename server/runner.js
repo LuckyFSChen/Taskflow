@@ -181,7 +181,7 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
         // Deterministic guard: an approval/elevation/policy block is environment-restricted,
         // not a program failure — never let it fall into the ordinary failed/repair-retry path.
         const manualAction=detectManualActionRequirement({summary:result.summary,evidence:result.evidence,selfReport:result.userActionRequired});
-        if(manualAction){result.passed=false;result.userActionRequired=buildUserActionRequest({detection:manualAction,selfReport:result.userActionRequired,workingDirectory:t.workspace,phase,threadId:thread.id,planVersion:t.planVersion});}
+        if(manualAction){result.passed=false;result.userActionRequired=buildUserActionRequest({detection:manualAction,selfReport:result.userActionRequired,workingDirectory:t.workspace,phase,threadId:thread.id,planVersion:t.planVersion,rawMessage:[result.summary,...(result.evidence||[])].join('\n')});}
       }
       thread.status='completed';thread.finished=now();thread.result=result;thread.summary=result.summary;thread.sessionId=output.sessionId;store.saveThread(thread);
       const current=store.task(t.id);if(current.status==='cancelled'||(current.status==='paused'&&current.error==='已中止執行，請檢查工作副本後恢復。'))return;
@@ -210,7 +210,7 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
       if(thread){thread.status=reset?'rate_limited':'failed';thread.finished=now();thread.error=e.message;thread.sessionId=e.sessionId||thread.sessionId;store.saveThread(thread);}const current=store.task(t.id);
       const manualAction=thread&&['execute','repair','review'].includes(thread.phase)?detectManualActionRequirement({message:e.message}):null;
       if(manualAction&&!['cancelled','paused','completed'].includes(current.status)){
-        current.userActionRequired=buildUserActionRequest({detection:manualAction,selfReport:null,workingDirectory:t.workspace,phase:thread.phase,threadId:thread.id,planVersion:current.planVersion});
+        current.userActionRequired=buildUserActionRequest({detection:manualAction,selfReport:null,workingDirectory:t.workspace,phase:thread.phase,threadId:thread.id,planVersion:current.planVersion,rawMessage:e.message});
         thread.status='completed';thread.finished=now();thread.error=null;
         thread.result={summary:current.userActionRequired.reason,questions:[],artifacts:[],passed:false,evidence:[e.message.slice(0,2000)],browserValidation:defaultBrowserValidation(),userActionRequired:current.userActionRequired};
         store.saveThread(thread);

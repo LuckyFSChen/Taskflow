@@ -42,9 +42,24 @@ test('An approval-blocked command becomes needs_user_action and the runner stops
   assert.equal(task.status,'waiting_input');
   assert.equal(task.userActionRequired.status,'pending');
   assert.equal(task.userActionRequired.category,'approval_required');
+  assert.match(task.userActionRequired.message,/requires approval/);
   assert.equal(calls,1);
   await runner.tick();await runner.tick();
   assert.equal(calls,1,'a pending manual action must stop the runner from touching this step again');
+ }finally{runner.stop();}
+});
+test('A sandbox-denied command is classified the same way as an approval block, not a code failure',async t=>{
+ const f=fixture(t);let calls=0;f.s.setSetting('runnerEnabled',true);
+ const runner=createRunner(f.s,{dataDir:join(f.root,'data'),adapter:async()=>{calls++;throw new Error('Tool execution failed: sandbox denied: npx prisma migrate dev');}});
+ try{
+  await runner.tick();
+  const task=f.s.task(f.task.id);
+  assert.equal(task.status,'waiting_input');
+  assert.equal(task.userActionRequired.status,'pending');
+  assert.equal(task.userActionRequired.category,'approval_required');
+  assert.equal(calls,1);
+  await runner.tick();
+  assert.equal(calls,1,'a pending manual action from a sandbox denial must never be retried automatically');
  }finally{runner.stop();}
 });
 
@@ -86,6 +101,23 @@ test('Marking a manual action completed re-enters verification instead of an aut
  }finally{runner.stop();}
 });
 
+test('A completed manual action still fails a genuine post-verification problem instead of forcing a pass',async t=>{
+ const f=fixture(t);f.s.setSetting('runnerEnabled',true);let calls=0;
+ const runner=createRunner(f.s,{dataDir:join(f.root,'data'),adapter:async()=>{calls++;if(calls===1)throw new Error('This command requires approval: npx prisma migrate dev');return {result:{summary:'migration ran but schema mismatch',passed:false,questions:[],evidence:['prisma/schema.prisma does not match applied migration'],artifacts:[]}};}});
+ try{
+  await runner.tick();
+  const task=f.s.task(f.task.id);const request=manualActionRequest(f.s,task);
+  const updated=decideManualAction(f.s,f.u,task.id,{requestId:request.id,decision:'completed'});
+  assert.equal(updated.userActionRequired,null);assert.equal(updated.status,'queued');
+  await runner.tick();
+  const final=f.s.task(task.id);
+  assert.equal(final.userActionRequired,null,'a real verification failure must never be reclassified as needing manual action');
+  assert.equal(final.status,'repair_planning');
+  assert.equal(final.round,1);
+  assert.match(final.validationFailure.summary,/schema mismatch/);
+ }finally{runner.stop();}
+});
+
 test('Reporting execution failure feeds the error back to the agent instead of re-trying the blocked command',async t=>{
  const f=fixture(t);f.s.setSetting('runnerEnabled',true);let calls=0,lastPrompt='';
  const runner=createRunner(f.s,{dataDir:join(f.root,'data'),adapter:async o=>{calls++;lastPrompt=o.prompt;if(calls===1)throw new Error('This command requires approval: npx prisma migrate dev');return {result:{summary:'fixed connection string',passed:true,questions:[],evidence:['migrated'],artifacts:[]}};}});
@@ -123,7 +155,7 @@ test('Skipping a blocked step records the skip, never claims a full pass, and st
 
 test('HTTP exposes the manual-action request, requires ownership, and rejects stale decisions',async t=>{
  const f=fixture(t);
- Object.assign(f.task,{status:'waiting_input',userActionRequired:{required:true,status:'pending',reason:'requires approval',actionType:'run_command',commands:['npx prisma migrate dev --name init'],workingDirectory:f.task.workspace,instructions:'請在 PowerShell 執行。',verification:['prisma/migrations 已建立'],requiresAdministrator:false,threadId:'thread-x',phase:'execute',planVersion:1,at:new Date().toISOString()}});
+ Object.assign(f.task,{status:'waiting_input',userActionRequired:{required:true,status:'pending',reason:'requires approval',actionType:'run_command',commands:['npx prisma migrate dev --name init'],workingDirectory:f.task.workspace,message:'This command requires approval: npx prisma migrate dev --name init',instructions:'請在 PowerShell 執行。',verification:['prisma/migrations 已建立'],requiresAdministrator:false,threadId:'thread-x',phase:'execute',planVersion:1,at:new Date().toISOString()}});
  f.s.saveTask(f.task);
  f.s.saveThread({id:'thread-x',taskId:f.task.id,version:1,phase:'execute',status:'completed',result:{summary:'blocked',passed:false,questions:[],evidence:['This command requires approval'],artifacts:[],userActionRequired:{required:true}}});
  f.s.db.prepare('INSERT INTO sessions VALUES (?,?,?)').run(hash('manual-session'),f.u.id,Date.now()+60000);
@@ -131,11 +163,19 @@ test('HTTP exposes the manual-action request, requires ownership, and rejects st
  try{
    const base=`http://127.0.0.1:${server.address().port}/api/tasks/${f.task.id}`,headers={cookie:'tf_session=manual-session','Content-Type':'application/json'};
    const detail=await (await fetch(base,{headers})).json();
+   // A pending manual action must surface as an explicit, distinct status — never collapsed
+   // into the generic waiting_input the Reviewer/UI use for ordinary questions.
+   assert.equal(detail.status,'waiting_input');
+   assert.equal(detail.displayStatus,'waiting_user_action');
    assert.equal(detail.manualAction.reason,'requires approval');
    assert.deepEqual(detail.manualAction.commands,['npx prisma migrate dev --name init']);
+   assert.equal(detail.manualAction.workingDirectory,f.task.workspace);
+   assert.match(detail.manualAction.message,/requires approval/);
+   assert.equal(detail.manualAction.instructions,'請在 PowerShell 執行。');
    const body=JSON.stringify({requestId:detail.manualAction.id,decision:'completed'});
    const response=await fetch(base+'/user-action/decision',{method:'POST',headers,body});assert.equal(response.status,200);
    const updated=await response.json();assert.equal(updated.status,'queued');assert.equal(updated.validationReviewPending,true);assert.equal(updated.manualAction,null);
+   assert.equal(updated.displayStatus,'queued','once resolved, the display status must fall back to the ordinary task status');
    assert.equal((await fetch(base+'/user-action/decision',{method:'POST',headers,body})).status,409);
  }finally{await new Promise(r=>server.close(r));}
 });

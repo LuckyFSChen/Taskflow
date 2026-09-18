@@ -24,6 +24,21 @@ test('Missing content fails closed after two passes, with named fields and origi
  await assert.rejects(validatedOutput(async()=>{calls++;const e=new Error('schema error');e.code='OUTPUT_FORMAT';e.rawResult={summary:'only summary'};e.sessionId='original-session';throw e;},{runDir:dir,schema:planJson},planSchema),e=>e.code==='OUTPUT_FORMAT'&&e.sessionId==='original-session'&&/acceptance/.test(e.message)&&/questions/.test(e.message)&&/steps/.test(e.message));
  assert.equal(calls,1);assert.equal(readdirSync(dir).filter(x=>x.startsWith('format-repair')).length,2);assert.doesNotMatch(readFileSync(join(dir,'format-repair-2.json'),'utf8'),/acceptance/);
 });
+test('A result missing questions/artifacts/passed is safely repaired with defaults, without inventing summary or evidence',async t=>{
+ const dir=fixture(t);let calls=0;
+ const result=await validatedOutput(async()=>{calls++;return {result:{summary:'Ran npm run build and it succeeded',evidence:['npm run build: exit 0']}};},{runDir:dir,schema:resultJson},resultSchema);
+ assert.equal(calls,1,'format repair must never re-invoke the adapter/engine');
+ assert.deepEqual(result.result,{summary:'Ran npm run build and it succeeded',evidence:['npm run build: exit 0'],questions:[],artifacts:[],passed:false,browserValidation:defaultBrowserValidation(),userActionRequired:defaultManualAction()});
+ assert.ok(readdirSync(dir).includes('format-repair-3.json'),'the third, defaults-filling repair pass must have run');
+ const original=JSON.parse(readFileSync(join(dir,'original-output.json'),'utf8'));
+ assert.deepEqual(original.result,{summary:'Ran npm run build and it succeeded',evidence:['npm run build: exit 0']},'the raw pre-repair command/tool evidence must be preserved untouched');
+});
+test('A plan missing steps is never defaulted to an empty plan — the third result-only repair pass never applies to the plan schema',async t=>{
+ const dir=fixture(t);let calls=0;
+ await assert.rejects(validatedOutput(async()=>{calls++;return {result:{summary:'plan without steps',acceptance:['done'],questions:[]}};},{runDir:dir,schema:planJson},planSchema),e=>e.code==='OUTPUT_FORMAT'&&/steps/.test(e.message));
+ assert.equal(calls,1);
+ assert.equal(readdirSync(dir).filter(x=>x.startsWith('format-repair')).length,2,'the plan schema must keep exactly the two lossless structural passes, never the result-only defaults pass');
+});
 test('Non-format and quota failures do not trigger repairs or repeat work',async t=>{
  const dir=fixture(t);let calls=0;await assert.rejects(validatedOutput(async()=>{calls++;throw Error('session limit');},{runDir:dir,schema:planJson},planSchema),/session limit/);assert.equal(calls,1);assert.equal(readdirSync(dir).length,0);
 });
