@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {ref} from 'vue';
-const props=defineProps<{request?:{id:string;reason:string;commands:string[];workingDirectory:string|null;instructions:string|null;verification:string[];requiresAdministrator:boolean|null};skips?:{reason:string;commands:string[]}[];busy:boolean}>();
+const props=defineProps<{request?:{id:string;reason:string;commands:string[];workingDirectory:string|null;instructions:string|null;verification:string[];requiresAdministrator:boolean|null;message?:string|null};skips?:{reason:string;commands:string[]}[];busy:boolean}>();
 const emit=defineEmits<{decide:[decision:'completed'|'failed'|'skip',note?:string]}>();
 const showFailForm=ref(false),note=ref('');
 async function copyCommands(){
@@ -23,6 +23,7 @@ function submitFailure(){emit('decide','failed',note.value);showFailForm.value=f
     <p v-else-if="request.requiresAdministrator===false">通常不需要系統管理員權限，請在一般 PowerShell 執行即可。</p>
     <p v-else>請先在一般 PowerShell 執行；若顯示權限不足，再改用「以系統管理員身分執行」。</p>
     <ul v-if="request.verification.length"><li v-for="(v,i) in request.verification" :key="i">{{v}}</li></ul>
+    <details v-if="request.message"><summary>查看原始錯誤訊息</summary><pre class="prewrap"><code>{{request.message}}</code></pre></details>
     <div class="actions">
       <button v-if="request.commands.length" class="secondary" type="button" @click="copyCommands">複製全部指令</button>
       <button class="primary" :disabled="busy" @click="$emit('decide','completed')">我已執行完成</button>
