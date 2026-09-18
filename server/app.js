@@ -68,13 +68,16 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     if(!allowActive&&store.threads(t.id).some(x=>x.status==='running'))throw new HttpError(409,'AI 正在修改此工作副本，請完成後再開啟預覽');
     return {key:`${p.id}:${t.id}:${t.planVersion}`,path:t.workspace};
   }
+  // Preview credentials (fullstack Preview 的一次性測試帳密) 只給 runner.js 內部組 prompt 用，
+  // 一般前端 UI 一律拿不到，避免外洩到瀏覽器或被其他使用者看見。
+  const withoutCredentials=info=>info?{...info,credentials:undefined}:info;
   app.get('/api/projects/:id/targets',(req,res)=>{
     const p=store.project(req.params.id);if(!p||!store.hasProject(req.user,p.id))throw new HttpError(404,'找不到專案');
-    const targets=[{taskId:null,label:'原始專案',web:detectWebProject(p.path),preview:previews.status(p.id)},...store.tasks(req.user).filter(t=>t.projectId===p.id&&t.workspace).map(t=>({taskId:t.id,label:`${t.title} · v${t.planVersion} 工作副本`,web:detectWebProject(t.workspace),preview:previews.status(`${p.id}:${t.id}:${t.planVersion}`)}))];
+    const targets=[{taskId:null,label:'原始專案',web:detectWebProject(p.path),preview:withoutCredentials(previews.status(p.id))},...store.tasks(req.user).filter(t=>t.projectId===p.id&&t.workspace).map(t=>({taskId:t.id,label:`${t.title} · v${t.planVersion} 工作副本`,web:detectWebProject(t.workspace),preview:withoutCredentials(previews.status(`${p.id}:${t.id}:${t.planVersion}`))}))];
     res.json({targets});
   });
   app.post('/api/projects/:id/open-folder',async(req,res)=>{const target=projectTarget(req,{allowActive:true});await folderOpener(target.path);res.json({ok:true});});
-  app.post('/api/projects/:id/preview',async(req,res)=>{const target=projectTarget(req);res.json(await previews.start(target.key,target.path));});
+  app.post('/api/projects/:id/preview',async(req,res)=>{const target=projectTarget(req);res.json(withoutCredentials(await previews.start(target.key,target.path)));});
   app.post('/api/projects/:id/preview/stop',async(req,res)=>{const target=projectTarget(req);await previews.stop(target.key);res.json({ok:true});});
   const visibleProjects=user=>{const projects=store.db.prepare('SELECT * FROM projects').all().filter(p=>store.hasProject(user,p.id));return projects.map(p=>user.role==='admin'?p:{id:p.id,name:p.name,code:p.code});};
   function decorated(t){const threads=store.threads(t.id).filter(th=>th.version===t.planVersion).map(th=>({...th,...threadPresentation(th)}));return {...t,validationSkipRequest:validationSkipRequest(store,t),executionApproval:executionApproval(store,t),manualAction:manualActionRequest(store,t),
