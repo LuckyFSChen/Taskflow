@@ -19,6 +19,10 @@ import ManualAction from './ManualAction.vue';
 // Git 守門（未提交修改／分支狀態）的人工確認區塊：以前這個情況只會顯示「需要處理」，
 // 沒有任何可以按的動作，任務因此永久卡住。
 import GitIssue from './GitIssue.vue';
+// 部署與驗收：合併、衝突預檢、清理、rollback 的後端能力早就存在（server/git-review.js），
+// 但前端從來沒有呼叫過，使用者因此每次都要自己開 PowerShell 下 git merge。
+import Completion from './Completion.vue';
+import {shouldLoadReview} from './completion-view.js';
 import NotificationManager from './NotificationManager.vue';
 import SystemHealth from './SystemHealth.vue';
 import OutputIssue from './OutputIssue.vue';
@@ -95,7 +99,37 @@ async function loadTask(id:string){selected.value=await api('/tasks/'+id);}
 // 成果報告不完整的三個操作。recoverOutput 只呼叫 deterministic recovery 的 endpoint，
 // 它不會（也不能）要求任何引擎重新執行工作。
 const outputRaw=ref<any>(null),outputRecovery=ref<any>(null);
-async function openTask(t:any){tab.value=DEFAULT_TAB;answer.value='';files.value=[];outputRaw.value=null;outputRecovery.value=null;await run(()=>loadTask(t.id));}
+// 部署與驗收的 Git 現況。/git/review 會實際執行 git 指令（讀 commit、讀正式分支狀態），
+// 所以絕不能放進三秒一次的 /state 輪詢——只在開啟任務、完成合併或使用者按重新讀取時取一次。
+const gitReview=ref<any>(null),reviewLoading=ref(false),reviewLoadedFor=ref<string|null>(null);
+async function loadReview(){
+  if(!selected.value||!shouldLoadReview(selected.value)){gitReview.value=null;return;}
+  const taskId=selected.value.id;
+  // 先記下「這個任務已經試著讀過了」，失敗也算：否則下面的 watch 會在每次失敗後立刻重試，
+  // 變成一邊跳錯誤訊息一邊不停跑 git 指令。要重試請按「重新讀取 Git 狀態」。
+  reviewLoadedFor.value=taskId;
+  reviewLoading.value=true;
+  try{const review=await api(`/tasks/${taskId}/git/review`);if(selected.value?.id===taskId)gitReview.value=review;}
+  catch(e:any){gitReview.value=null;notify(e.message);}
+  finally{reviewLoading.value=false;}
+}
+// 合併與撤銷都走既有 endpoint；成敗都重讀一次 Git 現況，畫面才不會停在舊狀態。
+async function completionMerge(options:{cleanup:boolean}){
+  if(!selected.value)return;
+  const taskId=selected.value.id,artifactVersion=selected.value.artifactVersion;
+  await run(async()=>{await api(`/tasks/${taskId}/git/decision`,{decision:'merge',artifactVersion,cleanup:options.cleanup});notify('已合併至正式分支');});
+  await loadReview();
+}
+async function completionRollback(mergeCommit:string){
+  if(!selected.value)return;
+  const taskId=selected.value.id;
+  await run(async()=>{await api(`/tasks/${taskId}/git/rollback`,{mergeCommit});notify('已撤銷合併；歷史完整保留，未刪除任何 commit');});
+  await loadReview();
+}
+async function openTask(t:any){tab.value=DEFAULT_TAB;answer.value='';files.value=[];outputRaw.value=null;outputRecovery.value=null;gitReview.value=null;reviewLoadedFor.value=null;await run(()=>loadTask(t.id));await loadReview();}
+// 任務有可能在詳情開著的時候才跑完；輪詢只讀 /state，不碰 /git/review，所以這裡補讀一次。
+// 條件包含任務 id，換任務時會重新判斷；同一個任務只會自動讀一次。
+watch(()=>selected.value&&shouldLoadReview(selected.value)&&reviewLoadedFor.value!==selected.value.id,need=>{if(need)void loadReview();});
 async function recoverOutput(){
   if(!selected.value)return;
   const taskId=selected.value.id,issueId=selected.value.outputIssue?.id;
@@ -201,6 +235,8 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
         <OutputIssue :task="selected" :busy="busy" :raw="outputRaw" :recovery="outputRecovery" @recover="recoverOutput" @raw="loadOriginalOutput" @replan="focusRevise"/>
         <ValidationSkip :request="selected.validationSkipRequest" :skips="selected.validationSkips" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/validation/decision`,{requestId:selected.validationSkipRequest.id,decision}))"/>
         <ExecutionApproval v-if="selected.executionApproval" :request="selected.executionApproval" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/execution/decision`,{requestId:selected.executionApproval.id,decision}))"/>
+        <!-- 部署與驗收：核准合併、清理與撤銷都在這裡完成，不需要再開 PowerShell。 -->
+        <Completion :task="selected" :review="gitReview" :busy="busy" :loading="reviewLoading" @refresh="loadReview" @merge="completionMerge" @rollback="completionRollback"/>
         <section v-if="selected.validationFailure" class="questions"><h3>最近未通過的驗證：第 {{selected.round}} 輪修正</h3><p class="prewrap">{{selected.validationFailure.summary}}</p><ul><li v-for="(e,i) in selected.validationFailure.evidence" :key="i">{{e}}</li></ul><p v-if="!selected.validationFailure.evidence.length">驗證缺少可確認的證據。</p><p v-for="(q,i) in selected.validationFailure.questions" :key="i">待確認：{{q}}</p><p v-if="selected.status==='repair_planning'">正在唯讀分析原因與解法，尚未執行修正。</p><template v-if="selected.repairPlan"><h3>問題原因與修正方案</h3><p class="prewrap">{{selected.repairPlan.summary}}</p><div v-for="(step,i) in selected.repairPlan.steps" :key="i" class="plan-step"><span class="step-number">{{Number(i)+1}}</span><div><strong>{{step.title}}</strong><p>{{step.instructions}}</p></div></div><h3>重新驗證標準</h3><ul><li v-for="(item,i) in selected.repairPlan.acceptance" :key="i">{{item}}</li></ul><p v-for="(q,i) in selected.repairPlan.questions" :key="i">待確認：{{q}}</p><template v-if="selected.status==='awaiting_repair_approval'&&!selected.validationSkipRequest"><button class="primary full" :disabled="busy||selected.repairPlan.questions.length>0" @click="run(()=>api(`/tasks/${selected.id}/repair/approve`,{proposalId:selected.repairPlan.id}))">核准此修正方案並執行</button><form @submit.prevent="run(async()=>{await api(`/tasks/${selected.id}/repair/revise`,{proposalId:selected.repairPlan.id,answer});answer='';})"><label>補充或修改修正方案<textarea v-model="answer" rows="3" minlength="2" maxlength="8000" required/></label><button class="secondary" :disabled="busy">重新提出方案，待我審核</button></form></template></template></section>
         <div v-if="selected.questions.length&&!selected.executionApproval&&!selected.validationSkipRequest&&!selected.manualAction" class="questions"><h3>需要你確認</h3><p v-for="(q,i) in selected.questions" :key="i">{{Number(i)+1}}. {{q}}</p></div>
 
