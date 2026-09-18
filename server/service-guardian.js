@@ -1,0 +1,38 @@
+import 'dotenv/config';
+import {createServer} from 'node:net';
+import {writeFileSync} from 'node:fs';
+import {runServiceRecovery} from './service-recovery.js';
+import {createStore} from './db.js';
+import {initServiceControl,stageCloudEvent,handleServiceRequests} from './service-control.js';
+const store=createStore();initServiceControl(store);
+const lock=createServer(socket=>socket.end());
+lock.on('error',()=>{store.close();process.exit(1);});
+async function request(path,body){
+  const response=await fetch(`${process.env.INBOX_URL.replace(/\/$/,'')}${path}`,{method:'POST',headers:{authorization:`Bearer ${process.env.INBOX_TOKEN}`,'content-type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(15000)});
+  if(!response.ok){
+    const detail=await response.json().catch(()=>({}));
+    throw new Error(`Inbox HTTP ${response.status}${Number.isInteger(detail.upstreamStatus)?` (LINE HTTP ${detail.upstreamStatus})`:''}`);
+  }return response.json();
+}
+async function repair(checkOnly=false){
+  return runServiceRecovery({checkOnly});
+}
+let busy=false;
+async function tick(){
+  if(busy)return;busy=true;
+  try{
+    // Commit every event locally BEFORE acknowledging it. Ordinary messages stay
+    // queued for the main service; they cannot hide recovery commands behind them.
+    try{if(process.env.INBOX_URL&&process.env.INBOX_TOKEN){
+      const {events}=await request('/runner/pull',{});
+      for(const event of events){stageCloudEvent(store,event);await request('/runner/ack',{id:event.webhookEventId});}
+    }}catch(e){console.error(new Date().toISOString(),'Cloud inbox unavailable',e.message);}
+    await handleServiceRequests(store,{recover:()=>repair(),inspect:()=>repair(true),notify:body=>request('/runner/notify',body),onError:e=>console.error(new Date().toISOString(),'Service request failed',String(e.stderr||e.message||e.code||'').slice(-2000))});
+    store.setSetting('guardianLastSuccess',new Date().toISOString());
+  }catch(e){console.error(new Date().toISOString(),e.code||'Guardian cycle failed',String(e.message||'').slice(0,300));}
+  finally{busy=false;}
+}
+lock.listen(4311,'127.0.0.1',()=>{
+  writeFileSync('data/service-guardian.pid',String(process.pid));
+  console.log('TaskFlow LINE recovery guardian ready');void tick();setInterval(()=>void tick(),5000);
+});

@@ -1,0 +1,42 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {DatabaseSync} from 'node:sqlite';
+import {mkdtempSync,rmSync,mkdirSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {createStore,id,hash} from '../server/db.js';
+import {processLine} from '../server/line.js';
+import {createLineChatWorker} from '../server/line-chat.js';
+import {createApp} from '../server/app.js';
+const lineA='U'+'a'.repeat(32),lineB='U'+'b'.repeat(32),lineC='U'+'c'.repeat(32);
+function fixture(t){const root=mkdtempSync(join(tmpdir(),'tf-multi-line-')),s=createStore(join(root,'db.sqlite')),u=s.addUser('User','user','fixture-password'),other=s.addUser('Other','other','fixture-password'),pid=id();mkdirSync(join(root,'project'));s.db.prepare('INSERT INTO projects VALUES (?,?,?,?)').run(pid,'demo','Demo',join(root,'project'));s.db.prepare('INSERT INTO memberships VALUES (?,?)').run(u.id,pid);t.after(()=>{s.close();rmSync(root,{recursive:true,force:true});});const send=(line,text)=>processLine(s,{webhookEventId:id(),type:'message',timestamp:Date.now(),source:{type:'user',userId:line},message:{type:'text',text}});const bind=(line,user=u)=>{const code=id();s.db.prepare('UPDATE users SET link_hash=?,link_expires=?,link_label=? WHERE id=?').run(hash(code),Date.now()+60000,'Phone '+line.slice(-1),user.id);send(line,'/link '+code);};return {root,s,u,other,pid,send,bind};}
+test('Two LINE accounts bind without replacement; one-time codes and cross-account ownership remain enforced',t=>{
+ const f=fixture(t);f.bind(lineA);f.bind(lineB);assert.equal(f.s.lineLinks(f.u.id).length,2);f.bind(lineA);assert.equal(f.s.lineLinks(f.u.id).length,2);f.bind(lineA,f.other);assert.equal(f.s.lineLink(lineA).user_id,f.u.id);assert.equal(f.s.lineLinks(f.other.id).length,0);
+ const code=f.s.db.prepare('SELECT link_hash FROM users WHERE id=?').get(f.u.id);assert.equal(code.link_hash,null);f.send(lineC,'/link invalid');assert.equal(f.s.lineLink(lineC),undefined);
+});
+test('Concurrent task wizards are isolated by LINE, including cancel and confirmation',t=>{
+ const f=fixture(t);f.bind(lineA);f.bind(lineB);f.send(lineA,'建立任務');f.send(lineB,'建立任務');
+ const flow=line=>JSON.parse(f.s.db.prepare('SELECT data FROM line_flows WHERE user_id=? AND line_id=?').get(f.u.id,line).data);
+ const a=flow(lineA),b=flow(lineB);assert.notEqual(a.id,b.id);f.send(lineA,'取消');assert.equal(f.s.db.prepare('SELECT COUNT(*) n FROM line_flows WHERE line_id=?').get(lineA).n,0);assert.equal(flow(lineB).id,b.id);f.send(lineB,'demo');f.send(lineB,'程式開發');f.send(lineB,'第二個 LINE 的任務');f.send(lineB,'請建立一個可以驗證的測試頁面');f.send(lineB,'確認發布');assert.equal(f.s.tasks().length,1);assert.equal(f.s.tasks()[0].title,'第二個 LINE 的任務');
+});
+test('Notifications fan out, preferences apply and unlink clears only that LINE pending work',t=>{
+ const f=fixture(t);f.bind(lineA);f.bind(lineB);f.s.db.prepare('DELETE FROM outbox').run();const task={id:id(),title:'Task',ownerId:f.u.id};f.s.notify(task,'hello');assert.equal(f.s.db.prepare('SELECT COUNT(*) n FROM outbox').get().n,2);
+ f.s.db.prepare('UPDATE line_links SET notifications=0 WHERE line_id=?').run(lineB);f.s.notify(task,'next');assert.equal(f.s.db.prepare('SELECT COUNT(*) n FROM outbox WHERE line_id=?').get(lineA).n,2);assert.equal(f.s.db.prepare('SELECT COUNT(*) n FROM outbox WHERE line_id=?').get(lineB).n,1);
+ f.send(lineA,'建立任務');f.send(lineB,'建立任務');assert.equal(f.s.unlinkLine(f.u.id,f.s.lineLink(lineA).id),true);assert.equal(f.s.lineLink(lineA),undefined);assert.ok(f.s.lineLink(lineB));assert.equal(f.s.db.prepare('SELECT COUNT(*) n FROM outbox WHERE line_id=?').get(lineA).n,0);assert.equal(f.s.db.prepare('SELECT COUNT(*) n FROM line_flows WHERE line_id=?').get(lineB).n,1);f.send(lineA,'任務進度');assert.match(f.s.db.prepare('SELECT message FROM outbox ORDER BY rowid DESC LIMIT 1').get().message,/請先登入/);
+});
+test('Unlink and relink while GPT is running cannot deliver an old reply or history',async t=>{
+ const f=fixture(t);f.bind(lineA);f.bind(lineB);f.s.db.prepare('DELETE FROM outbox').run();f.send(lineA,'old question');let finish;const worker=createLineChatWorker(f.s,{intervalMs:3600000,generate:()=>new Promise(r=>finish=r)});t.after(()=>worker.stop());const running=worker.tick();const oldId=f.s.lineLink(lineA).id;f.s.unlinkLine(f.u.id,oldId);f.bind(lineA);assert.notEqual(f.s.lineLink(lineA).id,oldId);finish('old answer');await running;assert.equal(f.s.db.prepare("SELECT COUNT(*) n FROM line_chats WHERE status='cancelled'").get().n,1);assert.equal(f.s.db.prepare("SELECT COUNT(*) n FROM outbox WHERE message='old answer'").get().n,0);
+ f.send(lineB,'new question');const otherWorker=createLineChatWorker(f.s,{intervalMs:3600000,generate:async({history})=>{assert.equal(history.length,0);return 'new answer';}});t.after(()=>otherWorker.stop());await otherWorker.tick();assert.equal(f.s.db.prepare("SELECT COUNT(*) n FROM outbox WHERE line_id=? AND message='new answer'").get(lineB).n,1);
+});
+test('Existing single binding and in-progress wizard migrate once and unlinked legacy binding stays removed',t=>{
+ const root=mkdtempSync(join(tmpdir(),'tf-link-migration-')),filename=join(root,'old.sqlite'),userId=id();const db=new DatabaseSync(filename);db.exec(`CREATE TABLE users(id TEXT PRIMARY KEY,name TEXT NOT NULL,username TEXT NOT NULL UNIQUE,password TEXT NOT NULL,role TEXT NOT NULL,line_id TEXT UNIQUE,link_hash TEXT,link_expires INTEGER);CREATE TABLE line_flows(user_id TEXT PRIMARY KEY REFERENCES users(id),data TEXT NOT NULL,expires INTEGER NOT NULL);`);db.prepare('INSERT INTO users VALUES (?,?,?,?,?,?,?,?)').run(userId,'Old','old','hash','member',lineA,null,null);db.prepare('INSERT INTO line_flows VALUES (?,?,?)').run(userId,JSON.stringify({stage:'title'}),Date.now()+60000);db.close();let s=createStore(filename);assert.equal(s.lineLinks(userId).length,1);assert.equal(JSON.parse(s.db.prepare('SELECT data FROM line_flows WHERE line_id=?').get(lineA).data).stage,'title');const linkId=s.lineLink(lineA).id;s.close();s=createStore(filename);assert.equal(s.lineLink(lineA).id,linkId);s.unlinkLine(userId,linkId);s.close();s=createStore(filename);assert.equal(s.lineLinks(userId).length,0);s.close();rmSync(root,{recursive:true,force:true});
+});
+test('Account API lists, names, mutes, revokes codes and unlinks only owned connections',async t=>{
+ const f=fixture(t);f.bind(lineA);f.bind(lineB);const server=createApp(f.s,{status:{}},{dist:join(f.root,'missing')}).listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));t.after(()=>server.close());const base=`http://127.0.0.1:${server.address().port}/api`;const call=(path,body,cookie='')=>fetch(base+path,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json',cookie},body:body===undefined?undefined:JSON.stringify(body)});const login=async username=>(await call('/login',{username,password:'fixture-password'})).headers.get('set-cookie').split(';')[0];
+ assert.equal((await call('/account/line-links')).status,401);const cookie=await login('user'),other=await login('other'),list=await(await call('/account/line-links',undefined,cookie)).json();assert.equal(list.links.length,2);assert.equal(list.links[0].line_id,undefined);const linkId=f.s.lineLink(lineA).id;
+ assert.equal((await call(`/account/line-links/${linkId}/update`,{label:'工作 LINE',notifications:false},other)).status,404);assert.equal((await call(`/account/line-links/${linkId}/remove`,{confirm:true},other)).status,404);
+ assert.equal((await call(`/account/line-links/${linkId}/update`,{label:'工作 LINE',notifications:false},cookie)).status,200);assert.equal(f.s.lineLink(lineA).label,'工作 LINE');assert.equal(f.s.lineLink(lineA).notifications,0);
+ const issued=await(await call('/account/line-link',{label:'第三個'},cookie)).json();await call('/account/line-link/cancel',{},cookie);f.send(lineC,issued.command);assert.equal(f.s.lineLink(lineC),undefined);
+ const first=await(await call('/account/line-link',{},cookie)).json(),second=await(await call('/account/line-link',{label:'第三個'},cookie)).json();f.send(lineC,first.command);assert.equal(f.s.lineLink(lineC),undefined);f.send(lineC,second.command);assert.equal(f.s.lineLink(lineC).label,'第三個');assert.equal(f.s.lineLinks(f.u.id).length,3);
+ assert.equal((await call(`/account/line-links/${linkId}/remove`,{},cookie)).status,400);assert.equal((await call(`/account/line-links/${linkId}/remove`,{confirm:true},cookie)).status,200);assert.equal(f.s.lineLinks(f.u.id).length,2);
+});

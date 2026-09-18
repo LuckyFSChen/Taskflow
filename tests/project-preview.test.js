@@ -1,0 +1,51 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtempSync,writeFileSync,mkdirSync,rmSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {get} from 'node:http';
+import {createProjectPreview} from '../server/project-preview.js';
+import {createStore,id} from '../server/db.js';
+import {createApp} from '../server/app.js';
+
+test('Local web preview builds once, serves loopback only, stops and surfaces build failures',async t=>{
+  const root=mkdtempSync(join(tmpdir(),'tf-preview-'));let calls=[];
+  const preview=createProjectPreview({npm:async(path,args)=>{calls.push(args);mkdirSync(join(path,'dist'),{recursive:true});writeFileSync(join(path,'dist/index.html'),'<h1>Preview proof</h1>');}});
+  t.after(async()=>{await preview.close();rmSync(root,{recursive:true,force:true});});
+  writeFileSync(join(root,'package.json'),JSON.stringify({devDependencies:{vite:'*'},scripts:{build:'vite build'}}));
+  const [one,two]=await Promise.all([preview.start('project',root),preview.start('project',root)]);
+  assert.equal(one.url,two.url);assert.match(one.url,/^http:\/\/127\.0\.0\.1:\d+$/);
+  assert.deepEqual(calls,[['install'],['run','build']]);
+  assert.match(await (await fetch(one.url)).text(),/Preview proof/);
+  const wrongHost=await new Promise((resolve,reject)=>{get(one.url,{headers:{host:'evil.test'}},res=>{res.resume();resolve(res.statusCode);}).on('error',reject);});
+  assert.equal(wrongHost,403);
+  assert.equal((await fetch(one.url+'/.env')).status,404);
+  await preview.stop('project');assert.equal(preview.status('project'),null);
+  await assert.rejects(fetch(one.url));
+  const broken=createProjectPreview({npm:async()=>{throw Error('build failed');}});
+  await assert.rejects(broken.start('broken',root),/build failed/);assert.equal(broken.status('broken'),null);await broken.close();
+});
+
+test('Project actions enforce login, membership and task ownership before opening or executing',async t=>{
+  const root=mkdtempSync(join(tmpdir(),'tf-preview-acl-')),store=createStore(join(root,'db.sqlite'));
+  const admin=store.addUser('Admin','admin','test-password-admin','admin'),member=store.addUser('Member','member','test-password-member');
+  const pid=id(),other=id(),tid=id();store.db.prepare('INSERT INTO projects VALUES (?,?,?,?)').run(pid,'demo','Demo',root);store.db.prepare('INSERT INTO projects VALUES (?,?,?,?)').run(other,'other','Other',root);
+  store.saveTask({id:tid,ownerId:admin.id,projectId:pid,status:'completed',priority:1,position:0,workspace:root,planVersion:1});
+  let opens=0,starts=0;
+  const server=createApp(store,{status:{}},{dist:join(root,'none'),folderOpener:async()=>opens++,previews:{status:()=>null,start:async()=>{starts++;return {url:'http://127.0.0.1:9999'};},stop:async()=>{}}}).listen(0,'127.0.0.1');
+  await new Promise(resolve=>server.once('listening',resolve));t.after(async()=>{await new Promise(resolve=>server.close(resolve));store.close();rmSync(root,{recursive:true,force:true});});
+  const base=`http://127.0.0.1:${server.address().port}/api`;
+  const post=(path,body={},cookie='')=>fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json',cookie},body:JSON.stringify(body)});
+  const login=async(username,password)=>(await post('/login',{username,password})).headers.get('set-cookie').split(';')[0];
+  const a=await login('admin','test-password-admin'),m=await login('member','test-password-member');
+  assert.equal((await post(`/projects/${pid}/open-folder`)).status,401);
+  assert.equal((await post(`/projects/${pid}/preview`,{},m)).status,404);assert.equal(starts,0);
+  store.db.prepare('INSERT INTO memberships VALUES (?,?)').run(member.id,pid);
+  assert.equal((await post(`/projects/${pid}/preview`,{taskId:tid},m)).status,404);
+  assert.equal((await post(`/projects/${other}/preview`,{taskId:tid},a)).status,404);
+  assert.equal((await post(`/projects/${pid}/open-folder`,{},a)).status,200);assert.equal(opens,1);
+  assert.equal((await post(`/projects/${pid}/preview`,{taskId:tid},a)).status,200);assert.equal(starts,1);
+  store.saveThread({id:id(),taskId:tid,version:1,status:'running'});
+  assert.equal((await post(`/projects/${pid}/open-folder`,{taskId:tid},a)).status,200);assert.equal(opens,2);
+  assert.equal((await post(`/projects/${pid}/preview`,{taskId:tid},a)).status,409);
+});

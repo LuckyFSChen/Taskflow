@@ -1,0 +1,27 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtempSync,rmSync,mkdirSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {createStore,id} from '../server/db.js';
+import {processLine} from '../server/line.js';
+import {validMessages,installMenu} from '../cloud-inbox/line-menu.js';
+
+function fixture(t){const root=mkdtempSync(join(tmpdir(),'line-ui-')),s=createStore(join(root,'db.sqlite')),user=s.addUser('Member','member','fixture-password'),pid=id();mkdirSync(join(root,'project'));s.db.prepare('INSERT INTO projects VALUES (?,?,?,?)').run(pid,'demo','測試專案',join(root,'project'));s.db.prepare('INSERT INTO memberships VALUES (?,?)').run(user.id,pid);const lineId='U'+'a'.repeat(32);s.db.prepare('UPDATE users SET line_id=? WHERE id=?').run(lineId,user.id);t.after(()=>{s.close();rmSync(root,{recursive:true,force:true});});const send=(value,postback=true,eventId=id())=>processLine(s,{webhookEventId:eventId,type:postback?'postback':'message',source:{type:'user',userId:lineId},...(postback?{postback:{data:value}}:{message:{type:'text',text:value}})});const last=()=>JSON.parse(s.db.prepare('SELECT payload FROM outbox ORDER BY rowid DESC LIMIT 1').get().payload);const flow=()=>JSON.parse(s.db.prepare('SELECT data FROM line_flows WHERE user_id=?').get(user.id).data);return {s,user,pid,send,last,flow};}
+test('Clickable wizard creates one durable task without commands; stale buttons and redelivery cannot submit twice',t=>{
+  const f=fixture(t);f.send('tf:new');const nonce=f.flow().id;assert.equal(f.last()[0].quickReply.items[0].action.label,'測試專案');
+  f.send(`tf:project:${nonce}:${f.pid}`);f.send(`tf:type:${nonce}:research`);f.send('研究文件測試',false);f.send('建立包含驗收條件的 Markdown 文件。',false);assert.equal(f.s.tasks().length,0);
+  const eventId=id();f.send(`tf:submit:${nonce}`,true,eventId);f.send(`tf:submit:${nonce}`,true,eventId);f.send(`tf:submit:${nonce}`);
+  assert.equal(f.s.tasks().length,1);assert.equal(f.s.tasks()[0].type,'research');assert.equal(f.s.tasks()[0].executor,'claude');assert.match(f.last()[0].text,/失效/);
+  for(const row of f.s.db.prepare('SELECT payload FROM outbox').all())assert.equal(validMessages(JSON.parse(row.payload)),true);
+});
+test('Expired flows, unauthorized project and old plan approval are rejected',t=>{const f=fixture(t);f.send('tf:new');const nonce=f.flow().id;f.send(`tf:project:${nonce}:${id()}`);assert.match(f.last()[0].text,/無法使用/);f.s.db.prepare('UPDATE line_flows SET expires=0').run();f.send(`tf:project:${nonce}:${f.pid}`);assert.match(f.last()[0].text,/失效/);assert.equal(f.s.tasks().length,0);});
+test('Task detail exposes versioned review buttons; old version cannot approve',t=>{const f=fixture(t);f.send('/task demo Test task\nCreate a sample document.',false);const task=f.s.tasks()[0];task.status='awaiting_approval';task.plan={summary:'Plan',acceptance:['File exists'],questions:[],steps:[{title:'Write',role:'Writer',instructions:'Create document'}]};task.planVersion=2;f.s.saveTask(task);f.send(`tf:view:${task.id}`);assert.ok(f.last()[0].quickReply.items.some(i=>i.action.data===`tf:approve:${task.id}:2`));f.send(`tf:approve:${task.id}:1`);assert.equal(f.s.task(task.id).status,'awaiting_approval');f.send(`tf:approve:${task.id}:2`);assert.equal(f.s.task(task.id).status,'queued');});
+test('Menu cancel creates no task; web shortcut never sends localhost as a phone URI action',t=>{const f=fixture(t);f.send('tf:new');f.send('tf:cancel');assert.equal(f.s.tasks().length,0);assert.equal(f.s.db.prepare('SELECT COUNT(*) n FROM line_flows').get().n,0);f.send('tf:web');assert.ok(!f.last()[0].quickReply.items.some(i=>i.action.type==='uri'));assert.match(f.last()[0].text,/Windows/);});
+test('Cloud message validator accepts quick replies and refuses malformed actions',()=>{assert.equal(validMessages([{type:'text',text:'Choose',quickReply:{items:[{type:'action',action:{type:'postback',label:'新增',data:'tf:new'}}]}}]),true);assert.equal(validMessages([{type:'text',text:'x',quickReply:{items:[{type:'action',action:{type:'uri',label:'bad',uri:'javascript:alert(1)'}}]}}]),false);});
+test('Menu installation is idempotent and verifies the default menu without sending chat messages',async t=>{
+  const original=globalThis.fetch;t.after(()=>globalThis.fetch=original);let menu=null,hasImage=false,defaultId=null,created=0;const paths=[];
+  globalThis.fetch=async(url,options={})=>{const p=new URL(url).pathname;paths.push(p);let status=200,body={};if(p.endsWith('/richmenu/list'))body={richmenus:menu?[menu]:[]};else if(p.endsWith('/user/all/richmenu')){status=defaultId?200:404;body={richMenuId:defaultId};}else if(p==='/v2/bot/richmenu'){created++;menu={richMenuId:'richmenu-fixture',name:'TaskFlow Quick Actions v1'};body=menu;}else if(p.endsWith('/content')){if(options.method==='POST')hasImage=true;else status=hasImage?200:404;}else if(p.endsWith('/user/all/richmenu/richmenu-fixture'))defaultId='richmenu-fixture';else throw Error('Unexpected request '+p);return new Response(JSON.stringify(body),{status});};
+  const request=()=>new Request('https://fixture/runner/menu/install',{method:'POST',body:JSON.stringify({imageBase64:Buffer.from([137,80,78,71,13,10,26,10]).toString('base64')})});
+  const env={LINE_CHANNEL_ACCESS_TOKEN:'fixture'};assert.equal((await installMenu(request(),env)).status,200);assert.equal((await installMenu(request(),env)).status,200);assert.equal(created,1);assert.ok(!paths.some(p=>p.includes('/message/')));
+});

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+.env
+*.log
+cloud-inbox/.wrangler/
+cloud-inbox/.dev.vars
+cloud-inbox/.dev.vars.*
