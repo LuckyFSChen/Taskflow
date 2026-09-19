@@ -66,6 +66,7 @@ const list = value => Array.isArray(value) ? value : [];
  *   runtime?: {completionValidation?: {status?: string, passed?: boolean, checks?: {name?: string, description?: string, passed: boolean}[]}|null},
  *   browserValidation?: {required?: boolean, executed?: boolean, passed?: boolean|null, status?: string, error?: string|null, notes?: string}|null,
  *   pendingActions?: {userActionRequired?: boolean, questions?: boolean, gitIssue?: boolean, outputIssue?: boolean, repairApproval?: boolean},
+ *   planProgress?: {total?: number, completed?: number, remaining?: number, nextStepTitle?: string|null} | null,
  * }} context 只接收呼叫端已經算好的證據，這個函式本身不讀取任何檔案或執行任何 Git／HTTP 操作。
  * @returns {{status: string, passed: boolean, blockingReasons: string[], warnings: string[], evidence: string[], nextAction: string}}
  *
@@ -194,6 +195,26 @@ export function reconcileCompletionState(context = {}) {
   }
   // browser && browser.required === false：這個任務不需要 Browser Validation，不列警告也不列 evidence。
 
+  // ---- 計畫步驟進度 ---------------------------------------------------------
+  // Group-level 的「完成」必須建立在所有計畫步驟都確實執行完成之上。只要還有步驟沒做完，
+  // 即使這一次獨立驗證自己回報 passed=true 也不能判定完成——那份 claim 只涵蓋它實際檢查
+  // 過的範圍（通常是最後執行的那一個步驟），不能代表整份計畫。這是 deterministic 的計數
+  // 結果，不是 AI 的 claim，所以直接列為 blocking；但「還沒做完」不等於「證明失敗」，
+  // 因此不設 deterministicFailure，狀態導向 blocked 而不是 failed。
+  const progress = context.planProgress;
+  if (progress && typeof progress === 'object' && Number.isFinite(progress.total)) {
+    const total = progress.total;
+    const completed = Number.isFinite(progress.completed) ? progress.completed : 0;
+    const remaining = Number.isFinite(progress.remaining) ? progress.remaining : Math.max(total - completed, 0);
+    if (remaining > 0) {
+      block(`計畫還有 ${remaining} 個步驟未完成（已完成 ${completed}/${total}），不得進入最終驗證或判定完成${progress.nextStepTitle ? `；下一個待執行步驟：${progress.nextStepTitle}` : ''}。`);
+    } else if (total > 0) {
+      proof(`計畫的 ${total} 個步驟已全部執行完成並各自通過驗證。`);
+    }
+  } else {
+    warn('沒有計畫步驟進度（不適用或尚未執行）。');
+  }
+
   // ---- 待使用者處理的事項 ---------------------------------------------------
   const pending = context.pendingActions || {};
   if (pending.gitIssue) block('Git 工作樹有未處理的確認事項（未提交修改／受保護分支等），需要使用者先處理。');
@@ -228,5 +249,71 @@ export function reconcileCompletionState(context = {}) {
     warnings,
     evidence,
     nextAction: NEXT_ACTIONS[status],
+  };
+}
+
+/**
+ * 依 threads 計算目前計畫版本的步驟進度。
+ *
+ * 判定規則與 runner 派工時完全一致（同一個 planVersion、phase='execute'、
+ * status='completed'、result.passed===true、且沒有待回答問題），確保「下一步要派哪一步」
+ * 與「可不可以視為完成」用的是同一套事實，不會出現 runner 還要派第 2 步、
+ * 完成判定卻認為整份計畫已結束的矛盾。
+ */
+export function planProgressOf(task, threads = []) {
+  const steps = list(task?.plan?.steps);
+  const total = steps.length;
+  const passedSteps = list(threads).filter(t => t
+    && t.version === task?.planVersion
+    && t.phase === 'execute'
+    && t.status === 'completed'
+    && t.result?.passed === true
+    && !list(t.result?.questions).length).length;
+  const completed = Math.min(passedSteps, total);
+  return {
+    total,
+    completed,
+    remaining: Math.max(total - completed, 0),
+    nextStepTitle: steps[completed]?.title || null,
+  };
+}
+
+/**
+ * 把一個任務目前握有的完成證據組成 reconcileCompletionState() 的 context。
+ *
+ * 這裡只讀取 task／threads 上已經算好的欄位，不做任何檔案、Git 或 HTTP I/O，也不重跑
+ * 任何檢查。抽成共用函式是為了讓所有會寫入 `status='completed'` 的路徑
+ * （review 結果、部署驗收結束、手動略過）核算的是同一組證據，而不是各自判斷。
+ *
+ * @param {object} task 任務
+ * @param {object[]} threads 這個任務的所有 thread
+ * @param {{executorResult?: object|null, browserValidation?: object|null, gitIssuePending?: boolean}} [overrides]
+ *   executorResult／browserValidation 預設取目前計畫版本最後一次完成的 review 結果；
+ *   呼叫端手上有更新的結果（例如 review 剛跑完、還沒寫回 thread）時可以覆寫。
+ */
+export function taskCompletionContext(task, threads = [], overrides = {}) {
+  const lastReview = list(threads)
+    .filter(t => t && t.phase === 'review' && t.version === task?.planVersion && t.status === 'completed')
+    .at(-1) || null;
+  const result = overrides.executorResult !== undefined ? overrides.executorResult : (lastReview?.result || null);
+  return {
+    executorResult: result && {
+      passed: result.passed, questions: result.questions, evidence: result.evidence, summary: result.summary,
+    },
+    git: {
+      headCommit: task?.git?.headCommit || null,
+      gitMerge: task?.gitMerge || null,
+      gitConflict: task?.gitConflict || null,
+    },
+    tests: {completionTest: task?.completionTest || null, completionMainTest: task?.completionMainTest || null},
+    deployment: task?.completion || null,
+    runtime: {completionValidation: task?.completionValidation || null},
+    browserValidation: overrides.browserValidation !== undefined ? overrides.browserValidation : (result?.browserValidation || null),
+    planProgress: planProgressOf(task, threads),
+    pendingActions: {
+      gitIssue: overrides.gitIssuePending === true,
+      userActionRequired: task?.userActionRequired?.status === 'pending',
+      outputIssue: !!task?.outputIssue,
+    },
   };
 }

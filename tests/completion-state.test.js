@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { reconcileCompletionState, COMPLETION_STATUSES } from '../server/completion-state.js';
+import { reconcileCompletionState, COMPLETION_STATUSES, planProgressOf, taskCompletionContext } from '../server/completion-state.js';
 
 // 一份「一切正常、可判定完成」的基準 context：executor 有 claim 有 evidence、
 // Git 乾淨、沒有測試 regression、部署與驗收都通過、Browser Validation 通過、沒有待處理事項。
@@ -224,4 +224,101 @@ test('驗收：Browser Validation 必要但未通過時不得 completed', () => 
   }));
   assert.notEqual(result.status, 'completed');
   assert.equal(result.status, 'failed');
+});
+
+// ---- 計畫步驟進度：group-level 完成的前置條件 --------------------------------
+
+test('status=blocked：計畫還有步驟沒完成時，即使這次驗證自己回報 passed 也不得 completed', () => {
+  const result = reconcileCompletionState(baseContext({
+    planProgress: { total: 6, completed: 1, remaining: 5, nextStepTitle: '擴充 Public／Admin API' },
+  }));
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.passed, false);
+  assert.ok(result.blockingReasons.some(r => r.includes('5 個步驟未完成')));
+  assert.ok(result.blockingReasons.some(r => r.includes('擴充 Public／Admin API')));
+});
+
+test('計畫步驟全部完成時，進度這一項成為 evidence 而不是 blocking', () => {
+  const result = reconcileCompletionState(baseContext({
+    planProgress: { total: 6, completed: 6, remaining: 0, nextStepTitle: null },
+  }));
+  assert.equal(result.status, 'completed');
+  assert.equal(result.passed, true);
+  assert.ok(result.evidence.some(e => e.includes('6 個步驟已全部執行完成')));
+});
+
+test('沒有計畫步驟進度時視為不適用：列入 warnings，不單獨促成也不擋住完成', () => {
+  const result = reconcileCompletionState(baseContext());
+  assert.equal(result.status, 'completed');
+  assert.ok(result.warnings.some(w => w.includes('計畫步驟進度')));
+});
+
+test('步驟未完成屬於 blocked 而不是 failed：還沒做完不等於證明失敗', () => {
+  const result = reconcileCompletionState(baseContext({
+    planProgress: { total: 3, completed: 0, remaining: 3, nextStepTitle: 'Step 1' },
+  }));
+  assert.equal(result.status, 'blocked');
+  assert.notEqual(result.status, 'failed');
+});
+
+// ---- planProgressOf：與 runner 派工用的是同一套事實 ---------------------------
+
+test('planProgressOf 只採計本計畫版本中確實通過、且沒有待回答問題的 execute 步驟', () => {
+  const task = { planVersion: 2, plan: { steps: [{ title: 'S1' }, { title: 'S2' }, { title: 'S3' }] } };
+  const threads = [
+    { version: 2, phase: 'execute', status: 'completed', result: { passed: true, questions: [] } },
+    { version: 1, phase: 'execute', status: 'completed', result: { passed: true, questions: [] } },      // 舊版本不算
+    { version: 2, phase: 'execute', status: 'completed', result: { passed: false, questions: [] } },     // 未通過不算
+    { version: 2, phase: 'execute', status: 'completed', result: { passed: true, questions: ['?'] } },   // 有待回答問題不算
+    { version: 2, phase: 'execute', status: 'rate_limited', result: null },                              // 未完成不算
+    { version: 2, phase: 'review', status: 'completed', result: { passed: true, questions: [] } },       // 不是 execute
+  ];
+  assert.deepEqual(planProgressOf(task, threads), { total: 3, completed: 1, remaining: 2, nextStepTitle: 'S2' });
+});
+
+test('planProgressOf 在沒有計畫或沒有 threads 時回傳零進度而不是丟例外', () => {
+  assert.deepEqual(planProgressOf({}, []), { total: 0, completed: 0, remaining: 0, nextStepTitle: null });
+  assert.deepEqual(planProgressOf(null, null), { total: 0, completed: 0, remaining: 0, nextStepTitle: null });
+});
+
+// ---- taskCompletionContext：所有寫入 completed 的路徑共用同一組證據 -------------
+
+test('taskCompletionContext 會把計畫步驟進度一併帶進核算，未完成的計畫無法判定完成', () => {
+  const task = {
+    planVersion: 1,
+    plan: { steps: [{ title: 'S1' }, { title: 'S2' }] },
+    git: { headCommit: 'abc1234' },
+    gitMerge: { commit: 'abc1234', baseBranch: 'main' },
+    completion: { status: 'completed', failure: null },
+    completionValidation: { status: 'completed', passed: true, checks: [{ name: 'preview', passed: true }] },
+  };
+  const threads = [
+    { version: 1, phase: 'execute', status: 'completed', result: { passed: true, questions: [] } },
+    { version: 1, phase: 'review', status: 'completed', result: { passed: true, questions: [], evidence: ['已驗證'], summary: 'ok' } },
+  ];
+  const context = taskCompletionContext(task, threads);
+  assert.deepEqual(context.planProgress, { total: 2, completed: 1, remaining: 1, nextStepTitle: 'S2' });
+  assert.equal(context.executorResult.passed, true);
+  const result = reconcileCompletionState(context);
+  assert.equal(result.passed, false);
+  assert.ok(result.blockingReasons.some(r => r.includes('1 個步驟未完成')));
+});
+
+test('taskCompletionContext 在部署驗收未通過時核算為 failed，不會停留在 completed', () => {
+  const task = {
+    planVersion: 1,
+    plan: { steps: [{ title: 'S1' }] },
+    git: { headCommit: 'abc1234' },
+    gitMerge: { commit: 'abc1234', baseBranch: 'main' },
+    completion: { status: 'completed', failure: null },
+    completionValidation: { status: 'failed', passed: false, checks: [], error: '找不到可預覽的網頁' },
+  };
+  const threads = [
+    { version: 1, phase: 'execute', status: 'completed', result: { passed: true, questions: [] } },
+    { version: 1, phase: 'review', status: 'completed', result: { passed: true, questions: [], evidence: ['已驗證'], summary: 'ok' } },
+  ];
+  const result = reconcileCompletionState(taskCompletionContext(task, threads));
+  assert.equal(result.status, 'failed');
+  assert.equal(result.passed, false);
+  assert.ok(result.blockingReasons.some(r => r.includes('部署驗收')));
 });

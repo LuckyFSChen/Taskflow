@@ -16,7 +16,12 @@ function fixture(t,phase='execute'){
  const task=createTask(s,u,{title:'Approval test',description:'Continue original work',projectId:pid,type:'research'});
  Object.assign(task,{status:'waiting_input',workspace:source,plan:{summary:'Original',acceptance:['done'],questions:[],steps:[{title:'Original step',role:'Author',instructions:'Continue work'}]},approvedVersion:1,questions:['是否核准調整套件版本並執行測試？']});
  if(phase==='repair'){task.round=1;task.repairPlan={id:'repair',round:1,planVersion:1,steps:[]};task.approvedRepairId='repair';}
- s.saveTask(task);s.saveThread({id:id(),taskId:task.id,version:1,phase,round:task.round,status:'completed',result:{passed:false,questions:task.questions}});
+ s.saveTask(task);
+ // 會走到 review／repair 的任務，代表它的計畫步驟本來就已經執行完成並通過——沒有通過的
+ // 步驟根本不會被派到最終驗證。fixture 必須忠實反映這一點，否則就會造出「步驟還沒做完
+ // 卻已經在跑最終驗證」這種現實中不該存在的狀態。
+ if(phase!=='execute')s.saveThread({id:id(),taskId:task.id,version:1,phase:'execute',round:0,status:'completed',title:'Original step',result:{summary:'Original step done',passed:true,questions:[],evidence:['step verified'],artifacts:[]}});
+ s.saveThread({id:id(),taskId:task.id,version:1,phase,round:task.round,status:'completed',result:{passed:false,questions:task.questions}});
  t.after(()=>{s.close();rmSync(root,{recursive:true,force:true});});return {s,u,other,task,root};
 }
 
@@ -58,7 +63,7 @@ test('Skip keeps failed evidence and original plan; resumes review, never unappr
  assert.throws(()=>decideValidationSkip(f.s,f.u,f.task.id,{requestId:req.id,decision:'skip'}),{status:409});
  f.s.setSetting('runnerEnabled',true);let prompt;
  const runner=createRunner(f.s,{dataDir:join(f.root,'data'),adapter:async o=>{prompt=o.prompt;return {result:{summary:'其餘檢查通過；視覺未驗證',passed:true,questions:[],evidence:['其他測試通過'],artifacts:[]}};}});
- try{await runner.tick();assert.equal(f.s.threads(task.id).at(-1).phase,'review');assert.match(prompt,/不得聲稱這些項目通過/);assert.equal(f.s.task(task.id).status,'completed');assert.equal(f.s.task(task.id).validationSkips.length,1);assert.equal(f.s.threads(task.id)[0].result.passed,false);}finally{runner.stop();}
+ try{await runner.tick();assert.equal(f.s.threads(task.id).at(-1).phase,'review');assert.match(prompt,/不得聲稱這些項目通過/);assert.equal(f.s.task(task.id).status,'completed');assert.equal(f.s.task(task.id).validationSkips.length,1);assert.equal(f.s.threads(task.id).find(x=>x.phase==='review').result.passed,false,'原本那份受限的驗證報告必須原樣保留，不因為使用者選擇跳過就被改寫成通過');}finally{runner.stop();}
 });
 test('New blocked review waits for decision; mixed functional failures still require repair',async t=>{
  const f=pending(t);let task=f.task;task.status='queued';task.validationReviewPending=true;f.s.saveTask(task);f.s.setSetting('runnerEnabled',true);

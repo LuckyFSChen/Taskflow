@@ -17,6 +17,7 @@ import {id, now} from './db.js';
 import {HttpError, requireTask} from './domain.js';
 import {validateDeployment} from './deployment-validation.js';
 import {waitForExit} from './process-lifecycle.js';
+import {reconcileCompletionState, taskCompletionContext} from './completion-state.js';
 
 const MAX_LISTED_CHECKS = 20;
 
@@ -127,6 +128,26 @@ export function createCompletionValidations({ previews, validate = validateDeplo
     };
   }
 
+  // 部署驗收是 group-level 的最後一道 deterministic 檢查。驗收沒有通過時，任務不能繼續
+  // 停留在 completed，否則畫面會同時出現「部署驗收未通過」與「任務已完成」兩個互相矛盾的
+  // 狀態。這裡不自己判斷，而是把任務目前握有的全部證據交給 reconcileCompletionState 重新
+  // 核算：只有核算結果仍然是 completed 才保留完成狀態，否則退回待處理交由使用者決定下一步
+  // （刻意不自動啟動修正流程——此時程式碼通常已經合併進正式分支，不應在使用者不知情的情況
+  // 下再次動到它）。使用者自己手動標記完成的任務（manualCompletion）不在此列。
+  function reconcileAfterValidation(store, taskId) {
+    const latest = store.task(taskId);
+    if (!latest || latest.status !== 'completed' || latest.manualCompletion) return null;
+    const reconciled = reconcileCompletionState(taskCompletionContext(latest, store.threads(taskId)));
+    if (reconciled.passed && reconciled.status === 'completed') return latest;
+    latest.status = 'waiting_input';
+    latest.questions = [`部署驗收未通過，任務不能視為完成：\n${reconciled.blockingReasons.join('\n')}\n\n${reconciled.nextAction}`];
+    store.saveTask(latest);
+    store.event(taskId, 'completion_state_reconciled',
+      `部署驗收未通過，任務狀態由「已完成」退回待處理：${reconciled.blockingReasons.join('；') || reconciled.nextAction}`);
+    store.notify(latest, `部署驗收未通過，任務已退回待處理：${reconciled.blockingReasons[0] || reconciled.nextAction}`);
+    return latest;
+  }
+
   function finish(store, taskId, validationId, patch) {
     const latest = store.task(taskId);
     if (!latest || latest.completionValidation?.id !== validationId) return null;
@@ -170,11 +191,12 @@ export function createCompletionValidations({ previews, validate = validateDeplo
               ? `TaskFlow 驗收基礎設施問題（不是專案驗收失敗）：${auth.failureCode}。失敗停在 ${outcome.state || 'AUTH_FAILED'}，${failed.map(item => `${item.name}（${item.actual}）`).join('、')}`
               : `部署驗收未通過：${failed.map(item => `${item.name}（${item.actual}）`).join('、')}${auth?.failureCode ? `，failureCode=${auth.failureCode}` : ''}`;
           store.event(taskId, 'completion_validation_result', summary);
-          if (!outcome.passed) store.notify(updated, summary);
+          if (!outcome.passed) { store.notify(updated, summary); reconcileAfterValidation(store, taskId); }
         })
         .catch(error => {
           finish(store, taskId, validationId, { status: 'failed', passed: false, error: String(error?.message || error).slice(0, 1000) });
           store.event(taskId, 'completion_validation_failed', `部署驗收未完成：${String(error?.message || error).slice(0, 500)}`);
+          reconcileAfterValidation(store, taskId);
         })
         .finally(() => running.delete(taskId));
 

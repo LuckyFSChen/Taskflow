@@ -17,7 +17,7 @@ import {detectWebProject,createProjectPreview} from './project-preview.js';
 import {createGitWorkspace,DEFAULT_PROTECTED_BRANCHES} from './git-workspace.js';
 import {gitIssuePending} from './git-issue.js';
 import {deriveBrowserValidationRequirement,checkClaudeBrowserCapability,browserMcpServerSpec,browserMcpConfig,browserAllowedTools,isBrowserToolName,categorizeBrowserTool,reconcileBrowserValidation,defaultBrowserValidation} from './browser-capability.js';
-import {reconcileCompletionState} from './completion-state.js';
+import {reconcileCompletionState,planProgressOf} from './completion-state.js';
 
 const blocked=name=> /^(node_modules|\.git|\.env(?:\..*)?|data|dist|build|\.venv|venv|\.ssh|\.aws|\.codex|\.claude|\.taskflow|first-login\.txt)$/i.test(name)||/\.(pem|key|pfx|sqlite(?:-wal|-shm)?)$/i.test(name);
 export function snapshot(source,dest,{excludePaths=[]}={}) {
@@ -110,7 +110,7 @@ export function applyResultGuards(result,{phase,browserEvidence,browserRequireme
 // 只是把 runner 已經握有的欄位（t.git、t.gitMerge、t.gitConflict、t.completionTest……）
 // 組成 context；部署管線與部署驗收在 review 通過前通常還沒開始，缺席會被
 // reconcileCompletionState 視為「不適用」，不會因此擋住審核，也不會被當成通過。
-function reviewCompletionContext(t,thread,result){
+function reviewCompletionContext(t,thread,result,threads=[]){
   return {
     executorResult:{passed:result.passed,questions:result.questions,evidence:result.evidence,summary:result.summary},
     git:{headCommit:t.git?.headCommit||null,gitMerge:t.gitMerge||null,gitConflict:t.gitConflict||null},
@@ -118,6 +118,9 @@ function reviewCompletionContext(t,thread,result){
     deployment:t.completion||null,
     runtime:{completionValidation:t.completionValidation||null},
     browserValidation:result.browserValidation||null,
+    // 計畫步驟進度是 deterministic 的計數，不是 AI 的 claim：只要還有步驟沒做完，
+    // 這一次 review 自己回報的 passed=true 就不足以讓整個任務判定完成。
+    planProgress:planProgressOf(t,threads),
     pendingActions:{
       gitIssue:gitIssuePending(t),
       userActionRequired:t.userActionRequired?.status==='pending',
@@ -142,7 +145,7 @@ export function applyPhaseResult(store,t,thread,phase,result,{wasPaused=false}={
   }
   else if(phase==='review'){
     t.validationReviewPending=false;
-    const reconciled=reconcileCompletionState(reviewCompletionContext(t,thread,result));
+    const reconciled=reconcileCompletionState(reviewCompletionContext(t,thread,result,store.threads(t.id)));
     // 成果版本同時記下對應的 commit：之後要查「這次核准的是哪一份程式碼」看 Git 就夠了，
     // 不需要再回頭找某個 vN 資料夾。completed 必須由 reconcileCompletionState 核算後才成立，
     // 不再只看這一次結果自己宣稱的 passed/evidence/questions。
@@ -240,7 +243,12 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
       let phase,step,eng;
       if(t.status==='planning'){phase='plan';eng=t.planner;}
       else {if(t.approvedVersion!==t.planVersion)throw new Error('計畫尚未核准');const done=all.filter(x=>x.phase==='execute'&&x.status==='completed'&&x.result?.passed&&!x.result.questions?.length);step=t.plan.steps[done.length];phase=step?'execute':'review';eng=phase==='review'?t.reviewer:t.executor;
-        if(t.validationReviewPending){phase='review';eng=t.reviewer;step=null;}
+        // validationReviewPending 的語意是「使用者已在本機完成被執行環境擋住的操作，
+        // 請回頭驗證那個被卡住的階段的結果」，不是「整個任務可以直接進入最終驗證」。
+        // 這裡必須先確認計畫步驟已經全部完成（step 為 undefined 代表 done.length 已
+        // 涵蓋所有 plan.steps）才允許跳到 group-level 獨立驗證；否則一次手動操作回報
+        // 就會讓剩餘步驟被整批略過，任務在只完成前幾步的情況下被判定完成。
+        if(t.validationReviewPending&&!step){phase='review';eng=t.reviewer;step=null;}
         if(t.round>0&&!t.validationReviewPending){const repaired=all.some(x=>x.phase==='repair'&&x.round===t.round&&x.status==='completed'&&x.result?.passed&&!x.result.questions?.length);if(!repaired){
           if(!t.repairPlan||t.repairPlan.round!==t.round||t.repairPlan.planVersion!==t.planVersion){phase='repair_plan';eng=t.planner;}
           else if(t.approvedRepairId!==t.repairPlan.id){t.status='awaiting_repair_approval';store.saveTask(t);return;}

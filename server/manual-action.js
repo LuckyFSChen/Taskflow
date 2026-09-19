@@ -2,6 +2,7 @@ import {hash,now,id} from './db.js';
 import {HttpError,requireTask} from './domain.js';
 import {recordClarification} from './clarifications.js';
 import {normalizeCommand,isHighRiskCommand} from './command-permissions.js';
+import {planProgressOf} from './completion-state.js';
 
 // Unambiguous: the execution environment itself refused the operation, not the code.
 const STRONG_PATTERNS=[
@@ -132,7 +133,10 @@ export function decideManualAction(store,user,taskId,{requestId,decision,note}={
   task.manualActionHistory=[...(task.manualActionHistory||[]),{...ua,decision,note:note?String(note).trim().slice(0,4000):null,resolvedAt:now(),resolvedBy:user.id}];
   if(decision==='completed'){
     recordClarification(task,store.threads(taskId),[`使用者已於本機完成以下操作：\n${commandsText}`],`已完成。請只驗證結果（${ua.verification.join('；')||'依原驗收條件檢查'}），不要重新執行相同或等效的指令。`);
-    task.userActionRequired=null;task.validationReviewPending=true;task.status='queued';task.error=null;
+    // 只有被擋住的階段本身是 review 時，回報「已完成」才代表要重跑 group-level 獨立驗證。
+    // execute／repair 階段的手動操作只影響那一個步驟，必須回到原本的步驟流程繼續驗證，
+    // 不能讓剩餘的計畫步驟被略過。
+    task.userActionRequired=null;task.validationReviewPending=ua.phase==='review';task.status='queued';task.error=null;
   } else if(decision==='failed'){
     recordClarification(task,store.threads(taskId),[`使用者嘗試執行以下操作：\n${commandsText}`],`執行失敗，錯誤訊息如下：\n${note.trim().slice(0,4000)}\n請分析原因並修正設定或程式；不要再次嘗試已被平台拒絕的原指令本身。`);
     task.userActionRequired=null;task.status='queued';task.error=null;
@@ -142,7 +146,18 @@ export function decideManualAction(store,user,taskId,{requestId,decision,note}={
     task.manualActionSkips=[...(task.manualActionSkips||[]),{...ua,skippedAt:now(),skippedBy:user.id}];
     recordClarification(task,store.threads(taskId),[`以下操作因執行環境限制而略過：\n${commandsText}`],'使用者選擇略過；此項目未驗證，不得聲稱通過，其餘驗收仍須實際檢查。');
     task.userActionRequired=null;
-    if(ua.phase==='review'){task.status='completed';task.artifactVersion=id();store.notify(task,'驗證完成；其中一項因執行環境限制經你同意略過（未驗證），其餘驗收已通過。');}
+    // 略過的是 review 階段的手動操作時，仍然不能只憑這個略過決定就標記完成：計畫步驟
+    // 沒做完的話，這次 review 涵蓋的範圍本來就不是整份計畫，必須回到步驟流程繼續。
+    if(ua.phase==='review'){
+      const progress=planProgressOf(task,store.threads(taskId));
+      if(progress.remaining>0){
+        task.status='queued';task.error=null;
+        store.notify(task,`已依你的選擇略過該項受限操作；但計畫還有 ${progress.remaining} 個步驟未完成（已完成 ${progress.completed}/${progress.total}），任務不會標記完成，將繼續執行「${progress.nextStepTitle}」。`);
+      } else {
+        task.status='completed';task.artifactVersion=id();
+        store.notify(task,'驗證完成；其中一項因執行環境限制經你同意略過（未驗證），其餘驗收已通過。');
+      }
+    }
     else{task.status='queued';task.error=null;}
   }
   task.controlVersion=(task.controlVersion||0)+1;

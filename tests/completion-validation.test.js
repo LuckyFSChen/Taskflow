@@ -262,3 +262,78 @@ test('TaskFlow 自己沒把驗收身份準備好時，不得誤報成「使用�
   assert.match(summary, /不是專案驗收失敗/);
   assert.match(summary, /credentials_not_injected/);
 });
+
+// ---- 驗收結果與任務狀態必須一致 ---------------------------------------------
+// 真實事故：部署驗收失敗（專案是 monorepo，Preview 找不到可預覽的網頁），但任務仍然
+// 停留在「已完成」，畫面同時顯示「驗收未完成」與「TASK：已完成」兩個互相矛盾的狀態。
+
+test('部署驗收未通過時，任務不得停留在已完成，必須退回待處理', async t => {
+  const f = mergedTask(t);
+  const validations = createCompletionValidations({
+    previews: fakePreviews(),
+    validate: async () => ({
+      passed: false,
+      checks: [{ name: 'login', method: 'POST', path: '/api/login', expected: '200', actual: 'HTTP 404', passed: false, detail: '' }],
+    }),
+    wait: async () => true,
+  });
+
+  validations.start(f.store, f.owner, f.taskId);
+  await validations.settled();
+
+  const task = f.store.task(f.taskId);
+  assert.equal(task.completionValidation.passed, false);
+  assert.notEqual(task.status, 'completed');
+  assert.equal(task.status, 'waiting_input');
+  assert.match(task.questions.join('\n'), /部署驗收未通過/);
+  assert.ok(f.store.events(f.taskId).some(e => e.kind === 'completion_state_reconciled'));
+});
+
+test('驗收本身失敗（例外）時同樣不得停留在已完成', async t => {
+  const f = mergedTask(t);
+  const validations = createCompletionValidations({
+    previews: fakePreviews(),
+    validate: async () => { throw new Error('目前支援 Vue／Vite 專案與純 HTML 網頁；此資料夾尚未找到可預覽的網頁。'); },
+    wait: async () => true,
+  });
+
+  validations.start(f.store, f.owner, f.taskId);
+  await validations.settled();
+
+  const task = f.store.task(f.taskId);
+  assert.equal(task.completionValidation.status, 'failed');
+  assert.notEqual(task.status, 'completed');
+});
+
+test('驗收通過時不會動到任務狀態', async t => {
+  const f = mergedTask(t);
+  const validations = createCompletionValidations({
+    previews: fakePreviews(),
+    validate: async () => passing,
+    wait: async () => true,
+  });
+
+  validations.start(f.store, f.owner, f.taskId);
+  await validations.settled();
+
+  const task = f.store.task(f.taskId);
+  assert.equal(task.completionValidation.passed, true);
+  assert.equal(task.status, 'completed');
+});
+
+test('使用者手動標記完成的任務，不會被驗收結果覆寫', async t => {
+  const f = mergedTask(t);
+  const seeded = f.store.task(f.taskId);
+  seeded.manualCompletion = { by: f.owner.id, at: new Date().toISOString(), previousStatus: 'running' };
+  f.store.saveTask(seeded);
+  const validations = createCompletionValidations({
+    previews: fakePreviews(),
+    validate: async () => ({ passed: false, checks: [{ name: 'health', method: 'GET', path: '/api/health', expected: '200', actual: 'HTTP 500', passed: false, detail: '' }] }),
+    wait: async () => true,
+  });
+
+  validations.start(f.store, f.owner, f.taskId);
+  await validations.settled();
+
+  assert.equal(f.store.task(f.taskId).status, 'completed');
+});

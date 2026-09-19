@@ -91,12 +91,21 @@ test('Marking a manual action completed re-enters verification instead of an aut
   let task=f.s.task(f.task.id);const request=manualActionRequest(f.s,task);
   assert.throws(()=>decideManualAction(f.s,f.other,task.id,{requestId:request.id,decision:'completed'}),{status:404});
   const updated=decideManualAction(f.s,f.u,task.id,{requestId:request.id,decision:'completed'});
-  assert.equal(updated.userActionRequired,null);assert.equal(updated.validationReviewPending,true);assert.equal(updated.status,'queued');
+  assert.equal(updated.userActionRequired,null);assert.equal(updated.status,'queued');
+  // 被擋住的是 execute 階段，手動完成只代表「那一個步驟的操作做完了」，不代表整份計畫
+  // 可以進入最終驗證。validationReviewPending 只在 review 階段被擋住時才成立。
+  assert.equal(updated.validationReviewPending,false);
   assert.throws(()=>decideManualAction(f.s,f.u,task.id,{requestId:request.id,decision:'completed'}),{status:409});
   await runner.tick();
   task=f.s.task(f.task.id);
-  assert.equal(f.s.threads(task.id).at(-1).phase,'review');
+  // 先回到被擋住的那個步驟重新驗證結果（而不是自動當成通過，也不是直接跳到 review）。
+  assert.equal(f.s.threads(task.id).at(-1).phase,'execute');
   assert.match(lastPrompt,/不要重新執行相同或等效的指令/);
+  assert.equal(f.s.threads(task.id).at(-1).result.passed,true);
+  // 步驟確實驗證通過之後，才輪到 group-level 獨立驗證，任務也才可能標記完成。
+  await runner.tick();
+  task=f.s.task(f.task.id);
+  assert.equal(f.s.threads(task.id).at(-1).phase,'review');
   assert.equal(task.status,'completed');
  }finally{runner.stop();}
 });
@@ -112,9 +121,12 @@ test('A completed manual action still fails a genuine post-verification problem 
   await runner.tick();
   const final=f.s.task(task.id);
   assert.equal(final.userActionRequired,null,'a real verification failure must never be reclassified as needing manual action');
-  assert.equal(final.status,'repair_planning');
-  assert.equal(final.round,1);
-  assert.match(final.validationFailure.summary,/schema mismatch/);
+  // 重新驗證這個步驟時發現真正的問題：走既有的「步驟未通過驗收」路徑等使用者處理，
+  // 絕不會因為使用者回報過「已手動完成」就被當成通過。
+  assert.equal(final.status,'waiting_input');
+  assert.notEqual(final.status,'completed');
+  assert.equal(f.s.threads(task.id).at(-1).result.passed,false);
+  assert.match(final.questions.join('\n'),/schema mismatch/);
  }finally{runner.stop();}
 });
 
@@ -174,8 +186,52 @@ test('HTTP exposes the manual-action request, requires ownership, and rejects st
    assert.equal(detail.manualAction.instructions,'請在 PowerShell 執行。');
    const body=JSON.stringify({requestId:detail.manualAction.id,decision:'completed'});
    const response=await fetch(base+'/user-action/decision',{method:'POST',headers,body});assert.equal(response.status,200);
-   const updated=await response.json();assert.equal(updated.status,'queued');assert.equal(updated.validationReviewPending,true);assert.equal(updated.manualAction,null);
+   const updated=await response.json();assert.equal(updated.status,'queued');assert.equal(updated.validationReviewPending,false,'an execute-phase manual action must not push the task into group-level final validation');assert.equal(updated.manualAction,null);
    assert.equal(updated.displayStatus,'queued','once resolved, the display status must fall back to the ordinary task status');
    assert.equal((await fetch(base+'/user-action/decision',{method:'POST',headers,body})).status,409);
  }finally{await new Promise(r=>server.close(r));}
+});
+
+test('A manual action on an early step never skips the remaining plan steps',async t=>{
+ // 迴歸測試：真實事故中，第 1 步因為執行環境擋住指令而回報需要手動操作，使用者回報
+ // 「已完成」之後，平台直接跳到 group-level 獨立驗證，第 2～6 步整批被略過，任務還被
+ // 判定為完成。手動操作只影響它自己那一個步驟，絕不能讓剩餘的計畫步驟消失。
+ const f=fixture(t);f.s.setSetting('runnerEnabled',true);
+ const seeded=f.s.task(f.task.id);
+ seeded.plan={summary:'three steps',acceptance:['done'],questions:[],steps:[
+  {title:'Step 1 schema',role:'Engineer',instructions:'run migration'},
+  {title:'Step 2 api',role:'Engineer',instructions:'extend api'},
+  {title:'Step 3 ui',role:'Engineer',instructions:'build ui'}]};
+ f.s.saveTask(seeded);
+ let calls=0;
+ const runner=createRunner(f.s,{dataDir:join(f.root,'data'),adapter:async()=>{calls++;
+  if(calls===1)throw new Error('This command requires approval: npx prisma migrate dev');
+  return {result:{summary:'step done',passed:true,questions:[],evidence:['verified'],artifacts:[]}};}});
+ try{
+  await runner.tick();
+  const blocked=f.s.task(f.task.id),request=manualActionRequest(f.s,blocked);
+  assert.equal(request.commands.length>0||request.message.length>0,true);
+  decideManualAction(f.s,f.u,blocked.id,{requestId:request.id,decision:'completed'});
+
+  await runner.tick();
+  assert.equal(f.s.threads(f.task.id).some(x=>x.phase==='review'),false,
+   '計畫還有步驟沒做完時，不得進入 group-level 獨立驗證');
+  assert.notEqual(f.s.task(f.task.id).status,'completed');
+  assert.equal(f.s.threads(f.task.id).at(-1).title,'Step 1 schema');
+
+  await runner.tick();
+  assert.equal(f.s.threads(f.task.id).at(-1).title,'Step 2 api');
+  assert.notEqual(f.s.task(f.task.id).status,'completed');
+
+  await runner.tick();
+  assert.equal(f.s.threads(f.task.id).at(-1).title,'Step 3 ui');
+  assert.notEqual(f.s.task(f.task.id).status,'completed');
+
+  // 三個步驟都實際執行並通過之後，才輪到最終驗證。
+  await runner.tick();
+  const last=f.s.threads(f.task.id).at(-1);
+  assert.equal(last.phase,'review');
+  assert.equal(f.s.threads(f.task.id).filter(x=>x.phase==='execute'&&x.result?.passed===true).length,3);
+  assert.equal(f.s.task(f.task.id).status,'completed');
+ }finally{runner.stop();}
 });
