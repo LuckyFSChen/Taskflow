@@ -141,37 +141,145 @@ export function dirtyFingerprint(dirty) {
 // 回傳值保留既有欄位（isRepository／repositoryPath／nested／branch／head／dirty），
 // 讓 runner、git-issue、git-review、completion 等既有呼叫端不必同步改寫；
 // 新的 canonical model 放在 `repository` 與 `policy` 兩個欄位裡。
-export function inspectRepository(projectPath, { git, projectRoot = null, managedProjectsRoot = null }) {
-  if (!existsSync(projectPath)) throw new GitSafetyError('project_missing', `專案資料夾不存在：${projectPath}`);
-  const repository = detectRepositoryInfo(projectPath, { git, projectRoot, managedProjectsRoot });
-  const policy = evaluateRepositoryPolicy(repository);
-  // managed-uninitialized 與 non-git 都還不是 repository：對外一律回報 isRepository: false，
-  // 由 policy.nextAction = 'git-init' 決定接下來要初始化，而不是進入人工處理狀態。
-  if (!repository.isGit) return { isRepository: false, repositoryPath: null, nested: false, repository, policy };
-  const repositoryPath = repository.worktreeRoot;
-  const branchResult = git(repositoryPath, ['branch', '--show-current'], { allowFailure: true });
-  const headResult = git(repositoryPath, ['rev-parse', 'HEAD'], { allowFailure: true });
-  const statusResult = git(repositoryPath, ['status', '--porcelain'], { allowFailure: true });
-  // `git status` 自己失敗時絕對不能回報 dirty: []：那會讓「讀不到狀態」被當成「工作目錄乾淨」，
-  // 於是守門形同關閉。讀不到就照實往外拋，由呼叫端當成 Git 檢查錯誤處理。
-  if (!statusResult.ok) {
-    throw new GitSafetyError('git_status_failed',
-      `無法讀取專案的 Git 狀態（git status 執行失敗），為安全起見已停止，不會假設工作目錄是乾淨的。\n\n${(statusResult.stderr || statusResult.error?.message || '').trim().slice(0, 300)}`,
-      { repositoryPath });
+export function inspectRepository(
+  projectPath,
+  { git, projectRoot = null, managedProjectsRoot = null }
+) {
+  if (!existsSync(projectPath)) {
+    throw new GitSafetyError(
+      'project_missing',
+      `專案資料夾不存在：${projectPath}`
+    );
   }
-  const dirty = statusResult.stdout.split('\n').map(line => line.trim()).filter(Boolean);
+
+  const repository = detectRepositoryInfo(projectPath, {
+    git,
+    projectRoot,
+    managedProjectsRoot,
+  });
+
+  const policy = evaluateRepositoryPolicy(repository);
+
+  // managed-uninitialized 與 non-git 都還不是 repository：
+  // 對外一律回報 isRepository: false，
+  // 由 policy.nextAction = 'git-init' 決定接下來要初始化，
+  // 而不是進入人工處理狀態。
+  if (!repository.isGit) {
+    return {
+      isRepository: false,
+      repositoryPath: null,
+      nested: false,
+      repository,
+      policy,
+    };
+  }
+
+  const repositoryPath = repository.worktreeRoot;
+
+  const branchResult = git(
+    repositoryPath,
+    ['branch', '--show-current'],
+    { allowFailure: true }
+  );
+
+  const headResult = git(
+    repositoryPath,
+    ['rev-parse', 'HEAD'],
+    { allowFailure: true }
+  );
+
+  const statusResult = git(
+    repositoryPath,
+    ['status', '--porcelain'],
+    { allowFailure: true }
+  );
+
+  // `git status` 自己失敗時絕對不能回報 dirty: []：
+  // 那會讓「讀不到狀態」被當成「工作目錄乾淨」，
+  // 於是守門形同關閉。
+  if (!statusResult.ok) {
+    throw new GitSafetyError(
+      'git_status_failed',
+      `無法讀取專案的 Git 狀態（git status 執行失敗），為安全起見已停止，不會假設工作目錄是乾淨的。\n\n${(
+        statusResult.stderr ||
+        statusResult.error?.message ||
+        ''
+      )
+        .trim()
+        .slice(0, 300)}`,
+      { repositoryPath }
+    );
+  }
+
+  const dirty = statusResult.stdout
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+
   return {
     isRepository: true,
     repositoryPath,
-    // `nested` 的語意從來就是「這個路徑只是別人 repository 的子目錄」，現在直接取自 topology：
-    // linked worktree 與 nested independent repository 都是合法的 root，不會落在這裡。
+
+    // `nested` 的語意是「這個路徑只是別人 repository 的子目錄」。
+    // linked worktree 與 nested independent repository 都是合法 root，
+    // 不會落在這裡。
     nested: repository.isSubdirectory,
-    branch: branchResult.ok ? firstLine(branchResult.stdout) || null : null,
-    head: headResult.ok ? firstLine(headResult.stdout) || null : null,
+
+    branch: branchResult.ok
+      ? firstLine(branchResult.stdout) || null
+      : null,
+
+    head: headResult.ok
+      ? firstLine(headResult.stdout) || null
+      : null,
+
     dirty,
     dirtyFingerprint: dirtyFingerprint(dirty),
     repository,
     policy,
+  };
+}
+
+
+// 可重用的 Git repository state inspector：
+// 專供 merge 流程判斷「是否真的乾淨、真的合併完成」。
+export function inspectMergeState({ repositoryPath, git }) {
+  const state = inspectRepository(repositoryPath, { git });
+
+  if (!state.isRepository) {
+    throw new GitSafetyError(
+      'not_a_repository',
+      '專案已不是 Git repository，無法檢查合併狀態。',
+      { repositoryPath }
+    );
+  }
+
+  const unresolvedFiles = git(
+    repositoryPath,
+    ['diff', '--name-only', '--diff-filter=U'],
+    { allowFailure: true }
+  )
+    .stdout
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  const mergeInProgress = git(
+    repositoryPath,
+    ['rev-parse', '-q', '--verify', 'MERGE_HEAD'],
+    { allowFailure: true }
+  ).ok;
+
+  return {
+    branch: state.branch,
+    head: state.head,
+    mergeInProgress,
+    unresolvedFiles,
+    dirty: state.dirty,
+    clean:
+      !state.dirty.length &&
+      !mergeInProgress &&
+      !unresolvedFiles.length,
   };
 }
 
@@ -482,6 +590,15 @@ function assertMergeReady({ repositoryPath, baseBranch, git }) {
       `合併前專案目錄必須停在 ${baseBranch}，但目前在 ${state.branch || 'detached HEAD'}。TaskFlow 不會替你切換分支，請先自行切換後再核准合併。`,
       { branch: state.branch, baseBranch });
   }
+  // 「衝突已解決但尚未 commit」（MERGE_HEAD 仍在）與一般 dirty_working_tree 是完全不同的處境：
+  // 前者不需要使用者再解一次衝突，只差一個 commit 或一次 abort，訊息必須分開辨識，
+  // 不能被下面籠統的 dirty_working_tree 蓋過去。因此在 dirty 檢查之前先看 MERGE_HEAD。
+  const merge = inspectMergeState({ repositoryPath, git });
+  if (merge.mergeInProgress) {
+    throw new GitSafetyError('merge_in_progress',
+      `${baseBranch} 目前處於一個進行中的 merge（MERGE_HEAD 仍存在）。這通常代表衝突已經解決但尚未完成 commit。\n\n${merge.unresolvedFiles.length ? `仍未解決的檔案：\n${merge.unresolvedFiles.join('\n')}\n\n` : ''}請先在專案目錄完成這個 merge（commit）或執行 git merge --abort 中止它，再回來核准合併。`,
+      { unresolvedFiles: merge.unresolvedFiles, branch: state.branch });
+  }
   if (state.dirty.length) {
     throw new GitSafetyError('dirty_working_tree',
       `${baseBranch} 目前存在未提交修改，已停止合併。\n\nTaskFlow 不會自動修改或清除這些內容。\n\n${state.dirty.slice(0, 30).join('\n')}`,
@@ -553,10 +670,22 @@ export function mergeTaskBranch({ repositoryPath, baseBranch, workingBranch, sub
   }
 
   const message = body ? `${subject}\n\n${body}` : subject;
-  git(repositoryPath, [...commitArgs(git, repositoryPath), 'merge', '--no-ff', '--no-edit', '-m', message, workingBranch]);
+  // pre-check（merge-tree）通過後，實際執行仍可能失敗——兩者之間可能有新的變化，或舊版 git 的
+  // 探測本身就不夠準。這裡不信任這個 command 的 exit code：allowFailure，執行完一律用
+  // inspectMergeState 讀 Git 本身的真實狀態做最終判斷，成功與否由狀態決定，不是由 AI 或
+  // command 回報的文字決定。
+  git(repositoryPath, [...commitArgs(git, repositoryPath), 'merge', '--no-ff', '--no-edit', '-m', message, workingBranch], { allowFailure: true });
+
+  const after = inspectMergeState({ repositoryPath, git });
+  if (after.mergeInProgress || after.unresolvedFiles.length) {
+    const files = after.unresolvedFiles.length ? after.unresolvedFiles : after.dirty;
+    // 不管這次衝突是不是我們剛剛觸發的，都不留下解到一半的 merge：abort 讓 baseBranch 回到
+    // 合併前的乾淨狀態，不需要使用者自己動手清理，也不會有殘留的 MERGE_HEAD。
+    git(repositoryPath, ['merge', '--abort'], { allowFailure: true, authorizedAs: 'abort_merge' });
+    return { merged: false, reason: 'conflict', files, hint: CONFLICT_HINT, baseBranch, workingBranch };
+  }
 
   // 合併後再確認一次：工作樹必須是乾淨的，HEAD 必須真的包含任務分支。
-  const after = inspectRepository(repositoryPath, { git });
   const contains = git(repositoryPath, ['merge-base', '--is-ancestor', workingBranch, 'HEAD'], { allowFailure: true }).ok;
   if (after.dirty.length || !contains) {
     throw new GitSafetyError('merge_incomplete',

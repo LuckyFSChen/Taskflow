@@ -6,7 +6,13 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   createGitRunner, createGitWorkspace, GitSafetyError, taskBranchName,
-  isProtectedBranch, isUnsafeToCommit, inspectRepository, prepareTaskWorkspace, assertWorkingBranch,
+  isProtectedBranch,
+  isUnsafeToCommit,
+  inspectRepository,
+  inspectMergeState,
+  mergeTaskBranch,
+  prepareTaskWorkspace,
+  assertWorkingBranch,
   ensureProjectRepository,
 } from '../server/git-workspace.js';
 import { detectRepositoryInfo, evaluateRepositoryPolicy, samePath } from '../server/git-repository.js';
@@ -334,6 +340,16 @@ test('核准合併：--no-ff 保留任務邊界，成果進入正式分支', t =
   assert.match(run(path, 'log', '-1', '--format=%s'), /taskflow: 合併/);
   assert.equal(run(path, 'status', '--porcelain'), '');
 
+  // 情境 1／clean merge：新的 inspector 必須確認乾淨、無進行中的 merge、HEAD 真的包含 workingBranch，
+  // 不是只看 merge command 有沒有回報成功。
+  const inspected = inspectMergeState({ repositoryPath: task.repositoryPath, git });
+  assert.equal(inspected.clean, true);
+  assert.equal(inspected.mergeInProgress, false);
+  assert.deepEqual(inspected.unresolvedFiles, []);
+  assert.equal(inspected.branch, 'main');
+  assert.equal(inspected.head, outcome.commit);
+  assert.ok(git(task.repositoryPath, ['merge-base', '--is-ancestor', task.workingBranch, 'HEAD'], { allowFailure: true }).ok, 'HEAD 必須真的包含 workingBranch');
+
   // 合併過就不再重複合併。
   assert.deepEqual(workspace.merge({ repositoryPath: task.repositoryPath, baseBranch: task.baseBranch, workingBranch: task.workingBranch, subject: 'again' }),
     { merged: false, reason: 'already_merged', baseBranch: 'main', workingBranch: task.workingBranch });
@@ -381,6 +397,87 @@ test('合併衝突：回報衝突檔案，正式分支一個字都不動', t => 
   assert.equal(run(path, 'status', '--porcelain'), '', '不得把正式分支丟在解到一半的 merge 狀態');
   assert.equal(existsSync(join(path, '.git', 'MERGE_HEAD')), false);
   assert.equal(readFileSync(join(path, 'README.md'), 'utf8'), '# 使用者的版本\n');
+
+  // 情境 2／conflict：新的 inspector 也必須確認 baseBranch 事後乾淨、無 MERGE_HEAD 殘留。
+  const inspected = inspectMergeState({ repositoryPath: task.repositoryPath, git });
+  assert.equal(inspected.clean, true);
+  assert.equal(inspected.mergeInProgress, false);
+  assert.deepEqual(inspected.unresolvedFiles, []);
+});
+
+test('情境 3／衝突已解決但尚未 commit：inspectMergeState 判斷為 mergeInProgress，assertMergeReady 回報 merge_in_progress 而非籠統的 dirty_working_tree', t => {
+  const root = sandbox(t), path = project(root);
+  existingRepo(path);
+  const task = taskWithCommit(root, path, { file: 'README.md', content: '# 任務的版本\n' });
+
+  writeFileSync(join(path, 'README.md'), '# 使用者的版本\n');
+  run(path, '-c', 'user.email=dev@example.test', '-c', 'user.name=Dev', 'commit', '-am', 'user edit');
+
+  // 直接在正式分支上觸發一次真的衝突，並像使用者一樣手動解決它：寫入解決後的內容、git add，
+  // 但刻意不 commit——這正是「衝突已解決但尚未 commit」的狀態，MERGE_HEAD 仍然存在。
+  const attempt = git(path, ['merge', '--no-ff', '--no-commit', task.workingBranch], { allowFailure: true });
+  assert.equal(attempt.ok, false, '這一步本來就預期會產生衝突');
+  writeFileSync(join(path, 'README.md'), '# 手動解決後的版本\n');
+  git(path, ['add', 'README.md']);
+
+  const inspected = inspectMergeState({ repositoryPath: path, git });
+  assert.equal(inspected.mergeInProgress, true, 'MERGE_HEAD 仍在，必須被判斷為進行中的 merge');
+  assert.deepEqual(inspected.unresolvedFiles, [], '已經 git add 過，不再是未解決檔案');
+  assert.equal(inspected.clean, false);
+
+  assert.throws(
+    () => workspace.merge({ repositoryPath: task.repositoryPath, baseBranch: 'main', workingBranch: task.workingBranch, subject: 'taskflow: merge' }),
+    e => e.code === 'GIT_SAFETY' && e.reason === 'merge_in_progress' && /衝突已經解決但尚未完成 commit/.test(e.message) && Array.isArray(e.details.unresolvedFiles) && e.details.unresolvedFiles.length === 0,
+  );
+});
+
+test('情境 5／command 回報成功但 repository 仍有 unresolved files：mergeTaskBranch 不信任這個旗標，一律用 inspector 的實際狀態判斷並自動 abort', t => {
+  // repositoryPath 只需要在檔案系統上存在（inspectRepository 的第一道檢查），底下所有 git 指令
+  // 都由 lyingGit 接管、完全不會真的執行，所以這裡不需要是一個真的 git repository。
+  const repositoryPath = sandbox(t);
+  const baseBranch = 'main';
+  const workingBranch = 'taskflow/fake-branch';
+  let mergeCommandExecuted = false;
+  let abortCalled = false;
+
+  const lyingGit = (cwd, args) => {
+    if (args[0] === 'rev-parse' && args[1] === '--is-inside-work-tree') return { ok: true, stdout: 'true\n', stderr: '' };
+    if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return { ok: true, stdout: `${repositoryPath}\n`, stderr: '' };
+    if (args[0] === 'branch' && args[1] === '--show-current') return { ok: true, stdout: `${baseBranch}\n`, stderr: '' };
+    if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { ok: true, stdout: `${'a'.repeat(40)}\n`, stderr: '' };
+    if (args[0] === 'status' && args[1] === '--porcelain') return { ok: true, stdout: '', stderr: '' };
+    if (args[0] === 'diff' && args.includes('--diff-filter=U')) {
+      // 一開始沒有進行中的衝突；「merge」執行過之後，repository 實際上仍卡在未解決狀態。
+      return mergeCommandExecuted ? { ok: true, stdout: 'README.md\n', stderr: '' } : { ok: true, stdout: '', stderr: '' };
+    }
+    if (args[0] === 'rev-parse' && args.includes('-q') && args.includes('--verify') && args.includes('MERGE_HEAD')) {
+      return { ok: mergeCommandExecuted, stdout: '', stderr: '' };
+    }
+    if (args[0] === 'rev-parse' && args.includes('--verify') && args.includes('--quiet') && args.includes(`refs/heads/${workingBranch}`)) {
+      return { ok: true, stdout: '', stderr: '' };
+    }
+    if (args[0] === 'merge-base' && args.includes('--is-ancestor')) return { ok: false, stdout: '', stderr: '' };
+    // pre-check（merge-tree）宣稱沒有衝突：這正是「pre-check 通過後，真正執行仍可能失敗」的情境。
+    if (args[0] === 'merge-tree') return { ok: true, stdout: `${'b'.repeat(40)}\n`, stderr: '' };
+    // 真正執行的 merge 前面會被加上 -c user.email=…／-c user.name=… 身分旗標（見 commitArgs），
+    // 所以不能只看 args[0]，得看整組參數是否包含 merge --no-ff --no-edit。
+    if (args.includes('merge') && args.includes('--no-ff') && args.includes('--no-edit')) {
+      mergeCommandExecuted = true;
+      // 指令本身謊稱成功，即使 repository 實際上仍未完成合併。
+      return { ok: true, stdout: 'Merge made by the recursive strategy.\n', stderr: '' };
+    }
+    if (args[0] === 'merge' && args.includes('--abort')) { abortCalled = true; return { ok: true, stdout: '', stderr: '' }; }
+    if (args[0] === 'config') return { ok: false, stdout: '', stderr: '' };
+    return { ok: true, stdout: '', stderr: '' };
+  };
+
+  const outcome = mergeTaskBranch({ repositoryPath, baseBranch, workingBranch, subject: 'taskflow: merge', git: lyingGit });
+
+  assert.equal(mergeCommandExecuted, true, '測試前提：真正執行的 merge 指令必須被呼叫過');
+  assert.equal(outcome.merged, false, 'command 回報成功不得直接視為合併完成');
+  assert.equal(outcome.reason, 'conflict');
+  assert.deepEqual(outcome.files, ['README.md']);
+  assert.equal(abortCalled, true, '偵測到仍有未解決檔案時，必須自動 abort 讓 baseBranch 回到乾淨狀態');
 });
 
 test('清理：合併後移除 worktree 與分支；有未提交內容時拒絕移除', t => {
