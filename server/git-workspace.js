@@ -183,8 +183,11 @@ function changedPaths(git, cwd) {
 
 // 供 Output Recovery 使用：讀取工作目錄「目前」尚未提交的真實變更檔案清單，作為
 // 還原 artifacts 欄位時可信的 Git 證據來源，而不是重新推導一套判斷邏輯。
+// 必須排除 isUnsafeToCommit 的路徑（例如 .taskflow/handoff.json）：那是 TaskFlow 自己
+// 寫進工作目錄的交接紀錄，不是 AI／使用者的工作成果，否則每一次 Git 證據還原都會混入
+// 這個檔案，見 commitWorkspaceChanges／cleanupTaskBranch 的同一原則。
 export function currentChangedFiles({ workingDirectory, git }) {
-  return changedPaths(git, workingDirectory);
+  return changedPaths(git, workingDirectory).filter(path => !path.split('/').some(isUnsafeToCommit));
 }
 
 // 用 pathspec 檔案而不是命令列參數：專案可能有上萬個檔案，Windows 的命令列長度會爆掉。
