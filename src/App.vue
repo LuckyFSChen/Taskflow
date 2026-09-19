@@ -141,7 +141,15 @@ async function loadReview(){
   // 變成一邊跳錯誤訊息一邊不停跑 git 指令。要重試請按「重新讀取 Git 狀態」。
   reviewLoadedFor.value=taskId;
   reviewLoading.value=true;
-  try{const review=await api(`/tasks/${taskId}/git/review`);if(selected.value?.id===taskId)gitReview.value=review;}
+  try{
+    const review=await api(`/tasks/${taskId}/git/review`);
+    if(selected.value?.id!==taskId)return;
+    gitReview.value=review;
+    // 讀取 Git 現況時，Server Domain 層可能已經把 completed 任務 reconcile 成
+    // ready_to_close（例如偵測到分支已在外部被合併）並持久化寫回；不補讀一次任務本體，
+    // 「關閉任務」按鈕會因為 selected.value.status 還停在舊值而不出現。
+    await loadTask(taskId);
+  }
   catch(e:any){gitReview.value=null;notify(e.message);}
   finally{reviewLoading.value=false;}
 }

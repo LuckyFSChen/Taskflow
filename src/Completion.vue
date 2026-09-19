@@ -47,6 +47,9 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
         <span :class="view.repository.clean?'ok-text':'error-text'">{{view.repository.clean?'工作樹乾淨':'有未提交修改'}}</span>
       </dd></div>
       <div v-if="view.merge"><dt>Merge commit</dt><dd><code>{{view.merge.short}}</code> <small>{{time(view.merge.at)}}</small></dd></div>
+      <div v-if="view.mainAdvanced"><dt>正式分支狀態</dt><dd>
+        <span class="subtle">已在任務執行期間更新（目前 HEAD <code>{{view.mainHead||'—'}}</code>），已重新檢查是否仍可整合</span>
+      </dd></div>
     </dl>
 
     <!-- 一次核准，依序跑完。狀態機在後端（server/completion-pipeline.js）：

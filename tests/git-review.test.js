@@ -9,6 +9,7 @@ import { createTask, approveTask } from '../server/domain.js';
 import { createRunner } from '../server/runner.js';
 import { taskGitReview, decideGitReview, rollbackTaskMerge, closeTask } from '../server/git-review.js';
 import { legacyWorkspaceStatus, migrateLegacyWorkspace } from '../server/git-migration.js';
+import { taskDisplayStatus } from '../server/task-status.js';
 
 const plan = { summary: '建立文件', acceptance: ['有文件'], questions: [], steps: [{ title: '撰寫文件', role: '作者', instructions: '完成文件' }] };
 const good = { summary: '驗證完成', questions: [], artifacts: ['result.md'], passed: true, evidence: ['已讀取 result.md'] };
@@ -163,7 +164,12 @@ test('main 在任務期間前進：Git Delivery 即時反映，不沿用舊的 m
   assert.equal(merged.status, 'ready_to_close');
 });
 
-test('手動在外部完成 git merge：重新讀取會偵測到，close 不需要再合併一次', async t => {
+// 行為調整說明：重新整理 Git Delivery 狀態（GET /git/review）本身就是 Server Domain 層
+// reconciliation 唯一的觸發點——不能只在回傳物件裡假裝任務已經整合，資料庫的 task.status
+// 必須跟畫面看到的事實一致（前一輪修正被使用者要求補上的架構原則）。因此這裡改成驗證：
+// 呼叫一次 taskGitReview() 之後，store 裡的 task.status 已經被持久化推進為 ready_to_close，
+// 不是只有這次呼叫回傳的 review 物件看起來像而已；重複呼叫也不會再次觸發或報錯。
+test('手動在外部完成 git merge：重新讀取會偵測到並持久化為 ready_to_close，close 不需要再合併一次', async t => {
   const f = await completedTask(t);
   // 使用者自己在終端機做完 merge，TaskFlow 完全不知情（沒有 t.gitMerge）。
   run(f.source, 'merge', '--no-ff', '--no-edit', f.task.git.workingBranch);
@@ -172,7 +178,21 @@ test('手動在外部完成 git merge：重新讀取會偵測到，close 不需�
 
   const review = taskGitReview(f.store, f.owner, f.task.id);
   assert.equal(review.externallyMerged, true);
-  assert.equal(review.merged, false);
+  assert.equal(review.merged, true, '偵測到之後應立即持久化，回傳物件要反映最新狀態');
+  assert.equal(review.status, 'merged');
+
+  const persisted = f.store.task(f.task.id);
+  assert.equal(persisted.status, 'ready_to_close', '不能只有 review 物件看起來已整合，task.status 也必須被寫回');
+  assert.ok(persisted.readyToCloseAt);
+  assert.equal(persisted.gitMerge.external, true);
+  const firstMergeAt = persisted.gitMerge.at;
+
+  // 對同一任務重複呼叫：已經是 ready_to_close，純讀取，不應該再次觸發 reconcile 或改變既有 metadata。
+  const second = taskGitReview(f.store, f.owner, f.task.id);
+  assert.equal(second.merged, true);
+  assert.equal(f.store.task(f.task.id).gitMerge.at, firstMergeAt, '重複讀取不應改動已經成立的 merge 時間');
+
+  assert.equal(taskDisplayStatus(f.store.task(f.task.id)), 'ready_to_close', '對應 Task Queue 應顯示「等待關閉」，不是「等待整合」');
 
   const closed = await closeTask(f.store, f.owner, f.task.id, {}, {});
   assert.equal(closed.status, 'closed');

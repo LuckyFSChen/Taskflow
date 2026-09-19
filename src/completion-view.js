@@ -362,6 +362,21 @@ export function mergeBlockers(task, review) {
     return blockers;
   }
 
+  // 防禦層，不是狀態來源：ready_to_close／closed 一律由後端的 task.status 決定
+  // （見下方 completionView 的 state 計算），這裡不會、也不能自己把畫面切換成
+  // ready_to_close。它處理的是另一件事——GET /git/review 已經即時偵測到分支被
+  // 外部合併，Server 也已經把這個事實持久化，但使用者手上的 task 物件可能還沒
+  // 重新抓到最新的 status（那幾秒鐘的正常落差）。這裡先擋住「核准並合併」，避免
+  // 使用者按下一個註定會被後端以 409（此分支的內容已經在正式分支上了）拒絕的按鈕。
+  if (review?.externallyMerged) {
+    blockers.push({
+      code: 'externally_merged',
+      message: '此分支的內容已經在外部被合併，不需要（也不能）再次核准合併。',
+      hint: '請重新整理後改用「關閉任務」；TaskFlow 已經確認合併結果並記錄。',
+    });
+    return blockers;
+  }
+
   // 後端 mergeDecision 的第一道檢查：只有通過獨立驗證而完成的任務能合併。
   if (task.status !== 'completed') {
     blockers.push({
@@ -598,6 +613,12 @@ export function completionView(task, review = null) {
     },
     repository: review?.repository || null,
     repositoryError: text(review?.repositoryError) || null,
+    // 只在還需要重新評估整合的階段（尚未到 ready_to_close／closed）才顯示「正式分支
+    // 已在任務執行期間更新」；一旦整合已經確認完成，即使 review.mainAdvanced 歷史上
+    // 曾經是 true，也不再顯示，避免使用者誤以為還需要重新 Merge（計畫書第九章、
+    // 第二輪修正驗收條件）。
+    mainAdvanced: !['ready_to_close', 'closed'].includes(state) && !!review?.mainAdvanced,
+    mainHead: shortCommit(review?.mainHead),
     commits: list(review?.commits).map(c => ({
       commit: text(c.commit),
       short: shortCommit(c.commit),

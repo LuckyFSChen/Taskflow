@@ -33,10 +33,109 @@ function branchHeadOf(gitWorkspace, repositoryPath, branch) {
   return result.ok ? firstLine(result.stdout) : null;
 }
 
+/**
+ * 唯一的 completed→ready_to_close reconciliation 入口，closeTask() 與 taskGitReview()
+ * 共用同一份判斷，不建立第二套邏輯。只處理「TaskFlow 自己不知道已經合併」的兩種情況：
+ *   1. 分支已經在外部（使用者手動 git merge）被合併進 baseBranch，t.gitMerge 還是空的。
+ *   2. 舊資料：這次改造之前就合併過，t.gitMerge 早就存在，但 status 從來沒被推進過。
+ * 條件不成立就原樣把 t 傳回去，不拋錯——呼叫端（尤其是 GET /git/review）不能因為
+ * 這裡驗證失敗就整支請求壞掉，任務只是照舊維持 completed。
+ */
+function reconcileExternalMerge(store, t, gitWorkspace) {
+  if (t.status !== 'completed') return t;
+  if (t.gitMerge) {
+    if (!mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.gitMerge.baseBranch, t.gitMerge.commit)) return t;
+  } else {
+    const branchHead = branchHeadOf(gitWorkspace, t.git.repositoryPath, t.git.workingBranch);
+    if (!branchHead || !mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.git.baseBranch, branchHead)) return t;
+    t.gitMerge = { commit: branchHead, baseBranch: t.git.baseBranch, workingBranch: t.git.workingBranch, artifactVersion: t.artifactVersion, by: null, at: now(), external: true };
+  }
+  assertTaskTransition(t, 'ready_to_close');
+  t.status = 'ready_to_close';
+  t.readyToCloseAt = now();
+  store.saveTask(t);
+  store.event(t.id, 'ready_to_close', t.gitMerge.external
+    ? '偵測到此任務已在外部手動合併，直接視為等待關閉，不需要再次核准合併。'
+    : '這是本次改造之前已合併的任務，重新確認合併結果仍在正式分支上後，直接視為等待關閉。');
+  return t;
+}
+
 // 審核畫面要的一切：分支、這條分支上的 commit、每個階段的驗收結果，以及正式分支現在的狀態。
 // 這裡會實際讀 Git，所以只在使用者開啟審核時呼叫，不放進輪詢用的 /api/state。
+//
+// 這支 API 語意上是「重新整理 Git Delivery 狀態」：如果讀 Git 的當下發現一個 completed
+// 任務其實已經整合進正式分支了（外部手動合併，或舊資料從未推進過），會順手呼叫
+// reconcileExternalMerge() 把這件事持久化為 ready_to_close，而不只是在回傳物件裡假裝一下——
+// 否則畫面看到的 externallyMerged 跟資料庫裡的 task.status 會對不起來。
 export function taskGitReview(store, user, tid, { gitWorkspace = shared } = {}) {
-  const t = requireTask(store, user, tid);
+  let t = requireTask(store, user, tid);
+
+  if (t.git?.mode !== 'worktree') {
+    const threads = store.threads(t.id).filter(th => th.version === t.planVersion && th.status === 'completed');
+    const validation = threads.map(th => ({
+      phase: th.phase, role: th.role, title: th.title,
+      passed: th.result?.passed ?? null,
+      browserValidation: th.result?.browserValidation?.status ?? null,
+      commit: th.commit?.commit || null,
+    }));
+    return { available: false, reason: t.workspace ? 'legacy_workspace' : 'not_git', validation, merge: null, conflict: null };
+  }
+
+  let commits = [], repository = null, repositoryError = null, remote = null;
+  // 下面這些欄位一律是「現在重新問一次 Git」的結果，不是任務完成或上次合併當下的快取
+  // （計畫書第八、九章）：main 有沒有前進、現在合不合併得起來，隨時可能已經和快取的結論不同。
+  let mainHead = null, mainAdvanced = false, mergeable = false, externallyMerged = false;
+  let hasConflict = !!t.gitConflict, conflict = t.gitConflict || null;
+
+  try {
+    mainHead = branchHeadOf(gitWorkspace, t.git.repositoryPath, t.git.baseBranch);
+    mainAdvanced = !!(mainHead && t.git.baseCommit && mainHead !== t.git.baseCommit);
+
+    if (!t.gitMerge) {
+      // 還沒被 TaskFlow 自己合併過：先確認分支是不是已經在外部被手動合併進 main，
+      // 這種情況不需要使用者再按一次「Merge 到 main」（計畫書第十章 Case D）。
+      const branchHead = branchHeadOf(gitWorkspace, t.git.repositoryPath, t.git.workingBranch);
+      if (branchHead && mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.git.baseBranch, branchHead)) {
+        externallyMerged = true;
+      } else if (branchHead) {
+        // 即時重新試算一次合不合併得起來；不沿用任務完成當下的舊結論。
+        const preview = gitWorkspace.previewMerge({ repositoryPath: t.git.repositoryPath, baseBranch: t.git.baseBranch, workingBranch: t.git.workingBranch });
+        if (preview.available && preview.conflicted) {
+          hasConflict = true;
+          conflict = conflict || { files: preview.files, hint: 'TaskFlow 不會自行決定 ours／theirs。請在專案目錄手動處理衝突後再回來，或改為要求 AI 修改。', baseBranch: t.git.baseBranch, workingBranch: t.git.workingBranch };
+        }
+        mergeable = preview.available && !preview.conflicted && !preview.alreadyMerged;
+      }
+    }
+
+    if (t.status === 'completed' && (externallyMerged || t.gitMerge)) {
+      t = reconcileExternalMerge(store, t, gitWorkspace);
+    }
+
+    if (!t.git.cleanedUp && t.workspace) {
+      commits = gitWorkspace.commits({ workingDirectory: t.workspace, baseCommit: t.git.baseCommit });
+    } else if (t.gitMerge) {
+      // worktree 已經清理掉了，沒有目錄可以讀 HEAD；改用 repositoryPath 讀
+      // baseCommit..分支自己的那個 parent（merge commit 的第二個 parent，因為合併一律
+      // 用 --no-ff）這個固定範圍，才會跟 worktree 還在時看到的清單一致——不多算進
+      // merge commit 本身，Ready to Close 畫面仍能「查看變更」。
+      commits = gitWorkspace.commits({ workingDirectory: t.git.repositoryPath, baseCommit: t.git.baseCommit, head: `${t.gitMerge.commit}^2` });
+    }
+    // fetch:false —— 開啟審核畫面不該觸發網路操作；這裡顯示的是上次 fetch 之後的狀態，
+    // 真正要推送時 pushBaseBranch() 會自己先 fetch 一次。
+    remote = gitWorkspace.remoteStatus({ repositoryPath: t.git.repositoryPath, baseBranch: t.git.baseBranch, fetch: false });
+    const state = gitWorkspace.inspect(t.git.repositoryPath);
+    repository = {
+      branch: state.branch, clean: state.dirty.length === 0,
+      onBaseBranch: state.branch === t.git.baseBranch,
+      dirty: state.dirty.slice(0, 30),
+    };
+  } catch (e) {
+    repositoryError = e.message;
+  }
+
+  // 用 reconcile 之後的最新 t 組出驗證與 review 物件，確保呼叫端看到的欄位（status、
+  // merge、merged...）與剛剛持久化的結果一致，不會出現「畫面說已整合，資料庫還是 completed」。
   const threads = store.threads(t.id).filter(th => th.version === t.planVersion && th.status === 'completed');
   const validation = threads.map(th => ({
     phase: th.phase, role: th.role, title: th.title,
@@ -45,11 +144,7 @@ export function taskGitReview(store, user, tid, { gitWorkspace = shared } = {}) 
     commit: th.commit?.commit || null,
   }));
 
-  if (t.git?.mode !== 'worktree') {
-    return { available: false, reason: t.workspace ? 'legacy_workspace' : 'not_git', validation, merge: null, conflict: null };
-  }
-
-  const review = {
+  return {
     available: true,
     status: t.gitMerge ? 'merged' : t.gitConflict ? 'conflict' : t.status === 'completed' && !t.manualCompletion ? 'ready' : 'not_ready',
     baseBranch: t.git.baseBranch,
@@ -58,68 +153,20 @@ export function taskGitReview(store, user, tid, { gitWorkspace = shared } = {}) 
     headCommit: t.git.headCommit,
     artifactVersion: t.artifactVersion || null,
     artifactCommit: t.artifactCommit || null,
-    commits: [], repository: null,
+    commits, repository, repositoryError,
     validation,
     merge: t.gitMerge || null,
-    conflict: t.gitConflict || null,
+    conflict,
     rollback: t.gitRollback || null,
     push: t.gitPush || null,
     cleanedUp: !!t.git.cleanedUp,
-    // 下面這些欄位一律是「現在重新問一次 Git」的結果，不是任務完成或上次合併當下的快取
-    // （計畫書第八、九章）：main 有沒有前進、現在合不合併得起來，隨時可能已經和快取的結論不同。
-    mainAdvanced: false,
-    mainHead: null,
-    hasConflict: !!t.gitConflict,
+    remote,
+    mainAdvanced, mainHead,
+    hasConflict,
     merged: !!t.gitMerge,
-    mergeable: false,
-    externallyMerged: false,
+    mergeable,
+    externallyMerged,
   };
-
-  try {
-    if (!t.git.cleanedUp && t.workspace) {
-      review.commits = gitWorkspace.commits({ workingDirectory: t.workspace, baseCommit: t.git.baseCommit });
-    } else if (t.gitMerge) {
-      // worktree 已經清理掉了，沒有目錄可以讀 HEAD；改用 repositoryPath 讀
-      // baseCommit..分支自己的那個 parent（merge commit 的第二個 parent，因為合併一律
-      // 用 --no-ff）這個固定範圍，才會跟 worktree 還在時看到的清單一致——不多算進
-      // merge commit 本身，Ready to Close 畫面仍能「查看變更」。
-      review.commits = gitWorkspace.commits({ workingDirectory: t.git.repositoryPath, baseCommit: t.git.baseCommit, head: `${t.gitMerge.commit}^2` });
-    }
-    // fetch:false —— 開啟審核畫面不該觸發網路操作；這裡顯示的是上次 fetch 之後的狀態，
-    // 真正要推送時 pushBaseBranch() 會自己先 fetch 一次。
-    review.remote = gitWorkspace.remoteStatus({ repositoryPath: t.git.repositoryPath, baseBranch: t.git.baseBranch, fetch: false });
-    const state = gitWorkspace.inspect(t.git.repositoryPath);
-    review.repository = {
-      branch: state.branch, clean: state.dirty.length === 0,
-      onBaseBranch: state.branch === t.git.baseBranch,
-      dirty: state.dirty.slice(0, 30),
-    };
-
-    const mainHead = branchHeadOf(gitWorkspace, t.git.repositoryPath, t.git.baseBranch);
-    review.mainHead = mainHead;
-    review.mainAdvanced = !!(mainHead && t.git.baseCommit && mainHead !== t.git.baseCommit);
-
-    if (!t.gitMerge) {
-      // 還沒被 TaskFlow 自己合併過：先確認分支是不是已經在外部被手動合併進 main，
-      // 這種情況不需要使用者再按一次「Merge 到 main」（計畫書第十章 Case D）。
-      const branchHead = branchHeadOf(gitWorkspace, t.git.repositoryPath, t.git.workingBranch);
-      if (branchHead && mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.git.baseBranch, branchHead)) {
-        review.externallyMerged = true;
-        review.mergeable = false;
-      } else if (branchHead) {
-        // 即時重新試算一次合不合併得起來；不沿用任務完成當下的舊結論。
-        const preview = gitWorkspace.previewMerge({ repositoryPath: t.git.repositoryPath, baseBranch: t.git.baseBranch, workingBranch: t.git.workingBranch });
-        if (preview.available && preview.conflicted) {
-          review.hasConflict = true;
-          review.conflict = review.conflict || { files: preview.files, hint: 'TaskFlow 不會自行決定 ours／theirs。請在專案目錄手動處理衝突後再回來，或改為要求 AI 修改。', baseBranch: t.git.baseBranch, workingBranch: t.git.workingBranch };
-        }
-        review.mergeable = preview.available && !preview.conflicted && !preview.alreadyMerged;
-      }
-    }
-  } catch (e) {
-    review.repositoryError = e.message;
-  }
-  return review;
 }
 
 function mergeDecision(store, user, t, input, gitWorkspace) {
@@ -215,30 +262,14 @@ export async function closeTask(store, user, tid, input = {}, { gitWorkspace = s
 
   if (t.status !== 'ready_to_close') {
     if (t.status !== 'completed') throw new HttpError(409, `任務目前是 ${t.status}，還不能關閉。`);
-    if (t.gitMerge) {
-      // 相容舊資料（計畫書第三十一章）：這個任務是在本次改造之前合併的，status 從此
-      // 停在 completed，從來沒有被推進過。舊的 merge commit 還在，重新驗證一次仍在
-      // 正式分支上就直接視為 ready_to_close，不要求 workingBranch 還存在——舊行為本來
-      // 就會在合併當下立刻清掉 worktree 與分支。
-      if (!mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.gitMerge.baseBranch, t.gitMerge.commit)) {
-        throw new HttpError(409, `${t.gitMerge.baseBranch} 目前不包含此任務先前的合併結果，無法關閉；請重新確認 Git 狀態。`);
-      }
-    } else {
-      const branchHead = branchHeadOf(gitWorkspace, t.git.repositoryPath, t.git.workingBranch);
-      if (!branchHead || !mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.git.baseBranch, branchHead)) {
-        throw new HttpError(409, '尚未合併至正式分支，無法關閉；請先在「部署與驗收」核准合併，或確認 Git 狀態後再試一次。');
-      }
-      // 分支已經在外部被合併：把目前查得到的事實記成 merge metadata，即使不是 TaskFlow
-      // 自己執行的合併，也不能讓這個任務從此沒有任何 merge 紀錄（計畫書第十四章）。
-      t.gitMerge = { commit: branchHead, baseBranch: t.git.baseBranch, workingBranch: t.git.workingBranch, artifactVersion: t.artifactVersion, by: null, at: now(), external: true };
+    // 與 taskGitReview() 共用同一份 reconciliation：涵蓋「外部手動合併」與「舊資料合併過
+    // 但從沒推進過 status」兩種情況（計畫書第十四、三十一章）。條件不成立就原樣不動、
+    // 不拋錯，交給下面依 t.gitMerge 有沒有值分辨出精確的錯誤原因。
+    reconcileExternalMerge(store, t, gitWorkspace);
+    if (t.status !== 'ready_to_close') {
+      if (t.gitMerge) throw new HttpError(409, `${t.gitMerge.baseBranch} 目前不包含此任務先前的合併結果，無法關閉；請重新確認 Git 狀態。`);
+      throw new HttpError(409, '尚未合併至正式分支，無法關閉；請先在「部署與驗收」核准合併，或確認 Git 狀態後再試一次。');
     }
-    assertTaskTransition(t, 'ready_to_close');
-    t.status = 'ready_to_close';
-    t.readyToCloseAt = now();
-    store.saveTask(t);
-    store.event(t.id, 'ready_to_close', t.gitMerge.external
-      ? '偵測到此任務已在外部手動合併，直接視為等待關閉，不需要再次核准合併。'
-      : '這是本次改造之前已合併的任務，重新確認合併結果仍在正式分支上後，直接視為等待關閉。');
   }
 
   const mainContainsTaskCommit = mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.gitMerge.baseBranch, t.gitMerge.commit);
