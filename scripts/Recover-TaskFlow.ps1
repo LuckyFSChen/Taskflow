@@ -1,4 +1,4 @@
-param([switch]$CheckOnly,[switch]$Restart,[string]$ResultFile)
+param([switch]$CheckOnly,[switch]$Restart,[switch]$Build,[string]$ResultFile)
 $ErrorActionPreference='Stop'
 if($CheckOnly -and $Restart){throw 'CheckOnly and Restart cannot be combined.'}
 $taskRoot=Split-Path -Parent $PSScriptRoot
@@ -42,6 +42,17 @@ $locked=$false
 try{
   $locked=$guard.WaitOne(10000)
   if(!$locked){throw 'Another service operation is still running.'}
+  # Build BEFORE stopping anything: merged source does not become dist/ by itself, and a
+  # failed build must never cost the user a running service. Dependencies are intentionally
+  # NOT reinstalled here (npm ci would delete node_modules while the server is using it);
+  # if a dependency is missing the build fails and says so, and Restart-TaskFlow.ps1 remains
+  # the manual path that runs npm ci.
+  if($Build -and !$CheckOnly){
+    if(!(Get-Command npm.cmd -ErrorAction SilentlyContinue)){throw 'npm.cmd was not found in PATH; the running service was not stopped.'}
+    & npm.cmd run build
+    if($LASTEXITCODE -ne 0){throw "Build failed with exit code $LASTEXITCODE; the running service was not stopped."}
+    if(!(Test-Path -LiteralPath (Join-Path $taskRoot 'dist\index.html'))){throw 'Build finished but dist\index.html is missing; the running service was not stopped.'}
+  }
   $localReady=Test-ServiceUrl 'http://127.0.0.1:4310'
   if((!$localReady -or $Restart) -and !$CheckOnly){
     $old=Owned-Process 'data/server.pid' $serverPath -Node

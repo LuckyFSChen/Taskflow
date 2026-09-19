@@ -7,6 +7,7 @@ import {dirname,join,resolve,relative,isAbsolute,extname} from 'node:path';
 import {HttpError} from './domain.js';
 import {killTree} from './runner.js';
 import {createStore} from './db.js';
+import {registerPreview,unregisterPreview,waitForExit} from './process-lifecycle.js';
 
 const KNOWN_SERVER_DEPS=['express','fastify','koa','hapi','restify'];
 // Only a bare `node <relative-file>.js` start script is trusted enough to auto-spawn;
@@ -83,7 +84,9 @@ async function waitForHealth(url,timeoutMs) {
   }
   throw new HttpError(422,`Preview 伺服器健康檢查逾時：${lastError}`);
 }
-export function createProjectPreview({npm=runNpm}={}) {
+// registryPath：把記憶體裡的 running 表同時寫一份到磁碟。純粹是為了服務重新啟動之後
+// 還認得出自己開過哪些 Preview 子程序——記憶體那份一重啟就沒了，子程序卻還活著。
+export function createProjectPreview({npm=runNpm,registryPath=resolve('data/preview/registry.json')}={}) {
   const running=new Map(),pending=new Map();
   async function startFullstack(key,path,pkg) {
     const serverFile=resolveFullstackEntry(path,pkg);
@@ -126,7 +129,8 @@ export function createProjectPreview({npm=runNpm}={}) {
     startupSettled=true;
     const info={url,kind:'fullstack',pid:child.pid,cwd:path,credentials:{username,password}};
     running.set(key,{child,info});
-    child.once('exit',()=>{if(running.get(key)?.child===child)running.delete(key);});
+    registerPreview(registryPath,{key,pid:child.pid,url,kind:'fullstack',cwd:path});
+    child.once('exit',()=>{if(running.get(key)?.child===child)running.delete(key);unregisterPreview(registryPath,key);});
     return info;
   }
   async function start(key,path) {
@@ -170,17 +174,21 @@ export function createProjectPreview({npm=runNpm}={}) {
   async function stop(key){
     if(pending.has(key))throw new HttpError(409,'網頁正在準備，請完成後再停止');
     const item=running.get(key);
-    if(!item)return;
+    if(!item)return {stopped:false,reason:'not_running'};
     running.delete(key);
     if(item.server){item.server.closeAllConnections();await new Promise(resolve=>item.server.close(resolve));}
-    if(item.child){
-      await new Promise(resolveStop=>{
-        if(item.child.exitCode!==null||item.child.signalCode){resolveStop();return;}
-        const timer=setTimeout(resolveStop,5000);
-        item.child.once('exit',()=>{clearTimeout(timer);resolveStop();});
-        killTree(item.child);
-      });
-    }
+    if(!item.child){unregisterPreview(registryPath,key);return {stopped:true,pid:null,verified:true};}
+    await new Promise(resolveStop=>{
+      if(item.child.exitCode!==null||item.child.signalCode){resolveStop();return;}
+      const timer=setTimeout(resolveStop,5000);
+      item.child.once('exit',()=>{clearTimeout(timer);resolveStop();});
+      killTree(item.child);
+    });
+    // killTree() 在 Windows 上是射後不理，子程序的 exit 事件也只在「它是我們的子程序」時才可靠。
+    // 這裡再向作業系統確認一次 PID 真的不見了；沒消失就照實回報 verified:false，不假裝停好了。
+    const verified=await waitForExit(item.info?.pid,{timeoutMs:5000});
+    unregisterPreview(registryPath,key);
+    return {stopped:true,pid:item.info?.pid??null,verified};
   }
   return {stopProject:async pid=>{const matches=key=>key===pid||key.startsWith(pid+':');if([...pending.keys()].some(matches))throw new HttpError(409,'網頁正在建置，請完成後再停止');await Promise.all([...running.keys()].filter(matches).map(stop));},hasProjectActivity:pid=>[...running.keys(),...pending.keys()].some(key=>key===pid||key.startsWith(pid+':')),start,stop,status:key=>running.get(key)?.info||null,close:async()=>{await Promise.allSettled([...pending.values()]);await Promise.all([...running.keys()].map(stop));}};
 }

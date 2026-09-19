@@ -4,7 +4,10 @@ import {writeFileSync} from 'node:fs';
 import {runServiceRecovery} from './service-recovery.js';
 import {createStore} from './db.js';
 import {initServiceControl,stageCloudEvent,handleServiceRequests} from './service-control.js';
-const store=createStore();initServiceControl(store);
+// 從網頁核准的重新啟動也走這支守護程式：主 server 不能自己殺自己，
+// 否則沒有人能把結果寫回去，也沒有人能在失敗時把舊服務救回來。
+import {handleControlRequests,initControlRequests,recoverStuckRestarts} from './control-requests.js';
+const store=createStore();initServiceControl(store);initControlRequests(store.db);
 const lock=createServer(socket=>socket.end());
 lock.on('error',()=>{store.close();process.exit(1);});
 async function request(path,body){
@@ -28,6 +31,9 @@ async function tick(){
       for(const event of events){stageCloudEvent(store,event);await request('/runner/ack',{id:event.webhookEventId});}
     }}catch(e){console.error(new Date().toISOString(),'Cloud inbox unavailable',e.message);}
     await handleServiceRequests(store,{recover:()=>repair(),inspect:()=>repair(true),notify:body=>request('/runner/notify',body),onError:e=>console.error(new Date().toISOString(),'Service request failed',String(e.stderr||e.message||e.code||'').slice(-2000))});
+    // 網頁核准的部署重啟。build=true：合併進 main 的原始碼要先建置，不然重啟後網頁還是舊的。
+    recoverStuckRestarts(store);
+    await handleControlRequests(store,{restart:()=>runServiceRecovery({build:true}),onError:e=>console.error(new Date().toISOString(),'Restart request failed',String(e.stderr||e.message||e.code||'').slice(-2000))});
     store.setSetting('guardianLastSuccess',new Date().toISOString());
   }catch(e){console.error(new Date().toISOString(),e.code||'Guardian cycle failed',String(e.message||'').slice(0,300));}
   finally{busy=false;}
