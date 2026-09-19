@@ -16,6 +16,9 @@ import {
   technicalFacts,
   threadTechnical,
   threadEvents,
+  taskRuns,
+  runTitle,
+  attemptLabel,
 } from '../src/task-detail-view.js';
 
 // 共用的任務樣板：一個已核准、有三個步驟的程式任務。
@@ -361,6 +364,32 @@ test('執行紀錄只取該 thread 的事件', () => {
   assert.deepEqual(threadEvents(task, 'a', 1).map(e => e.message), ['3']);
 });
 
+// --- K. Run / Attempt ---------------------------------------------------------
+// task.runs 由 server/run-attempt.js 的 buildRuns() 算好，這裡只驗證
+// task-detail-view.js 挑選顯示欄位的邏輯，不重算分組（分組演算法在
+// tests/run-attempt.test.js 已經測過）。
+
+test('taskRuns 直接回傳 task.runs，沒有就給空陣列', () => {
+  assert.deepEqual(taskRuns(null), []);
+  assert.deepEqual(taskRuns({}), []);
+  const runs = [{ id: 'r1', attempts: [] }];
+  assert.deepEqual(taskRuns({ runs }), runs);
+});
+
+test('runTitle 優先用 server 算好的中文標題，缺漏才用 phase 對照表', () => {
+  assert.equal(runTitle({ title: '修改程式', phase: 'execute' }), '修改程式');
+  assert.equal(runTitle({ title: '', phase: 'repair_plan' }), '修正方案分析');
+  assert.equal(runTitle(null), '');
+});
+
+test('attemptLabel 只在重試過一次以上才顯示第幾次／共幾次', () => {
+  const single = { attempts: [{ id: 'a' }] };
+  const retried = { attempts: [{ id: 'a' }, { id: 'b' }, { id: 'c' }] };
+  assert.equal(attemptLabel(single, 0), '');
+  assert.equal(attemptLabel(retried, 0), '嘗試 1 / 3');
+  assert.equal(attemptLabel(retried, 2), '嘗試 3 / 3');
+});
+
 // --- J. 防呆 ------------------------------------------------------------------
 
 test('缺資料時不會丟例外', () => {
@@ -373,6 +402,8 @@ test('缺資料時不會丟例外', () => {
   assert.equal(validationFailureView({}), null);
   assert.deepEqual(threadEvents({}, 'x'), []);
   assert.equal(publishState(null), null);
+  assert.deepEqual(taskRuns(null), []);
+  assert.equal(runTitle(null), '');
   const empty = progressSteps({ planVersion: 1, status: 'planning' });
   assert.deepEqual(empty.map(s => s.key), ['plan', 'approval', 'review']);
 });

@@ -1,4 +1,5 @@
 import {threadPresentation} from './thread-presentation.js';
+import {buildRuns} from './run-attempt.js';
 import {registerNotificationAdmin} from './notification-admin.js';
 import {approveRepair,reviseRepair} from './repair-approval.js';
 import {projectRemovalPlan,removeProject} from './project-removal.js';
@@ -119,6 +120,9 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/projects/:id/preview/stop',async(req,res)=>{const target=projectTarget(req);await previews.stop(target.key);res.json({ok:true});});
   const visibleProjects=user=>{const projects=store.db.prepare('SELECT * FROM projects').all().filter(p=>store.hasProject(user,p.id));return projects.map(p=>user.role==='admin'?p:{id:p.id,name:p.name,code:p.code});};
   function decorated(t){const threads=store.threads(t.id).filter(th=>th.version===t.planVersion).map(th=>({...th,...threadPresentation(th)}));
+    // Run／Attempt：把 threads 依 (planVersion, round, phase[, execute 的 step 游標]) 純運算分組，
+    // 不新增資料表欄位；沒有 thread 的任務給空陣列，不是 undefined（見 docs/DOMAIN-MODEL-RUN-ATTEMPT.md）。
+    const runs=buildRuns(threads);
     // 重新啟動「正式 TaskFlow」只對 TaskFlow 自己這個專案有意義；其他專案不該看到那個按鈕，
     // 也不該為了它每次輪詢都多查一次資料庫。
     const selfProject=isSelfProject(store.project(t.projectId)?.path,taskflowRoot),deployable=selfProject&&!!t.gitMerge;
@@ -147,7 +151,7 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     // 方案群組只送 id 與名稱；群組的完成度／狀態一律由前端依真實 task state 聚合，
     // 後端不預先算任何進度數字，也不會在這裡幫沒有 planGroupId 的舊任務「猜」一個群組。
     planGroupId:t.planGroupId||null,planGroupName:t.planGroupId?store.planGroup(t.planGroupId)?.name||null:null,
-    workspace:undefined,threads,ownerName:store.user(t.ownerId)?.name,projectName:store.project(t.projectId)?.name,completedSteps:threads.filter(th=>th.phase==='execute'&&th.status==='completed'&&th.result?.passed&&!th.result.questions?.length).length,totalSteps:t.plan?.steps.length||0};}
+    workspace:undefined,threads,runs,ownerName:store.user(t.ownerId)?.name,projectName:store.project(t.projectId)?.name,completedSteps:threads.filter(th=>th.phase==='execute'&&th.status==='completed'&&th.result?.passed&&!th.result.questions?.length).length,totalSteps:t.plan?.steps.length||0};}
   app.get('/api/state',async(req,res)=>{
     const browser=await checkClaudeBrowserCapability().catch(error=>({available:false,provider:null,cli:'claude',error:error.message}));
     res.json({user:req.user,onboarding:onboardingStatus(store,req.user),defaultProjectRoot:req.user.role==='admin'?store.setting('defaultProjectRoot',''):undefined,projects:visibleProjects(req.user),planGroups:planGroupsPublic(store,req.user),tasks:store.tasks(req.user).map(decorated),runner:{enabled:store.setting('runnerEnabled',false),...runner.status,maxConcurrent:runnerLimit(store),activeTaskIds:(runner.status.activeTaskIds||[]).filter(id=>store.tasks(req.user).some(t=>t.id===id)),activeTaskId:store.tasks(req.user).some(t=>t.id===runner.status.activeTaskId)?runner.status.activeTaskId:null},integrations:{lineConfigured:!!(process.env.INBOX_URL&&process.env.INBOX_TOKEN),lastSync:store.setting('inboxLastSuccess'),error:store.setting('inboxError'),notificationError:store.db.prepare("SELECT error FROM outbox WHERE sent=0 AND cancelled_at IS NULL AND error IS NOT NULL ORDER BY rowid DESC LIMIT 1").get()?.error||null,pendingNotifications:store.db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent=0 AND cancelled_at IS NULL').get().n,browser:{configured:!!browser.available,provider:browser.provider,available:browser.available,error:browser.error}}});

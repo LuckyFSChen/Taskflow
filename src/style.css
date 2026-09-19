@@ -119,6 +119,12 @@
 .role-row{display:flex;align-items:flex-start;gap:12px;border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px}
 .role-row strong{display:block;font-size:.875rem}
 .role-row small{display:block;margin-top:5px;font-size:.75rem;line-height:1.7;color:#8b93a1;overflow-wrap:anywhere}
+/* Run／Attempt：同一個 Run 重試過一次以上才會出現這個群組外框，只重試過一次的
+   Run 維持原本的單一列外觀（見 App.vue「執行紀錄」）。 */
+.run-group{border:1px solid var(--line);border-radius:10px;padding:14px 16px 4px;margin-bottom:12px;background:#fafbfc}
+.run-header{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.run-header strong{font-size:.875rem;flex:1}
+.run-group .role-row{background:#fff}
 /* 成果：驗證證據依角色分組，沒有證據就直接說沒有，不留空白區塊。 */
 .evidence-block{border:1px solid var(--line);border-radius:10px;padding:15px 17px;margin-bottom:12px}
 .evidence-block strong{font-size:.875rem}
@@ -237,22 +243,26 @@ input,select,textarea{border-radius:var(--radius-control);border-color:#dcdce0;t
 .filter-tabs button.selected{background:var(--surface);box-shadow:0 1px 2px #0000000f;color:var(--ink)}
 
 /* ============================================================
-   平台設定：五個分頁 + Setting Row
+   平台設定：八個分類 + Setting Row
    一列預設只顯示「標題 / 說明 / 目前的值」，要改才展開編輯器。
    ============================================================ */
-/* 設定頁共用容器：header／description（App.vue 的 page-heading）與 tabs／content
-   sections（settings-shell 以下）都要套用同一個 max-width，版面比例才會一致。 */
-.content-settings .page-heading,.content-settings .settings-shell{max-width:900px;margin-left:auto;margin-right:auto}
-.settings-shell{display:grid;gap:18px}
+/* 設定頁共用容器：header／description（App.vue 的 page-heading）與 nav／content
+   （settings-shell 以下）都要套用同一個 max-width，版面比例才會一致。 */
+.content-settings .page-heading{max-width:1040px;margin-left:auto;margin-right:auto}
+.content-settings .settings-shell{max-width:1040px;margin-left:auto;margin-right:auto}
+/* 桌面版採左側導覽 + 右側內容的兩欄版面（貼近系統設定的資訊層級），
+   分類一多也不會像等分分頁那樣被擠壓；窄螢幕改成上方橫向捲動列。 */
+.settings-shell{display:grid;grid-template-columns:214px minmax(0,1fr);gap:32px;align-items:start}
 .settings-stack{display:grid;gap:18px}
-.settings-hint{margin:0;font-size:.8125rem;color:var(--muted)}
-/* 桌面版一律等分 grid，欄寬不看文字長度；grid-template-columns 由 JS 依 TABS
-   數量產生（repeat() 的次數不吃 custom property，所以不能寫 repeat(var(--count),1fr)），
-   避免「AI 與執行」把自己的分頁撐寬、其他分頁跟著變窄。 */
-.segmented{position:relative;display:grid;padding:4px;background:#ececef;border-radius:13px;width:100%}
-.segmented button{position:relative;z-index:1;min-width:0;border:0;background:none;padding:11px 20px;border-radius:10px;font-size:.875rem;font-weight:500;color:#5b5b60;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:color .18s var(--ease-soft)}
-.segmented button.selected{color:var(--ink);font-weight:600}
-.segmented-thumb{position:absolute;z-index:0;top:4px;bottom:4px;left:4px;width:calc((100% - 8px)/var(--count));transform:translateX(calc(var(--index)*100%));background:var(--surface);border-radius:10px;box-shadow:0 1px 3px #00000014;transition:transform .26s var(--ease-soft)}
+.settings-hint{margin:0 0 18px;font-size:.8125rem;color:var(--muted)}
+.settings-section-title{margin:6px 0 0}
+.settings-nav{position:sticky;top:24px;display:grid;gap:2px;padding:8px;background:#ececef;border-radius:14px}
+.settings-nav-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border:0;border-radius:10px;background:none;text-align:left;font-size:.875rem;font-weight:500;color:#5b5b60;transition:background .16s var(--ease-soft),color .16s var(--ease-soft)}
+.settings-nav-item svg{flex-shrink:0;color:#8a8a90;transition:color .16s var(--ease-soft)}
+.settings-nav-item:hover{background:#e2e2e6}
+.settings-nav-item.selected{background:var(--surface);color:var(--ink);box-shadow:0 1px 3px #00000014}
+.settings-nav-item.selected svg{color:var(--accent)}
+.settings-content{min-width:0}
 .surface-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-card);box-shadow:var(--shadow-card);padding:8px 24px 20px}
 .surface-card>h2,.card-head h2{display:flex;align-items:center;gap:9px;margin:0;font-size:1rem;letter-spacing:-.015em}
 .card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:16px 0 4px}
@@ -302,12 +312,12 @@ input,select,textarea{border-radius:var(--radius-control);border-color:#dcdce0;t
 }
 @media(max-width:850px){
   .editor-grid{grid-template-columns:1fr}
+  .settings-shell{grid-template-columns:1fr}
+  .settings-nav{position:static;display:flex;width:100%;overflow-x:auto;border-radius:13px}
+  .settings-nav-item{flex:0 0 auto;padding:9px 14px;font-size:.8125rem}
 }
 @media(max-width:640px){
-  .segmented{display:flex;width:100%;overflow-x:auto}
-  .segmented-thumb{display:none}
-  .segmented button{flex:0 0 auto;padding:9px 16px;font-size:.8125rem}
-  .segmented button.selected{background:var(--surface);box-shadow:0 1px 3px #00000014}
+  .settings-nav-item span{white-space:nowrap}
 }
 @media(max-width:600px){
   .surface-card{padding:6px 18px 16px}

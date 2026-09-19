@@ -2,10 +2,10 @@
 // 停止之後身份真的消失。單元測試證明得了每一段，證明不了這條資料流沒有斷。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,writeFileSync,mkdirSync,rmSync,existsSync} from 'node:fs';
+import {writeFileSync,mkdirSync,existsSync} from 'node:fs';
 import {join,resolve} from 'node:path';
-import {tmpdir} from 'node:os';
 import {DatabaseSync} from 'node:sqlite';
+import {testCleanup} from './helpers/cleanup.js';
 import {createProjectPreview} from '../server/project-preview.js';
 import {createStore,passwordMatches} from '../server/db.js';
 import {validateDeployment} from '../server/deployment-validation.js';
@@ -13,7 +13,6 @@ import {isAlive} from '../server/process-lifecycle.js';
 
 const previewDbSlug=key=>key.replace(/[^a-zA-Z0-9_-]/g,'_');
 const previewDbPathFor=key=>resolve('data/preview',previewDbSlug(key),'taskflow.sqlite');
-const rmDirSafe=path=>rmSync(path,{recursive:true,force:true,maxRetries:5,retryDelay:200});
 const fakeNpm=async(path,args)=>{if(args[0]==='install')mkdirSync(join(path,'node_modules'),{recursive:true});};
 
 function writeFixture(root,serverSource) {
@@ -56,12 +55,15 @@ createServer((req,res)=>{
 }).listen(port,host);
 `;
 
+// 清理順序由 testCleanup 保證：先 preview.close()（停掉子程序、關掉 Preview DB 連線），
+// 才刪夾具目錄與 Preview 資料庫目錄。反過來的話，Windows 會因為 handle 還開著而 EPERM。
 async function startFixture(t,key) {
-  const root=mkdtempSync(join(tmpdir(),'tf-acceptance-'));
+  const cleanup=testCleanup(t);
+  const root=cleanup.tempDir('tf-acceptance-');
   writeFixture(root,AUTH_SERVER);
-  const preview=createProjectPreview({npm:fakeNpm});
-  t.after(async()=>{await preview.close();rmDirSafe(root);rmDirSafe(join('data/preview',previewDbSlug(key)));});
-  return {root,preview};
+  const preview=cleanup.dispose(createProjectPreview({npm:fakeNpm}),'preview runtime');
+  cleanup.directory(resolve('data/preview',previewDbSlug(key)));
+  return {root,preview,cleanup};
 }
 
 test('Preview 子程序真的收到 TASKFLOW_ACCEPTANCE_*，不是只存在父行程',async t=>{
@@ -172,10 +174,10 @@ test('Test 8（落地版）：驗收產生的任何結果都不得夾帶 passwor
 
 // 這一段直接驗資料庫層：401 的根因就在這裡——舊寫法只在「完全沒有使用者」時才寫入帳密。
 test('upsertUser 每次都把驗收帳號的密碼換成這一輪的那一組',async t=>{
-  const dir=mkdtempSync(join(tmpdir(),'tf-acceptance-db-'));
-  t.after(()=>rmDirSafe(dir));
-  const store=createStore(join(dir,'preview.sqlite'));
-  t.after(()=>store.close());
+  // store 必須在目錄被刪除**之前**關閉：SQLite 連線（含 -wal／-shm）是真的 file handle。
+  const cleanup=testCleanup(t);
+  const dir=cleanup.tempDir('tf-acceptance-db-');
+  const store=cleanup.dispose(createStore(join(dir,'preview.sqlite')),'preview store');
 
   store.addUser('既有使用者','someone-else','first-password-123');
   store.upsertUser('TaskFlow Preview','taskflow-preview','first-acceptance-pw');
