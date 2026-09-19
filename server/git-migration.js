@@ -59,6 +59,9 @@ export function migrateLegacyWorkspace(store, user, tid, { gitWorkspace = shared
     projectPath: project.path, taskId: t.id, title: t.title,
     worktreesDir: join(dataDir, 'worktrees'),
     protectedBranches: store.setting('protectedBranches', DEFAULT_PROTECTED_BRANCHES),
+    // Repository topology 的判斷需要知道這是不是 TaskFlow 自己管理的專案 root，
+    // 否則尚未 git init 的專案會被誤判成上層版本庫的子目錄（見 git-repository.js）。
+    projectRoot: project.path, managedProjectsRoot: store.setting('defaultProjectRoot', '') || null,
   });
   for (const e of prepared.events) store.event(t.id, e.kind, e.message);
 

@@ -12,6 +12,8 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { detectRepositoryInfo, evaluateRepositoryPolicy, samePath } from './git-repository.js';
+export { detectRepositoryInfo, evaluateRepositoryPolicy, REPOSITORY_TYPES } from './git-repository.js';
 
 export const DEFAULT_PROTECTED_BRANCHES = ['main', 'master', 'production', 'release', 'develop'];
 
@@ -95,11 +97,6 @@ export function createGitRunner({ exec = execFileSync, timeout = 120000 } = {}) 
   };
 }
 
-const samePath = (a, b) => {
-  const normalize = p => resolve(p).replace(/[\\/]+$/, '');
-  const [x, y] = [normalize(a), normalize(b)];
-  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
-};
 const firstLine = text => String(text || '').split('\n')[0].trim();
 
 export function gitAvailable(git, cwd = process.cwd()) {
@@ -138,12 +135,20 @@ export function dirtyFingerprint(dirty) {
   return normalized ? createHash('sha256').update(normalized).digest('hex') : null;
 }
 
-export function inspectRepository(projectPath, { git }) {
+// 唯一的 repository 檢查入口。topology 由 git-repository.js 判斷（detection），
+// 該不該停下來由 policy 決定；這裡只負責把兩者接上 Git 狀態（branch／HEAD／未提交修改）。
+//
+// 回傳值保留既有欄位（isRepository／repositoryPath／nested／branch／head／dirty），
+// 讓 runner、git-issue、git-review、completion 等既有呼叫端不必同步改寫；
+// 新的 canonical model 放在 `repository` 與 `policy` 兩個欄位裡。
+export function inspectRepository(projectPath, { git, projectRoot = null, managedProjectsRoot = null }) {
   if (!existsSync(projectPath)) throw new GitSafetyError('project_missing', `專案資料夾不存在：${projectPath}`);
-  const inside = git(projectPath, ['rev-parse', '--is-inside-work-tree'], { allowFailure: true });
-  if (!inside.ok || firstLine(inside.stdout) !== 'true') return { isRepository: false, repositoryPath: null, nested: false };
-  const top = git(projectPath, ['rev-parse', '--show-toplevel'], { allowFailure: true });
-  const repositoryPath = top.ok ? resolve(firstLine(top.stdout)) : resolve(projectPath);
+  const repository = detectRepositoryInfo(projectPath, { git, projectRoot, managedProjectsRoot });
+  const policy = evaluateRepositoryPolicy(repository);
+  // managed-uninitialized 與 non-git 都還不是 repository：對外一律回報 isRepository: false，
+  // 由 policy.nextAction = 'git-init' 決定接下來要初始化，而不是進入人工處理狀態。
+  if (!repository.isGit) return { isRepository: false, repositoryPath: null, nested: false, repository, policy };
+  const repositoryPath = repository.worktreeRoot;
   const branchResult = git(repositoryPath, ['branch', '--show-current'], { allowFailure: true });
   const headResult = git(repositoryPath, ['rev-parse', 'HEAD'], { allowFailure: true });
   const statusResult = git(repositoryPath, ['status', '--porcelain'], { allowFailure: true });
@@ -158,11 +163,15 @@ export function inspectRepository(projectPath, { git }) {
   return {
     isRepository: true,
     repositoryPath,
-    nested: !samePath(repositoryPath, projectPath),
+    // `nested` 的語意從來就是「這個路徑只是別人 repository 的子目錄」，現在直接取自 topology：
+    // linked worktree 與 nested independent repository 都是合法的 root，不會落在這裡。
+    nested: repository.isSubdirectory,
     branch: branchResult.ok ? firstLine(branchResult.stdout) || null : null,
     head: headResult.ok ? firstLine(headResult.stdout) || null : null,
     dirty,
     dirtyFingerprint: dirtyFingerprint(dirty),
+    repository,
+    policy,
   };
 }
 
@@ -245,6 +254,30 @@ export function initRepository(projectPath, { git, defaultBranch = 'main', ignor
   return { defaultBranch, head, events };
 }
 
+// 專案建立時就給它自己的 repository boundary，而不是等到第一個任務才補。
+//
+// 為什麼要在建立時做：TaskFlow 在「預設專案存放位置」底下建立的新專案，如果那個位置本身
+// 位於另一個 repository 裡（例如 F:\TaskFlow\Projects\），在還沒 git init 前會被 Git 解析成
+// 上層 repository 的一部分。先初始化，之後的每一次 detection 都會直接得到 normal／
+// nested-independent，不必再走 managed-uninitialized 這條補救路徑。
+//
+// 這個函式只在 policy 說「可以自己初始化」時才動手：真正屬於別人 repository 的子目錄
+// （nextAction = 'user-action'）一律不碰，避免在別人追蹤中的工作樹裡塞一個內嵌版本庫。
+// 失敗不是致命的——回報原因即可，第一個任務開始時 prepareTaskWorkspace 會再試一次。
+export function ensureProjectRepository(projectPath, { git, projectRoot = null, managedProjectsRoot = null, defaultBranch = 'main' }) {
+  if (!existsSync(projectPath)) return { initialized: false, reason: 'project_missing', events: [] };
+  if (!gitAvailable(git, projectPath)) return { initialized: false, reason: 'git_unavailable', events: [] };
+  const repository = detectRepositoryInfo(projectPath, { git, projectRoot, managedProjectsRoot });
+  const policy = evaluateRepositoryPolicy(repository);
+  if (policy.nextAction !== 'git-init') return { initialized: false, reason: repository.repositoryType, repository, policy, events: [] };
+  try {
+    const init = initRepository(projectPath, { git, defaultBranch });
+    return { initialized: true, reason: null, repository, policy, defaultBranch: init.defaultBranch, head: init.head, events: init.events };
+  } catch (e) {
+    return { initialized: false, reason: 'init_failed', error: e.message, repository, policy, events: [] };
+  }
+}
+
 function worktreePaths(git, repositoryPath) {
   const list = git(repositoryPath, ['worktree', 'list', '--porcelain'], { allowFailure: true });
   return list.ok ? list.stdout.split('\n').filter(line => line.startsWith('worktree ')).map(line => resolve(line.slice('worktree '.length).trim())) : [];
@@ -255,19 +288,35 @@ function worktreePaths(git, repositoryPath) {
 export function prepareTaskWorkspace({
   projectPath, taskId, title = '', worktreesDir,
   protectedBranches = DEFAULT_PROTECTED_BRANCHES, defaultBranch = 'main',
-  approvedDirtyFingerprint = null, git,
+  approvedDirtyFingerprint = null, projectRoot = null, managedProjectsRoot = null, git,
 }) {
   const events = [];
-  let state = inspectRepository(projectPath, { git });
+  const context = { git, projectRoot, managedProjectsRoot };
+  let state = inspectRepository(projectPath, context);
 
-  if (!state.isRepository) {
-    const init = initRepository(projectPath, { git, defaultBranch });
-    events.push(...init.events);
-    state = inspectRepository(projectPath, { git });
-  } else if (state.nested) {
+  // 決策一律走 policy，不再自己判斷 `nested`。順序很重要：先擋掉必須由人處理的情況，
+  // 再處理「TaskFlow 可以自己解決」的初始化，否則會在別人的 repository 裡 git init。
+  if (state.policy.blocked) {
     throw new GitSafetyError('nested_repository',
       `此專案位於另一個 Git repository 之內（版本庫根目錄：${state.repositoryPath}）。TaskFlow 不會替你在上層版本庫建立分支或修改其內容，請改為指定版本庫根目錄作為專案，或先在此資料夾獨立建立版本庫。`,
-      { repositoryPath: state.repositoryPath });
+      { repositoryPath: state.repositoryPath, repositoryType: state.repository.repositoryType, blockReason: state.policy.blockReason });
+  }
+
+  if (state.policy.nextAction === 'git-init') {
+    // managed-uninitialized：專案實體上位於另一個 repository 底下，但它是 TaskFlow 自己管理的
+    // 專案 root。把這件事寫進工作紀錄，使用者才知道為什麼這裡會多出一個版本庫。
+    const outer = state.repository.inheritedOuterRepository;
+    if (outer) {
+      events.push({ kind: 'git_init', message: `此專案是 TaskFlow 管理的專案資料夾，但尚未有自己的 Git 版本庫，因此 Git 先前把它解析成上層版本庫（${outer}）的子目錄。TaskFlow 現在為它建立獨立的版本庫；上層版本庫的內容不會被修改。` });
+    }
+    const init = initRepository(projectPath, { git, defaultBranch });
+    events.push(...init.events);
+    state = inspectRepository(projectPath, context);
+    if (!state.isRepository || state.policy.blocked) {
+      throw new GitSafetyError('git_init_incomplete',
+        `已嘗試為此專案建立獨立的 Git 版本庫，但重新檢查後仍不是一個可用的版本庫根目錄（目前判定：${state.repository.repositoryType}）。為安全起見已停止，不會在上層版本庫上進行任何操作。`,
+        { repositoryPath: state.repositoryPath, repositoryType: state.repository.repositoryType });
+    }
   }
 
   const { repositoryPath } = state;
@@ -439,8 +488,11 @@ function detectMergeConflicts({ repositoryPath, baseBranch, workingBranch, git }
     for (const line of lines.slice(1)) { if (!line.trim()) break; files.push(line.trim()); }
     return { conflicted: true, files };
   }
-  // 舊版 git：沒有 merge-tree --write-tree，只能實際試一次。
-  const attempt = git(repositoryPath, ['merge', '--no-commit', '--no-ff', workingBranch], { allowFailure: true });
+  // 舊版 git（< 2.38）：沒有 merge-tree --write-tree，只能實際試一次。
+  // 這裡必須帶上 commitArgs：即使是 --no-commit，git 也會先要求 committer identity，
+  // 而 TaskFlow 明確支援「專案沒有設定 user.name／user.email」的情況。少了它，這一步會
+  // 因為身分不明而失敗，被誤讀成「有衝突」——而且是一個沒有任何衝突檔案的假衝突。
+  const attempt = git(repositoryPath, [...commitArgs(git, repositoryPath), 'merge', '--no-commit', '--no-ff', workingBranch], { allowFailure: true });
   if (attempt.ok) {
     git(repositoryPath, ['merge', '--abort'], { allowFailure: true, authorizedAs: 'abort_merge' });
     return { conflicted: false, files: [] };
@@ -448,6 +500,14 @@ function detectMergeConflicts({ repositoryPath, baseBranch, workingBranch, git }
   const files = git(repositoryPath, ['diff', '--name-only', '--diff-filter=U'], { allowFailure: true })
     .stdout.split('\n').map(line => line.trim()).filter(Boolean);
   git(repositoryPath, ['merge', '--abort'], { allowFailure: true, authorizedAs: 'abort_merge' });
+  // 真正的衝突一定至少有一個 unmerged path。一個檔案都沒有，代表這次 merge 根本沒開始
+  // （身分不明、unrelated histories、權限…）。把它當成衝突會讓合併永遠被擋住，而且錯誤訊息
+  // 指向錯的方向，所以照實往外拋，讓使用者看到 git 真正說了什麼。
+  if (!files.length) {
+    throw new GitSafetyError('merge_probe_failed',
+      `無法試算合併結果（git merge 未能開始，且沒有任何衝突檔案），為安全起見已停止，正式分支未被改動。\n\n${(attempt.stderr || attempt.error?.message || '').trim().slice(0, 300)}`,
+      { baseBranch, workingBranch });
+  }
   return { conflicted: true, files };
 }
 
@@ -583,7 +643,13 @@ export function createGitWorkspace({ git = createGitRunner() } = {}) {
   return {
     git,
     available: cwd => gitAvailable(git, cwd),
-    inspect: (projectPath) => inspectRepository(projectPath, { git }),
+    // context = { projectRoot, managedProjectsRoot }：讓 detection 認得出 TaskFlow 自己管理的
+    // 專案 root。沒有帶 context 的呼叫端（Review／合併等，傳進來的已經是 repository root）
+    // 行為與以前完全相同。
+    inspect: (projectPath, context = {}) => inspectRepository(projectPath, { ...context, git }),
+    detect: (projectPath, context = {}) => detectRepositoryInfo(projectPath, { ...context, git }),
+    policy: (repositoryInfo) => evaluateRepositoryPolicy(repositoryInfo),
+    ensureRepository: (projectPath, options = {}) => ensureProjectRepository(projectPath, { ...options, git }),
     prepare: (options) => prepareTaskWorkspace({ ...options, git }),
     assertWorkingBranch: (options) => assertWorkingBranch({ ...options, git }),
     commit: (options) => commitWorkspaceChanges({ ...options, git }),

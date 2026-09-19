@@ -315,6 +315,9 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     if(store.db.prepare('SELECT id FROM projects WHERE code=?').get(p.code))throw new HttpError(409,'此專案代號已存在，請使用其他代號');
     const directory=prepareProjectDirectory(p.path,{createIfMissing:p.createIfMissing});
     const pid=id();store.db.prepare('INSERT INTO projects VALUES (?,?,?,?)').run(pid,p.code,p.name,directory.path);
+    // 只有 TaskFlow 剛建立的空資料夾才順手初始化版本庫；使用者指定的既有資料夾一律不碰，
+    // 由第一個任務開始時的既有流程處理（見 git-workspace.js 的 ensureProjectRepository）。
+    if(directory.created)try{gitWorkspace.ensureRepository(directory.path,{projectRoot:directory.path,managedProjectsRoot:store.setting('defaultProjectRoot','')||null});}catch{}
     res.status(201).json({...store.project(pid),directoryCreated:directory.created});
   });
   app.post('/api/admin/project-root',admin,(req,res)=>{

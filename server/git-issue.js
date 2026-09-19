@@ -129,7 +129,12 @@ function inspectProject(store, task, gitWorkspace) {
   const project = store.project(task.projectId);
   if (!project || !existsSync(project.path)) throw new HttpError(409, '專案資料夾不存在，無法重新檢查 Git 狀態。');
   try {
-    return gitWorkspace.inspect(project.path);
+    // 重新檢查一定要重跑 detection，不能拿 task.gitIssue 裡的舊判定當真相：repository topology
+    // 是會變的（managed-uninitialized → git init → normal），舊快照只是 diagnostic。
+    return gitWorkspace.inspect(project.path, {
+      projectRoot: project.path,
+      managedProjectsRoot: store.setting('defaultProjectRoot', '') || null,
+    });
   } catch (e) {
     // Git 指令本身失敗（權限、版本庫損毀…）永遠不能被當成「工作目錄乾淨」，
     // 照實回報給使用者，blocker 保持原狀。
@@ -237,6 +242,11 @@ export function decideGitIssue(store, user, taskId, { issueId, action } = {}, { 
   }
   // 其他 reason（受保護分支、巢狀版本庫…）無法只靠 git status 斷定已解決：清除 blocker
   // 讓 runner 重跑同一份守門，若仍未處理會立刻再擋下來，不會偷偷放行。
+  //
+  // nested_repository 是唯一有可能「不需要使用者做任何事」就解除的：TaskFlow 管理的專案
+  // 資料夾在還沒 git init 前會被判成上層版本庫的子目錄，重新檢查時會得到
+  // managed-uninitialized，下一次派工由 TaskFlow 自己初始化版本庫即可。
+  const selfResolvable = request.reason === 'nested_repository' && state.policy && !state.policy.blocked;
   archive(task, 'recheck', user);
   task.gitIssue = {
     ...task.gitIssue, status: 'resolved', resolvedAt: now(), resolvedBy: user.id,
@@ -248,6 +258,8 @@ export function decideGitIssue(store, user, taskId, { issueId, action } = {}, { 
   store.event(taskId, request.reason === 'dirty_working_tree' ? 'git_recheck_clean' : 'git_rechecked',
     request.reason === 'dirty_working_tree'
       ? `Git working tree 已乾淨，任務恢復${resumeLabel(request.resumeStatus)}。`
-      : `${user.name} 已處理 Git 狀態並要求重新檢查；守門會在下一次派工前重跑，未通過前不執行工作。任務恢復${resumeLabel(request.resumeStatus)}。`);
+      : selfResolvable
+        ? `重新檢查後，此專案不再被判定為其他版本庫的子目錄（目前判定：${state.repository?.repositoryType || '未知'}）${state.repository?.needsGitInit ? '，TaskFlow 會在下一次派工前為它建立獨立的 Git 版本庫' : ''}。任務恢復${resumeLabel(request.resumeStatus)}。`
+        : `${user.name} 已處理 Git 狀態並要求重新檢查；守門會在下一次派工前重跑，未通過前不執行工作。任務恢復${resumeLabel(request.resumeStatus)}。`);
   return task;
 }

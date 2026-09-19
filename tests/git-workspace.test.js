@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   createGitRunner, createGitWorkspace, GitSafetyError, taskBranchName,
   isProtectedBranch, isUnsafeToCommit, inspectRepository, prepareTaskWorkspace, assertWorkingBranch,
+  ensureProjectRepository,
 } from '../server/git-workspace.js';
+import { detectRepositoryInfo, evaluateRepositoryPolicy, samePath } from '../server/git-repository.js';
 
 const git = createGitRunner();
 const workspace = createGitWorkspace({ git });
@@ -227,7 +229,12 @@ test('分支命名與受保護清單', () => {
 test('inspectRepository 回報非版本庫、乾淨與髒污狀態', t => {
   const root = sandbox(t), path = project(root);
   writeFileSync(join(path, 'a.js'), '1\n');
-  assert.deepEqual(inspectRepository(path, { git }), { isRepository: false, repositoryPath: null, nested: false });
+  const absent = inspectRepository(path, { git });
+  assert.equal(absent.isRepository, false);
+  assert.equal(absent.repositoryPath, null);
+  assert.equal(absent.nested, false);
+  assert.equal(absent.repository.repositoryType, 'non-git');
+  assert.equal(absent.policy.nextAction, 'git-init');
   existingRepo(path);
   const clean = inspectRepository(path, { git });
   assert.ok(clean.isRepository && clean.branch === 'main' && clean.dirty.length === 0 && !clean.nested);
@@ -431,4 +438,253 @@ test('Rollback：撤銷 merge commit，不必回頭找舊資料夾', t => {
   assert.match(run(path, 'log', '-1', '--format=%s'), /撤銷/);
   assert.ok(run(path, 'cat-file', '-t', merged.commit), '原本的 merge commit 仍留在歷史中');
   assert.equal(run(path, 'rev-list', '--count', 'HEAD'), '4');
+});
+
+// ── Repository topology 回歸測試 ────────────────────────────────────────────────
+//
+// 這一組測試釘住 git-repository.js 的 canonical model。每一個 case 都對應一種真實會遇到的
+// 目錄結構，重點在於「Git 語意」與「TaskFlow 產品語意」不一致時，誰說了算：
+//   - working tree root 一律以 `git rev-parse --show-toplevel` 為準（不向上找 .git）
+//   - 唯一的例外是 TaskFlow 自己管理、但還沒 git init 的專案 root（managed-uninitialized）
+//
+// tmpdir 在部分平台上是 symlink（macOS 的 /tmp → /private/tmp），而 git 回報的是 realpath，
+// 所以這裡的 sandbox 一律先 realpath 再使用，否則路徑比對會假性失敗。
+const realSandbox = t => realpathSync(sandbox(t));
+
+/** F:\TaskFlow 的縮影：外層 repository + 被忽略的 Projects/ 與 data/ 兩個資料夾。 */
+function taskflowLayout(root) {
+  const taskflow = join(root, 'TaskFlow');
+  mkdirSync(taskflow, { recursive: true });
+  existingRepo(taskflow);
+  writeFileSync(join(taskflow, '.gitignore'), 'data/\nProjects/\n');
+  run(taskflow, 'add', '.');
+  run(taskflow, 'commit', '-m', 'ignore generated folders');
+  const projectsRoot = join(taskflow, 'Projects');
+  const worktreesDir = join(taskflow, 'data', 'worktrees');
+  mkdirSync(projectsRoot, { recursive: true });
+  mkdirSync(worktreesDir, { recursive: true });
+  return { taskflow, projectsRoot, worktreesDir };
+}
+
+test('topology A：TaskFlow 管理的專案尚未 git init，不得判成巢狀版本庫', t => {
+  const root = realSandbox(t);
+  const { taskflow, projectsRoot } = taskflowLayout(root);
+  const managed = join(projectsRoot, 'new-project');
+  mkdirSync(managed, { recursive: true });
+
+  // 純 Git 語意：--show-toplevel 會一路解析到 F:\TaskFlow。這個結果本身沒有錯……
+  assert.equal(run(managed, 'rev-parse', '--show-toplevel'), taskflow.replaceAll('\\', '/'));
+  assert.equal(detectRepositoryInfo(managed, { git }).repositoryType, 'subdirectory',
+    '沒有 TaskFlow context 時，它在 Git 語意上確實只是子目錄');
+
+  // ……但帶上 TaskFlow 自己的 project metadata 之後，它是一個尚未初始化的獨立專案 root。
+  const info = detectRepositoryInfo(managed, { git, projectRoot: managed, managedProjectsRoot: projectsRoot });
+  assert.equal(info.repositoryType, 'managed-uninitialized');
+  assert.equal(info.isGit, false);
+  assert.equal(info.isManagedProject, true);
+  assert.equal(info.isRepositoryRoot, true);
+  assert.equal(info.isSubdirectory, false);
+  assert.equal(info.needsGitInit, true);
+  assert.equal(info.branch, null, '不得把上層版本庫的分支當成這個專案的分支');
+  assert.ok(samePath(info.inheritedOuterRepository, taskflow));
+
+  assert.deepEqual(evaluateRepositoryPolicy(info),
+    { blocked: false, requiresUserAction: false, nextAction: 'git-init', blockReason: null });
+
+  const state = inspectRepository(managed, { git, projectRoot: managed, managedProjectsRoot: projectsRoot });
+  assert.equal(state.nested, false, '這正是先前誤判成 nested_repository 的來源');
+});
+
+test('topology B：managed project 派工時自行初始化版本庫，之後是正常的 repository root', t => {
+  const root = realSandbox(t);
+  const { taskflow, projectsRoot } = taskflowLayout(root);
+  const managed = join(projectsRoot, 'new-project');
+  mkdirSync(managed, { recursive: true });
+  const outerHead = run(taskflow, 'rev-parse', 'HEAD');
+
+  const prepared = workspace.prepare({
+    projectPath: managed, taskId, title: 'managed project', worktreesDir: join(root, 'wt'),
+    projectRoot: managed, managedProjectsRoot: projectsRoot,
+  });
+
+  assert.ok(existsSync(join(managed, '.git')), '專案必須取得自己的版本庫');
+  assert.equal(run(managed, 'rev-parse', '--show-toplevel'), managed.replaceAll('\\', '/'));
+  assert.equal(prepared.git.repositoryPath, managed);
+  assert.equal(prepared.git.baseBranch, 'main');
+  assert.ok(prepared.events.some(e => e.kind === 'git_init' && e.message.includes('上層版本庫')),
+    '工作紀錄要說明為什麼這裡多出一個版本庫');
+  assert.equal(run(taskflow, 'rev-parse', 'HEAD'), outerHead, '上層版本庫不得被改動');
+  assert.equal(run(taskflow, 'status', '--porcelain'), '', '上層版本庫的工作樹不得出現新的變更');
+
+  // 初始化之後就是一個合法的獨立 repository root（實體上仍在 TaskFlow 底下，故為 nested-independent）。
+  const after = detectRepositoryInfo(managed, { git, projectRoot: managed, managedProjectsRoot: projectsRoot });
+  assert.equal(after.repositoryType, 'nested-independent');
+  assert.equal(after.isRepositoryRoot, true);
+  assert.equal(after.needsGitInit, false);
+  assert.equal(evaluateRepositoryPolicy(after).blocked, false);
+});
+
+test('topology C：真正的 repository 子目錄仍然被擋，且不會被 managed context 放行', t => {
+  const root = realSandbox(t);
+  const repo = join(root, 'repo');
+  mkdirSync(repo, { recursive: true });
+  existingRepo(repo);
+  const frontend = join(repo, 'frontend');
+  mkdirSync(frontend, { recursive: true });
+  writeFileSync(join(frontend, 'a.js'), '1\n');
+
+  const info = detectRepositoryInfo(frontend, { git });
+  assert.equal(info.repositoryType, 'subdirectory');
+  assert.equal(info.isSubdirectory, true);
+  assert.equal(info.isRepositoryRoot, false);
+  assert.deepEqual(evaluateRepositoryPolicy(info),
+    { blocked: true, requiresUserAction: true, nextAction: 'user-action', blockReason: 'repository-subdirectory' });
+
+  // 就算它被登記成專案，只要不在 TaskFlow 管理的專案存放位置底下，就不是 managed project。
+  const registered = detectRepositoryInfo(frontend, { git, projectRoot: frontend, managedProjectsRoot: join(root, 'elsewhere') });
+  assert.equal(registered.repositoryType, 'subdirectory');
+  assert.equal(registered.isManagedProject, false);
+
+  assert.throws(() => workspace.prepare({
+    projectPath: frontend, taskId, title: 'subdirectory', worktreesDir: join(root, 'wt'),
+    projectRoot: frontend, managedProjectsRoot: join(root, 'elsewhere'),
+  }), e => e.reason === 'nested_repository');
+  // 被擋下來時絕對不能就地 git init：那會在別人追蹤中的工作樹裡塞一個內嵌版本庫。
+  assert.ok(!existsSync(join(frontend, '.git')));
+  assert.equal(ensureProjectRepository(frontend, { git, projectRoot: frontend, managedProjectsRoot: join(root, 'elsewhere') }).initialized, false);
+});
+
+test('topology D：linked worktree 實體位於另一個 repository 底下，仍是合法的 worktree root', t => {
+  const root = realSandbox(t);
+  const { taskflow, projectsRoot, worktreesDir } = taskflowLayout(root);
+  const source = join(projectsRoot, 'idv-web');
+  mkdirSync(source, { recursive: true });
+  existingRepo(source);
+  const worktree = join(worktreesDir, '77fe4c5a-3b76-4667-a1fe-9fa4426a3132');
+  run(source, 'worktree', 'add', '-b', 'taskflow/77fe4c5a', worktree);
+
+  const info = detectRepositoryInfo(worktree, { git });
+  assert.equal(info.repositoryType, 'linked-worktree');
+  assert.equal(info.isLinkedWorktree, true);
+  assert.equal(info.isRepositoryRoot, true);
+  assert.equal(info.isSubdirectory, false);
+  assert.ok(samePath(info.worktreeRoot, worktree));
+  assert.ok(samePath(info.commonGitDir, join(source, '.git')));
+  assert.ok(!samePath(info.gitDir, info.commonGitDir), 'linked worktree 有自己的 git-dir');
+  assert.ok(samePath(info.mainWorktree, source));
+  assert.ok(samePath(info.physicalParentRepository, taskflow), '實體父版本庫只當診斷資訊');
+  assert.equal(evaluateRepositoryPolicy(info).blocked, false,
+    `F:\\TaskFlow\\.git 存在也不得影響結果`);
+  assert.equal(inspectRepository(worktree, { git }).nested, false);
+});
+
+test('topology E／F：nested independent repository 合法，純資料夾為 non-git', t => {
+  const root = realSandbox(t);
+  const outer = join(root, 'outer');
+  mkdirSync(outer, { recursive: true });
+  existingRepo(outer);
+  const inner = join(outer, 'inner');
+  mkdirSync(inner, { recursive: true });
+  existingRepo(inner);
+
+  const nested = detectRepositoryInfo(inner, { git });
+  assert.equal(nested.repositoryType, 'nested-independent');
+  assert.equal(nested.isRepositoryRoot, true);
+  assert.equal(nested.isSubdirectory, false);
+  assert.ok(samePath(nested.physicalParentRepository, outer));
+  assert.equal(evaluateRepositoryPolicy(nested).blocked, false);
+
+  const plain = join(root, 'plain');
+  mkdirSync(plain, { recursive: true });
+  const nonGit = detectRepositoryInfo(plain, { git });
+  assert.equal(nonGit.repositoryType, 'non-git');
+  assert.equal(nonGit.isGit, false);
+  assert.equal(nonGit.needsGitInit, true);
+  assert.equal(evaluateRepositoryPolicy(nonGit).nextAction, 'git-init');
+
+  const normal = detectRepositoryInfo(outer, { git });
+  assert.equal(normal.repositoryType, 'normal');
+  assert.equal(normal.isRepositoryRoot, true);
+  assert.equal(evaluateRepositoryPolicy(normal).nextAction, 'continue');
+});
+
+test('topology G：專案建立時就取得自己的版本庫（ensureProjectRepository）', t => {
+  const root = realSandbox(t);
+  const { taskflow, projectsRoot } = taskflowLayout(root);
+  const managed = join(projectsRoot, 'brand-new');
+  mkdirSync(managed, { recursive: true });
+
+  const outcome = ensureProjectRepository(managed, { git, projectRoot: managed, managedProjectsRoot: projectsRoot });
+  assert.equal(outcome.initialized, true);
+  assert.equal(run(managed, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main');
+  assert.equal(run(taskflow, 'status', '--porcelain'), '', '上層版本庫不得看到任何新變更');
+
+  // 已經初始化過就不再重複動作。
+  assert.equal(ensureProjectRepository(managed, { git, projectRoot: managed, managedProjectsRoot: projectsRoot }).initialized, false);
+
+  // 之後派工走的是既有 repository 路徑，不會再 init 一次。
+  const prepared = workspace.prepare({
+    projectPath: managed, taskId, title: 'brand new', worktreesDir: join(root, 'wt'),
+    projectRoot: managed, managedProjectsRoot: projectsRoot,
+  });
+  assert.ok(!prepared.events.some(e => e.kind === 'git_init'));
+  assert.equal(prepared.git.repositoryPath, managed);
+});
+
+test('舊版 git（沒有 merge-tree --write-tree）：專案未設定 git 身分時仍能正確試算合併', t => {
+  const root = realSandbox(t);
+  const path = join(root, 'repo');
+  mkdirSync(path, { recursive: true });
+  // 刻意不設定 user.email／user.name：TaskFlow 明確支援這種專案（commitArgs 會補上暫時身分）。
+  run(path, 'init');
+  run(path, 'symbolic-ref', 'HEAD', 'refs/heads/main');
+  writeFileSync(join(path, 'a.txt'), 'one\n');
+  run(path, 'add', '.');
+  run(path, '-c', 'user.email=seed@example.test', '-c', 'user.name=Seed', 'commit', '-m', 'initial');
+
+  // git < 2.38 沒有 `merge-tree --write-tree`，會退回「真的試一次合併再 abort」那條路徑。
+  const oldGit = (cwd, args, options) => args[0] === 'merge-tree'
+    ? { ok: false, stdout: '', stderr: 'usage: git merge-tree <base-tree> <branch1> <branch2>\n' }
+    : git(cwd, args, options);
+  const oldWorkspace = createGitWorkspace({ git: oldGit });
+
+  const prepared = oldWorkspace.prepare({ projectPath: path, taskId, title: 'old git merge', worktreesDir: join(root, 'wt') });
+  writeFileSync(join(prepared.git.workingDirectory, 'b.txt'), 'two\n');
+  const committed = oldWorkspace.commit({
+    workingDirectory: prepared.git.workingDirectory, workingBranch: prepared.git.workingBranch,
+    subject: 'taskflow(execute): add b',
+  });
+  assert.equal(committed.committed, true);
+
+  // 沒有 committer identity 時，這一步以前會失敗並被誤判成「有衝突、但沒有任何衝突檔案」，
+  // 於是合併永遠被擋住。現在必須正常完成。
+  const merged = oldWorkspace.merge({
+    repositoryPath: path, baseBranch: 'main', workingBranch: prepared.git.workingBranch,
+    subject: 'taskflow(merge): add b',
+  });
+  assert.equal(merged.merged, true, '沒有設定 git 身分不得被誤判成合併衝突');
+  assert.ok(existsSync(join(path, 'b.txt')));
+  assert.equal(run(path, 'log', '-1', '--format=%P').split(' ').length, 2, '必須是 --no-ff 合併');
+
+  // 真正的衝突在同一條退路上仍要被認出來，而且正式分支不得留在解到一半的狀態。
+  const second = '284abcde-0000-4000-8000-000000000002';
+  const conflicting = oldWorkspace.prepare({ projectPath: path, taskId: second, title: 'conflict', worktreesDir: join(root, 'wt') });
+  writeFileSync(join(conflicting.git.workingDirectory, 'a.txt'), 'from task\n');
+  oldWorkspace.commit({
+    workingDirectory: conflicting.git.workingDirectory, workingBranch: conflicting.git.workingBranch,
+    subject: 'taskflow(execute): rewrite a',
+  });
+  writeFileSync(join(path, 'a.txt'), 'from main\n');
+  run(path, 'add', '.');
+  run(path, '-c', 'user.email=seed@example.test', '-c', 'user.name=Seed', 'commit', '-m', 'main edits a');
+
+  const blocked = oldWorkspace.merge({
+    repositoryPath: path, baseBranch: 'main', workingBranch: conflicting.git.workingBranch,
+    subject: 'taskflow(merge): rewrite a',
+  });
+  assert.equal(blocked.merged, false);
+  assert.equal(blocked.reason, 'conflict');
+  assert.ok(blocked.files.includes('a.txt'));
+  assert.equal(readText(join(path, 'a.txt')), 'from main\n', '正式分支的內容不得被動到');
+  assert.equal(run(path, 'status', '--porcelain'), '', '不得留在解到一半的 merge 狀態');
 });

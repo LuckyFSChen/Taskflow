@@ -148,7 +148,7 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
     if(gitMode&&gitWorkspace.available(project.path)){
       // 使用者明確確認過的未提交修改，指紋一致時不再阻塞（見 git-issue.js）。
       // 指紋不同代表又有新的修改，prepare() 會照樣擋下來重新詢問。
-      const prepared=gitWorkspace.prepare({projectPath:project.path,taskId:t.id,title:t.title,worktreesDir:join(dataDir,'worktrees'),protectedBranches:protectedBranches(),approvedDirtyFingerprint:t.gitDirtyApproval?.fingerprint||null});
+      const prepared=gitWorkspace.prepare({projectPath:project.path,taskId:t.id,title:t.title,worktreesDir:join(dataDir,'worktrees'),protectedBranches:protectedBranches(),approvedDirtyFingerprint:t.gitDirtyApproval?.fingerprint||null,projectRoot:project.path,managedProjectsRoot:store.setting('defaultProjectRoot','')||null});
       t.git=prepared.git;t.workspace=prepared.git.workingDirectory;persistWorkspace();
       for(const e of prepared.events)store.event(t.id,e.kind,e.message);
       return branchGuard();

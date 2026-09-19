@@ -40,6 +40,65 @@ Agent 在 worktree 內修改檔案
 `taskflow/<taskId 前 8 碼>-<標題 slug>`，例如 `taskflow/184abcde-fix-line-webhook`。
 標題若是中文會被濾掉，此時只保留 `taskflow/184abcde`，仍可對應任務。
 
+## Repository topology 判斷（RepositoryInfo）
+
+「這個路徑到底是什麼」由 `server/git-repository.js` 單一入口回答，其他模組不自己拼湊
+`git rev-parse` 的結果，也不自己向上找 `.git`。判斷與決策刻意分開：
+
+```
+detectRepositoryInfo(projectPath, { git, projectRoot, managedProjectsRoot })
+    → RepositoryInfo      只描述現況，不做決策
+
+evaluateRepositoryPolicy(repositoryInfo)
+    → { blocked, requiresUserAction, nextAction, blockReason }
+```
+
+### 三個判斷原則
+
+1. **Git 語意優先於 filesystem 結構。** working tree root 一律以 `git rev-parse --show-toplevel`
+   為準。向上搜尋 `.git` 只寫進 `physicalParentRepository` 當診斷資訊，**不得**參與 blocked 判斷——
+   那會誤傷 linked worktree、nested independent repository 與 submodule。
+2. **`.git` 只判斷存不存在，不判斷是不是資料夾。** linked worktree 的 `.git` 是一個文字檔
+   （內容為 `gitdir: ...`），用 `isDirectory()` 判斷會把合法的 worktree 判成非 repository。
+3. **Git 語意不是唯一的事實來源。** TaskFlow 自己在「預設專案存放位置」底下建立的專案，在還沒
+   `git init` 前 `--show-toplevel` 會穿透到上層 repository。那個結果在 Git 語意上正確，但在
+   TaskFlow 的產品語意上錯誤：它是一個尚未初始化的獨立專案 root。
+
+### repositoryType 與 policy
+
+| repositoryType | 什麼情況 | blocked | nextAction |
+| --- | --- | --- | --- |
+| `normal` | `projectPath == show-toplevel`，實體上層沒有其他 repository | false | `continue` |
+| `nested-independent` | 同上，但實體上位於另一個 repository 底下（例如 `Projects/idv-web`） | false | `continue` |
+| `linked-worktree` | `git-dir != git-common-dir`，且 `worktree list --porcelain` 列有這個 root | false | `continue` |
+| `managed-uninitialized` | TaskFlow 管理的專案 root，還沒有自己的 `.git` | false | `git-init` |
+| `non-git` | 完全不在任何 Git context 裡 | false | `git-init` |
+| `subdirectory` | `projectPath != show-toplevel`，且不是上面任何一種 | **true** | `user-action` |
+
+認不出來的型別一律 `blocked`：放行一個看不懂的狀態，比多問一次危險得多。
+
+### managed project root
+
+一個路徑要被當成 TaskFlow 管理的專案 root，必須**同時**滿足兩個條件：
+
+- 與 TaskFlow DB 記錄的 project root 完全一致（不是它的子目錄）
+- 位於平台設定「預設專案存放位置」（`defaultProjectRoot`）底下
+
+第二個條件是刻意的：使用者手動註冊的 `C:\repo\frontend` 雖然也在 DB 裡，但它是別人 repository
+的真實子目錄，仍必須走 `subdirectory` 的保護。
+
+`managed-uninitialized` 的出路是 TaskFlow 自己 `git init`，不是叫使用者去處理，所以它**不會**
+產生 `gitIssue`。專案建立時（LINE 建專案、管理端建立新資料夾）就會呼叫 `ensureProjectRepository()`
+先劃清 repository 邊界；萬一漏掉，第一個任務的 `prepareTaskWorkspace()` 會再補一次。
+
+### repository topology 是會變的
+
+`managed-uninitialized → git init → normal` 是正常的演進，所以 `task.gitIssue` 裡的判定只是
+**diagnostic snapshot**，不是永久真相。任務「重新檢查」或恢復時一律重跑 `detectRepositoryInfo()`
+再重新 evaluate policy，舊的 `nested_repository` 不會把任務永遠卡住。
+
+---
+
 ## 安全守門（deterministic，不依賴 AI 判斷）
 
 | 情況 | 行為 |
@@ -48,7 +107,7 @@ Agent 在 worktree 內修改檔案
 | 工作目錄被切到 main／master／production／release／develop | 停止，`protected_branch`，訊息為「Git safety check failed.」 |
 | 工作目錄被切到其他分支 | 停止，`branch_changed`；TaskFlow 不會自動切回去 |
 | 工作目錄處於 detached HEAD | 停止，`detached_head` |
-| 專案位於另一個 repository 之內 | 停止，`nested_repository`；不會在上層版本庫建立分支 |
+| 專案是另一個 repository 的子目錄 | 停止，`nested_repository`；不會在上層版本庫建立分支。判定依據見下面的 Repository topology 一節——linked worktree、nested independent repository 與 TaskFlow 自己管理的專案 root 都不算 |
 | repository 還沒有任何 commit | 停止，`no_commits`；請先自行完成第一次 commit |
 | 工作目錄已被手動刪除 | 停止，`worktree_missing` |
 
@@ -369,6 +428,13 @@ node --test tests/git-workspace.test.js tests/git-runner.test.js tests/git-revie
 Phase 1：新專案建立版本庫且機密不進入歷史、既有專案不重新 init 也不改 main、未提交修改時停止且
 不動使用者內容、worktree 重複使用、受保護分支／detached HEAD／分支被換掉的守門、破壞性指令
 被擋下、巢狀 repository 與無 commit 的專案、關閉 Git 模式時退回舊快照、刪除專案時一併清除 worktree。
+
+Repository topology（`git-workspace.test.js` 的 topology A–G）：TaskFlow 管理的專案在 `git init`
+之前不得被判成 `nested_repository`、派工時自行初始化且不動上層版本庫、真正的 repository 子目錄仍被擋
+且不會就地 `git init`、linked worktree 實體位於另一個 repository 底下仍是合法 worktree root、
+nested independent repository 合法、純資料夾為 `non-git`、專案建立時就取得自己的版本庫。
+另有一個回歸測試釘住舊版 git（`< 2.38`，沒有 `merge-tree --write-tree`）的合併退路：專案未設定
+`user.name`／`user.email` 時不得被誤判成「有衝突、但沒有任何衝突檔案」。
 
 Phase 2：有修改才 commit、沒修改不留空 commit、機密與 `.taskflow/` 不進版、刪除與改名都被保存、
 commit 前重跑分支守門、規劃階段不 commit、`passed=false` 與引擎失敗的階段一樣保存成果但任務不會
