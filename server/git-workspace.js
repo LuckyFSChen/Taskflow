@@ -447,6 +447,15 @@ function assertMergeReady({ repositoryPath, baseBranch, git }) {
       `合併前專案目錄必須停在 ${baseBranch}，但目前在 ${state.branch || 'detached HEAD'}。TaskFlow 不會替你切換分支，請先自行切換後再核准合併。`,
       { branch: state.branch, baseBranch });
   }
+  // 「衝突已解決但尚未 commit」（MERGE_HEAD 仍在）與一般 dirty_working_tree 是完全不同的處境：
+  // 前者不需要使用者再解一次衝突，只差一個 commit 或一次 abort，訊息必須分開辨識，
+  // 不能被下面籠統的 dirty_working_tree 蓋過去。因此在 dirty 檢查之前先看 MERGE_HEAD。
+  const merge = inspectMergeState({ repositoryPath, git });
+  if (merge.mergeInProgress) {
+    throw new GitSafetyError('merge_in_progress',
+      `${baseBranch} 目前處於一個進行中的 merge（MERGE_HEAD 仍存在）。這通常代表衝突已經解決但尚未完成 commit。\n\n${merge.unresolvedFiles.length ? `仍未解決的檔案：\n${merge.unresolvedFiles.join('\n')}\n\n` : ''}請先在專案目錄完成這個 merge（commit）或執行 git merge --abort 中止它，再回來核准合併。`,
+      { unresolvedFiles: merge.unresolvedFiles, branch: state.branch });
+  }
   if (state.dirty.length) {
     throw new GitSafetyError('dirty_working_tree',
       `${baseBranch} 目前存在未提交修改，已停止合併。\n\nTaskFlow 不會自動修改或清除這些內容。\n\n${state.dirty.slice(0, 30).join('\n')}`,
@@ -493,10 +502,22 @@ export function mergeTaskBranch({ repositoryPath, baseBranch, workingBranch, sub
   }
 
   const message = body ? `${subject}\n\n${body}` : subject;
-  git(repositoryPath, [...commitArgs(git, repositoryPath), 'merge', '--no-ff', '--no-edit', '-m', message, workingBranch]);
+  // pre-check（merge-tree）通過後，實際執行仍可能失敗——兩者之間可能有新的變化，或舊版 git 的
+  // 探測本身就不夠準。這裡不信任這個 command 的 exit code：allowFailure，執行完一律用
+  // inspectMergeState 讀 Git 本身的真實狀態做最終判斷，成功與否由狀態決定，不是由 AI 或
+  // command 回報的文字決定。
+  git(repositoryPath, [...commitArgs(git, repositoryPath), 'merge', '--no-ff', '--no-edit', '-m', message, workingBranch], { allowFailure: true });
+
+  const after = inspectMergeState({ repositoryPath, git });
+  if (after.mergeInProgress || after.unresolvedFiles.length) {
+    const files = after.unresolvedFiles.length ? after.unresolvedFiles : after.dirty;
+    // 不管這次衝突是不是我們剛剛觸發的，都不留下解到一半的 merge：abort 讓 baseBranch 回到
+    // 合併前的乾淨狀態，不需要使用者自己動手清理，也不會有殘留的 MERGE_HEAD。
+    git(repositoryPath, ['merge', '--abort'], { allowFailure: true, authorizedAs: 'abort_merge' });
+    return { merged: false, reason: 'conflict', files, hint: CONFLICT_HINT, baseBranch, workingBranch };
+  }
 
   // 合併後再確認一次：工作樹必須是乾淨的，HEAD 必須真的包含任務分支。
-  const after = inspectRepository(repositoryPath, { git });
   const contains = git(repositoryPath, ['merge-base', '--is-ancestor', workingBranch, 'HEAD'], { allowFailure: true }).ok;
   if (after.dirty.length || !contains) {
     throw new GitSafetyError('merge_incomplete',
