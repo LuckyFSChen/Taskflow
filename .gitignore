@@ -1,6 +1,7 @@
 node_modules/
 dist/
 data/
+Projects/
 .env
 *.log
 cloud-inbox/.wrangler/
