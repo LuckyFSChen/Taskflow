@@ -79,10 +79,16 @@ export function reconcileCompletionState(context = {}) {
   // executor 自己回報 passed=false／有問題／缺 evidence 不算——那只是一份尚未證實的 claim，
   // 缺乏證據並不等於證明失敗，導向 blocked。
   let deterministicFailure = false;
+  // executor／reviewer 的 claim 不能單獨促成 completed：至少要有一項「非 claim」的
+  // deterministic 證據通過（Git commit／合併、測試比對、部署流程、部署驗收、Browser
+  // Validation 其中之一），否則即使 claim 是 passed=true，也只能停在 blocked——
+  // 這正是舊任務資料只剩 claim、沒有任何可核對證據時的情況。
+  let deterministicProofCount = 0;
 
   const block = message => { if (message) blockingReasons.push(message); };
   const warn = message => { if (message) warnings.push(message); };
   const proof = message => { if (message) evidence.push(message); };
+  const deterministicProof = message => { if (message) { evidence.push(message); deterministicProofCount++; } };
 
   // ---- executor / reviewer 的 claim（只是 claim，不是最終依據）-------------
   const exec = context.executorResult;
@@ -106,9 +112,9 @@ export function reconcileCompletionState(context = {}) {
   }
   if (git.workingTreeClean === false) warn('Git 工作樹有尚未提交的修改。');
   else if (git.workingTreeClean === undefined) warn('沒有 Git 工作樹狀態（不適用或尚未執行）。');
-  if (git.headCommit) proof(`目前 head commit：${git.headCommit}`);
+  if (git.headCommit) deterministicProof(`目前 head commit：${git.headCommit}`);
   else warn('沒有可用的 Git commit 記錄（不適用或尚未執行）。');
-  if (git.gitMerge) proof(`已合併到正式分支：${git.gitMerge.commit || git.gitMerge.baseBranch || ''}`.trim());
+  if (git.gitMerge) deterministicProof(`已合併到正式分支：${git.gitMerge.commit || git.gitMerge.baseBranch || ''}`.trim());
 
   // ---- 測試比對／合併後重測 -------------------------------------------------
   let testsRunning = false;
@@ -128,7 +134,7 @@ export function reconcileCompletionState(context = {}) {
     } else if (report.verdict === 'baseline_unavailable' || report.verdict === 'parse_failed') {
       warn(`${label}${report.verdict === 'baseline_unavailable' ? '沒有可用的比對基準' : '無法判讀測試結果'}，未能證明沒有 regression。`);
     } else if (report.verdict === 'no_regression') {
-      proof(`${label}沒有新的失敗。`);
+      deterministicProof(`${label}沒有新的失敗。`);
     }
   }
 
@@ -150,7 +156,7 @@ export function reconcileCompletionState(context = {}) {
         : (stage === 'test' || stage === 'test_main') ? 'testing'
         : 'deploying';
     } else if (deployment.status === 'completed') {
-      proof('部署流程（測試比對／合併／重測／重啟／驗收／推送／清理）已全部完成。');
+      deterministicProof('部署流程（測試比對／合併／重測／重啟／驗收／推送／清理）已全部完成。');
     } else if (deployment.status === 'failed') {
       block(`部署流程失敗：${deployment.failure?.message || '原因不明'}`);
       deterministicFailure = true;
@@ -174,7 +180,7 @@ export function reconcileCompletionState(context = {}) {
       block(`部署驗收未通過：${failedChecks.join('、') || '（未列出項目）'}`);
       deterministicFailure = true;
     } else {
-      proof(`部署驗收通過（${list(runtime.checks).length} 項檢查）。`);
+      deterministicProof(`部署驗收通過（${list(runtime.checks).length} 項檢查）。`);
     }
   } else {
     warn('沒有部署驗收（preview/runtime）結果（不適用或尚未執行）。');
@@ -187,7 +193,7 @@ export function reconcileCompletionState(context = {}) {
       block(`Browser Validation 未通過：${browser.error || browser.notes || '未確認實際互動與結果'}`);
       deterministicFailure = true;
     } else {
-      proof('Browser Validation 已實際執行並通過。');
+      deterministicProof('Browser Validation 已實際執行並通過。');
     }
   } else if (!browser) {
     warn('沒有 Browser Validation 結果（不適用或尚未執行）。');
@@ -219,6 +225,12 @@ export function reconcileCompletionState(context = {}) {
   else if (awaitingUser) status = 'awaiting_user';
   else if (deterministicFailure) status = 'failed';
   else if (blockingReasons.length) status = 'blocked';
+  else if (deterministicProofCount === 0) {
+    // claim（executorResult）本身不算數：沒有任何 Git／測試／部署／驗收／Browser
+    // Validation 的實際證據可核對時，不能只憑 AI 自我宣稱就判定完成。
+    warn('目前只有 executor／reviewer 的 claim，沒有任何 Git、測試、部署或驗收等 deterministic 證據可核對，暫不能判定完成。');
+    status = 'blocked';
+  }
   else status = 'completed';
 
   return {
