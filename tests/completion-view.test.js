@@ -259,6 +259,24 @@ test('沒有新增失敗：放行，並說明基準上原本就有幾項失敗',
   assert.match(view.stages.find(s => s.key === 'test').detail, /既有 3 項/);
 });
 
+test('沒有新增失敗但基準有既有失敗：回傳 existingFailureCount／unchangedFailureCount 供畫面顯示', () => {
+  const view = completionView(withTest({
+    verdict: 'no_regression',
+    newFailures: [], newFailureCount: 0,
+    existingFailures: ['tests/a.test.js > 舊壞掉的測試', 'tests/b.test.js > 另一個舊的'],
+    existingFailureCount: 2,
+    unchangedFailures: ['tests/a.test.js > 舊壞掉的測試', 'tests/b.test.js > 另一個舊的'],
+    unchangedFailureCount: 2,
+    baseline: { ok: true, total: 147, passed: 145, failedCount: 2, failed: [] },
+    current: { ok: true, total: 153, passed: 151, failedCount: 2, failed: [] },
+  }), baseReview());
+  assert.equal(view.canMerge, true);
+  assert.equal(view.test.verdict, 'no_regression');
+  assert.equal(view.test.newFailureCount, 0);
+  assert.equal(view.test.existingFailureCount, 2);
+  assert.equal(view.test.unchangedFailureCount, 2);
+});
+
 test('有新增失敗：擋住合併，並指名是哪幾項', () => {
   const view = completionView(withTest({
     verdict: 'regression',

@@ -155,6 +155,9 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
         <p v-if="view.test.resolvedFailureCount" class="subtle">
           另有 {{view.test.resolvedFailureCount}} 項基準上原本失敗的測試，在這條分支上通過了。
         </p>
+        <p v-if="view.test.existingFailureCount" class="subtle">
+          基準上原本就有 {{view.test.existingFailureCount}} 項失敗，其中 {{view.test.unchangedFailureCount}} 項為既有失敗，尚未修復。
+        </p>
         <p v-if="view.test.verdict==='baseline_unavailable'||view.test.verdict==='parse_failed'" class="subtle">
           這種情況不會自動擋住合併，但也不代表沒有 regression——讀不懂結果就是讀不懂，請自行判斷後再決定。
         </p>
@@ -200,6 +203,9 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
           </ul>
           <p class="subtle">這些在合併前的正式分支與任務分支上都沒有出現。若要退回，請使用下方的「撤銷這次合併」。</p>
         </template>
+        <p v-if="view.mainTest.existingFailureCount" class="subtle">
+          基準上原本就有 {{view.mainTest.existingFailureCount}} 項失敗，其中 {{view.mainTest.unchangedFailureCount}} 項為既有失敗，尚未修復。
+        </p>
       </template>
     </div>
 
