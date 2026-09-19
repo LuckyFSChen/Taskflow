@@ -76,18 +76,34 @@ function mergeDecision(store, user, t, input, gitWorkspace) {
   if (!t.artifactVersion || input.artifactVersion !== t.artifactVersion) throw new HttpError(409, '成果版本不符，請重新查看最新成果後再核准。');
   if (t.gitMerge) throw new HttpError(409, '此任務已經合併過了。');
 
-  const outcome = gitWorkspace.merge({
-    repositoryPath: t.git.repositoryPath,
-    baseBranch: t.git.baseBranch,
-    workingBranch: t.git.workingBranch,
-    subject: `taskflow: ${summarize(t.title)}`.slice(0, 72),
-    body: [
-      `任務：${t.title}（${t.id}）`,
-      `分支：${t.git.workingBranch} → ${t.git.baseBranch}`,
-      `成果版本：${t.artifactVersion}`,
-      `核准合併：${user.name}（${user.id}）於 ${now()}`,
-    ].join('\n'),
-  });
+  let outcome;
+  try {
+    outcome = gitWorkspace.merge({
+      repositoryPath: t.git.repositoryPath,
+      baseBranch: t.git.baseBranch,
+      workingBranch: t.git.workingBranch,
+      subject: `taskflow: ${summarize(t.title)}`.slice(0, 72),
+      body: [
+        `任務：${t.title}（${t.id}）`,
+        `分支：${t.git.workingBranch} → ${t.git.baseBranch}`,
+        `成果版本：${t.artifactVersion}`,
+        `核准合併：${user.name}（${user.id}）於 ${now()}`,
+      ].join('\n'),
+    });
+  } catch (e) {
+    // MERGE_HEAD 仍存在（衝突已解決但尚未 commit，或有人在正式分支留下一個進行中的 merge）
+    // 是明確可辨識的狀態，不能讓它變成無結構的純文字錯誤直接往外拋：一樣寫入 t.gitConflict、
+    // 產生 Human Action Request，讓使用者知道要處理什麼，之後才有機會重新核對狀態。
+    if (e instanceof GitSafetyError && e.reason === 'merge_in_progress') {
+      const files = e.details?.unresolvedFiles || [];
+      t.gitConflict = { id: id(), files, hint: e.message, baseBranch: t.git.baseBranch, workingBranch: t.git.workingBranch, at: now() };
+      store.saveTask(t);
+      store.event(t.id, 'git_conflict', `合併 ${t.git.workingBranch} 時發現正式分支上有一個進行中的 merge（尚未 commit），已停止${files.length ? `：${files.join('、')}` : ''}`);
+      store.notify(t, `合併尚未完成：${e.message}`);
+      return t;
+    }
+    throw e;
+  }
 
   if (!outcome.merged && outcome.reason === 'conflict') {
     t.gitConflict = { id: id(), files: outcome.files, hint: outcome.hint, baseBranch: outcome.baseBranch, workingBranch: outcome.workingBranch, at: now() };
@@ -96,13 +112,25 @@ function mergeDecision(store, user, t, input, gitWorkspace) {
     store.notify(t, `合併發生衝突，尚未合併。\n\n${outcome.files.join('\n')}\n\n${outcome.hint}`);
     return t;
   }
-  if (!outcome.merged && outcome.reason === 'already_merged') throw new HttpError(409, '此分支的內容已經在正式分支上了。');
+  if (!outcome.merged && outcome.reason === 'already_merged') {
+    // 這個分支的內容已經在正式分支上——可能是使用者已經自行解決衝突並手動完成了 merge commit。
+    // mergeTaskBranch 在回報 already_merged 之前已經用 assertMergeReady／merge-base --is-ancestor
+    // 重新核對過 Git 狀態（正式分支乾淨、確實在 baseBranch 上、HEAD 真的包含 workingBranch），
+    // 所以這裡不再用 409 擋住使用者，而是把這次 reconciliation 的結果視為合併完成，讓流程繼續。
+    const state = gitWorkspace.inspect(t.git.repositoryPath);
+    outcome = { merged: true, commit: state.head, baseBranch: outcome.baseBranch, workingBranch: outcome.workingBranch, reconciled: true };
+  }
 
   t.gitConflict = null;
-  t.gitMerge = { commit: outcome.commit, baseBranch: outcome.baseBranch, workingBranch: outcome.workingBranch, artifactVersion: t.artifactVersion, by: user.id, at: now() };
+  t.gitMerge = {
+    commit: outcome.commit, baseBranch: outcome.baseBranch, workingBranch: outcome.workingBranch,
+    artifactVersion: t.artifactVersion, by: user.id, at: now(), ...(outcome.reconciled ? { reconciled: true } : {}),
+  };
   t.publishApproval = { by: user.id, at: now(), artifactVersion: t.artifactVersion };
   store.saveTask(t);
-  store.event(t.id, 'git_merged', `${user.name} 核准並合併 ${outcome.workingBranch} 至 ${outcome.baseBranch}（${outcome.commit.slice(0, 8)}）`);
+  store.event(t.id, 'git_merged', outcome.reconciled
+    ? `${user.name} 核准合併；偵測到 ${outcome.workingBranch} 已經在 ${outcome.baseBranch} 上（可能已手動解決衝突並完成 merge commit），重新核對 Git 狀態後視為合併完成（${outcome.commit.slice(0, 8)}）`
+    : `${user.name} 核准並合併 ${outcome.workingBranch} 至 ${outcome.baseBranch}（${outcome.commit.slice(0, 8)}）`);
 
   if (input.cleanup !== false) applyCleanup(store, t, { gitWorkspace, deleteUnmerged: false });
   store.notify(t, `成果已合併至 ${outcome.baseBranch}（${outcome.commit.slice(0, 8)}）。`);
