@@ -191,6 +191,26 @@ test('比對：多出一項失敗就是 regression，並指名是哪一項', () 
   assert.deepEqual(outcome.resolvedFailures, ['tests/login.test.js > 登入失敗會擋住']);
 });
 
+test('比對：需求範例——既有 2 項失敗，新增 6 個通過的測試，不算 regression', () => {
+  // 對照需求描述的具體數字：
+  //   Baseline: 145 passed / 2 failed
+  //   Current:  151 passed / 2 failed（同一組失敗識別碼）
+  // 預期：existingFailures 2 項、newFailures 0 項、unchangedFailures 2 項，verdict 是 no_regression。
+  const failedIdentities = [
+    'tests/legacy-import.test.js > 匯入舊格式檔案',
+    'tests/legacy-export.test.js > 匯出相容舊版欄位',
+  ];
+  const baseline = { ok: true, reason: null, total: 147, passed: 145, failed: failedIdentities };
+  const current = { ok: true, reason: null, total: 153, passed: 151, failed: failedIdentities };
+
+  const outcome = compareTestRuns(baseline, current);
+
+  assert.equal(outcome.verdict, VERDICTS.NO_REGRESSION);
+  assert.equal(outcome.existingFailures.length, 2);
+  assert.deepEqual(outcome.newFailures, []);
+  assert.equal(outcome.unchangedFailures.length, 2);
+});
+
 test('比對：拿不到基準時不判定為通過，也不判定為 regression', () => {
   const current = parseTapOutput(flat, { root: '/repo' });
   const outcome = compareTestRuns({ ok: false, reason: 'not_on_base_branch', failed: [] }, current);

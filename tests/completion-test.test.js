@@ -84,6 +84,11 @@ test('沒有新增失敗時判定 no_regression，並在兩個目錄各跑一次
   assert.equal(report.baseline.total, 3);
   assert.equal(report.current.total, 3);
 
+  // 既有失敗（c）在這次沒有新增、也還沒修好，兩個公開欄位應該一致回報同一項。
+  const publicReport = completionTestPublic(f.store.task(f.task.id));
+  assert.equal(publicReport.existingFailureCount, 1);
+  assert.equal(publicReport.unchangedFailureCount, 1);
+
   const suites = npm.calls.filter(c => c.args[0] === 'test');
   assert.equal(suites.length, 2);
   assert.equal(suites[0].cwd, f.source);                       // 基準跑在專案目錄（main）
