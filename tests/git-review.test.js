@@ -136,6 +136,33 @@ test('合併衝突：停在待處理，不動正式分支，也不自行解衝�
   assert.ok(existsSync(f.task.workspace), '工作目錄必須保留給後續修改使用');
 });
 
+test('情境 4／使用者已自行解決衝突並手動完成 merge commit：重新核對後視為合併完成，不再丟 409', async t => {
+  const f = await completedTask(t, { file: 'README.md', content: '# 任務的版本\n' });
+  writeFileSync(join(f.source, 'README.md'), '# 使用者的版本\n');
+  run(f.source, '-c', 'user.email=dev@example.test', '-c', 'user.name=Dev', 'commit', '-am', 'user edit');
+
+  // 使用者不透過 TaskFlow，自己在專案目錄手動解決衝突並完成 merge commit。
+  const attempt = (() => { try { run(f.source, 'merge', '--no-ff', '--no-commit', f.task.git.workingBranch); return true; } catch { return false; } })();
+  assert.equal(attempt, false, '這一步本來就預期會產生衝突');
+  writeFileSync(join(f.source, 'README.md'), '# 手動解決後的版本\n');
+  run(f.source, 'add', 'README.md');
+  run(f.source, '-c', 'user.email=dev@example.test', '-c', 'user.name=Dev', 'commit', '--no-edit');
+  const manualMergeCommit = run(f.source, 'rev-parse', 'HEAD');
+  assert.equal(existsSync(join(f.source, '.git', 'MERGE_HEAD')), false, '使用者已經自行完成 commit，不應再處於進行中的 merge');
+
+  const merged = decideGitReview(f.store, f.owner, f.task.id, { decision: 'merge', artifactVersion: f.task.artifactVersion, cleanup: false });
+
+  assert.equal(merged.gitConflict, null);
+  assert.ok(merged.gitMerge, '必須重新核對 Git 狀態後視為合併完成，而不是丟 409 擋住使用者');
+  assert.equal(merged.gitMerge.reconciled, true);
+  assert.equal(merged.gitMerge.commit, manualMergeCommit);
+  assert.equal(merged.gitMerge.baseBranch, 'main');
+  assert.equal(readFileSync(join(f.source, 'README.md'), 'utf8'), '# 手動解決後的版本\n', '不得覆蓋使用者手動解決的內容');
+  assert.equal(run(f.source, 'rev-parse', 'HEAD'), manualMergeCommit, '不得產生額外的 commit');
+  assert.ok(f2events(f.store, f.task.id).some(m => m.includes('重新核對') && m.includes('視為合併完成')));
+  assert.equal(taskGitReview(f.store, f.owner, f.task.id).status, 'merged');
+});
+
 test('拒絕：預設保留分支，明確選擇才刪除', async t => {
   const f = await completedTask(t);
   const kept = decideGitReview(f.store, f.owner, f.task.id, { decision: 'reject' });
