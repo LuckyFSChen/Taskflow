@@ -42,13 +42,36 @@ function detectRequiresAdministrator(text){
 // Deterministic, rule-based classification. The LLM's own self-report (userActionRequired
 // in the structured result) is only ever a secondary, corroborated signal here — never the
 // sole basis for stopping retries; the regex layer is authoritative whenever it matches.
+// TaskFlow 自己負責版本控制（runner.js 的 commitPhase）：執行環境擋下 agent 的 git add／
+// git commit／git push 是預期中的正確行為，不是需要使用者出手排除的環境問題——使用者手動跑
+// 一次 git commit 既不該做、也不是平台要的。把這種阻擋當成手動操作請求，會生出一個 commands
+// 為空、使用者根本無從執行的請求，並把一個實際上已經完成、而且已經由平台 commit 的步驟卡住。
+// 只有在這類阻擋「之外」還有別的阻擋時，才真的需要使用者介入。
+const PLATFORM_OWNED_CONTEXT=/git\s+(?:add|commit|push)|版本控制/i;
+const CONTEXT_WINDOW=240;
+function platformOwnedMatch(text,index){
+  return PLATFORM_OWNED_CONTEXT.test(text.slice(Math.max(0,index-CONTEXT_WINDOW),index+CONTEXT_WINDOW));
+}
+// 逐一檢查每個 pattern 的「每一次」出現：第一次出現落在版本控制的敘述裡，不代表後面沒有
+// 真正需要使用者處理的阻擋，所以不能只看第一個 match 就放棄。
+function firstActionableMatch(patterns,text){
+  for(const pattern of patterns){
+    const scan=new RegExp(pattern.source,pattern.flags.includes('g')?pattern.flags:pattern.flags+'g');
+    let found;
+    while((found=scan.exec(text))!==null){
+      if(!platformOwnedMatch(text,found.index))return {match:found[0]};
+      if(found.index===scan.lastIndex)scan.lastIndex++;
+    }
+  }
+  return null;
+}
 export function detectManualActionRequirement({message,summary,evidence,selfReport}={}){
   const text=[message,summary,...(evidence||[]),selfReport?.reason,selfReport?.instructions].filter(Boolean).join('\n');
   if(text){
-    const strong=STRONG_PATTERNS.find(p=>p.test(text));
-    if(strong)return {category:'approval_required',match:strong.exec(text)[0],requiresAdministrator:detectRequiresAdministrator(text)};
-    const weak=WEAK_PATTERNS.find(p=>p.test(text));
-    if(weak&&WEAK_CONTEXT.test(text))return {category:'permission_error',match:weak.exec(text)[0],requiresAdministrator:detectRequiresAdministrator(text)};
+    const strong=firstActionableMatch(STRONG_PATTERNS,text);
+    if(strong)return {category:'approval_required',match:strong.match,requiresAdministrator:detectRequiresAdministrator(text)};
+    const weak=firstActionableMatch(WEAK_PATTERNS,text);
+    if(weak&&WEAK_CONTEXT.test(text))return {category:'permission_error',match:weak.match,requiresAdministrator:detectRequiresAdministrator(text)};
   }
   if(selfReport?.required&&(selfReport.commands?.length||selfReport.instructions))return {category:'agent_reported',match:selfReport.reason||selfReport.instructions,requiresAdministrator:selfReport.requiresAdministrator??null};
   return null;

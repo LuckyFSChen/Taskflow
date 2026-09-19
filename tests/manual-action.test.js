@@ -235,3 +235,30 @@ test('A manual action on an early step never skips the remaining plan steps',asy
   assert.equal(f.s.task(f.task.id).status,'completed');
  }finally{runner.stop();}
 });
+
+test('A block on git add/commit/push never becomes a user-action request',()=>{
+ // 迴歸測試：TaskFlow 自己負責版本控制，agent 被擋下 git add／git commit 是預期中的正確行為。
+ // 實際事故：最後一個步驟已完成、測試全過、平台也已 commit，但 agent 在 summary 裡如實說明
+ // 「本次執行環境對 git add／git commit 回傳 This command requires approval」，這段敘述被
+ // 比對到，於是 passed 被強制改成 false，並生出一個 commands 為空、使用者無從執行的請求。
+ assert.equal(detectManualActionRequirement({message:'git commit failed: This command requires approval'}),null);
+ assert.equal(detectManualActionRequirement({summary:'本次執行環境對 git add／git commit 等操作回傳「This command requires approval」，已依規則不重複嘗試；版本控制交由 TaskFlow 平台負責。',evidence:['npm test：30 passed']}),null);
+ assert.equal(detectManualActionRequirement({summary:'依規則版本控制交由平台處理；sandbox denied 了 git push。'}),null);
+});
+
+test('A real environment block is still detected even when a git block is mentioned first',()=>{
+ // 版本控制的阻擋要忽略，但不能因此漏掉同一份報告裡真正需要使用者處理的阻擋。
+ const detection=detectManualActionRequirement({
+  summary:'git commit 被擋下（This command requires approval），版本控制交由平台負責。'
+    +' '.repeat(400)
+    +'另外，執行 npx prisma migrate deploy 時同樣回報 This command requires approval，此項無法繞過。',
+ });
+ assert.ok(detection,'a genuine block outside the version-control context must still be detected');
+ assert.equal(detection.category,'approval_required');
+});
+
+test('Version-control wording never masks an elevation requirement',()=>{
+ const detection=detectManualActionRequirement({summary:'git add 被擋；'+' '.repeat(400)+'安裝驅動程式 requires administrator privileges。'});
+ assert.ok(detection);
+ assert.equal(detection.requiresAdministrator,true);
+});
