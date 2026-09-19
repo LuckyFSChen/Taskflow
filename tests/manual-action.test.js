@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {mkdtempSync,mkdirSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -261,4 +262,34 @@ test('Version-control wording never masks an elevation requirement',()=>{
  const detection=detectManualActionRequirement({summary:'git add 被擋；'+' '.repeat(400)+'安裝驅動程式 requires administrator privileges。'});
  assert.ok(detection);
  assert.equal(detection.requiresAdministrator,true);
+});
+
+test("An agent asking the user to run git add/commit is never turned into a user action",()=>{
+ // 迴歸測試：Task Group 2 的 v5 第 3 步實際做完了工作（改寫兩個測試檔、backend 88 項測試全過），
+ // 平台也已經把它 commit 成 7c7ec100。但 agent 不知道平台會替它 commit，於是把被擋下的
+ // git add／git commit 放進 userActionRequired，要使用者「在本機手動執行 add/commit」。
+ // 照做只會多出一個平台沒有記錄的 commit。先前只過濾了 regex 層，自我回報這條路徑沒擋住。
+ const selfReport={required:true,actionType:'run_command',
+  commands:['git add src/__tests__/publicApi.test.ts','git commit -m "taskflow(execute): 測試改為內容存在性斷言"'],
+  reason:'本次工具呼叫層級的核准機制拒絕了寫入類 git 操作（git add / git commit）',
+  instructions:'請在本機終端機依序執行這兩行指令，將本步驟修改的檔案加入版控並建立 commit。'};
+ assert.equal(detectManualActionRequirement({summary:'已完成本步驟，唯未能完成 git commit。',selfReport}),null);
+ assert.equal(detectManualActionRequirement({selfReport:{required:true,commands:[],instructions:'請手動 git commit 這兩個檔案'}}),null);
+});
+
+test('An agent self-report about a genuinely blocked command is still honoured',()=>{
+ // 版控要忽略，但不能因此把真正需要使用者處理的事也一起吞掉。
+ assert.equal(detectManualActionRequirement({selfReport:{required:true,commands:['npx prisma migrate deploy'],instructions:'請執行'}}).category,'agent_reported');
+ assert.equal(detectManualActionRequirement({selfReport:{required:true,commands:[],instructions:'請在本機安裝 Visual Studio Build Tools 後重試'}}).category,'agent_reported');
+ // 指令清單同時含版控與非版控時，非版控的那個仍然需要使用者處理。
+ assert.equal(detectManualActionRequirement({selfReport:{required:true,commands:['git add .','npm run deploy'],instructions:'請執行'}}).category,'agent_reported');
+});
+
+test('The executor prompt states that version control belongs to the platform',()=>{
+ // 這是根因的預防：不講清楚，agent 就會一再嘗試 git add／git commit，再把被擋下當成
+ // 失敗或需要使用者處理。今晚三次事故都源自這一點。
+ const prompt=readFileSync(new URL('../server/runner.js',import.meta.url),'utf8');
+ assert.match(prompt,/版本控制由平台負責/);
+ assert.match(prompt,/不要執行 git add、git commit、git push/);
+ assert.match(prompt,/不要因此把 passed 設為 false/);
 });

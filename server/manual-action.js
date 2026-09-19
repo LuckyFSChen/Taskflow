@@ -54,6 +54,17 @@ function platformOwnedMatch(text,index){
 }
 // 逐一檢查每個 pattern 的「每一次」出現：第一次出現落在版本控制的敘述裡，不代表後面沒有
 // 真正需要使用者處理的阻擋，所以不能只看第一個 match 就放棄。
+// 同一條規則也必須套用在 agent 的自我回報上。agent 不知道平台已經替它 commit（commitPhase
+// 就在它回報後幾秒執行），於是把被擋下的 git add／git commit 當成「需要使用者手動執行」——
+// 那是平台自己的工作，使用者不該也不需要做，照做反而會多出一個平台沒有記錄的 commit。
+// 指令清單全部都是版控操作時視為平台自有；沒有列出指令時，退而檢查它給的理由與說明。
+// 這個分支只在 regex 層沒有找到任何其他真正阻擋時才會被走到，所以不會蓋掉真的要使用者處理的事。
+function platformOwnedSelfReport(selfReport){
+  const commands=(selfReport?.commands||[]).map(command=>String(command||'')).filter(Boolean);
+  if(commands.length)return commands.every(command=>PLATFORM_OWNED_CONTEXT.test(command));
+  const described=[selfReport?.reason,selfReport?.instructions].filter(Boolean).join('\n');
+  return !!described&&PLATFORM_OWNED_CONTEXT.test(described);
+}
 function firstActionableMatch(patterns,text){
   for(const pattern of patterns){
     const scan=new RegExp(pattern.source,pattern.flags.includes('g')?pattern.flags:pattern.flags+'g');
@@ -73,7 +84,7 @@ export function detectManualActionRequirement({message,summary,evidence,selfRepo
     const weak=firstActionableMatch(WEAK_PATTERNS,text);
     if(weak&&WEAK_CONTEXT.test(text))return {category:'permission_error',match:weak.match,requiresAdministrator:detectRequiresAdministrator(text)};
   }
-  if(selfReport?.required&&(selfReport.commands?.length||selfReport.instructions))return {category:'agent_reported',match:selfReport.reason||selfReport.instructions,requiresAdministrator:selfReport.requiresAdministrator??null};
+  if(selfReport?.required&&(selfReport.commands?.length||selfReport.instructions)&&!platformOwnedSelfReport(selfReport))return {category:'agent_reported',match:selfReport.reason||selfReport.instructions,requiresAdministrator:selfReport.requiresAdministrator??null};
   return null;
 }
 export function classifyExecutionFailure(context){
