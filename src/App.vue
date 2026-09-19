@@ -15,9 +15,9 @@ import {buildPlanGroups} from './plan-group.js';
 import TaskPlanGroup from './components/task-queue/TaskPlanGroup.vue';
 import TaskQueueItem from './components/task-queue/TaskQueueItem.vue';
 import TaskQueueToolbar from './components/task-queue/TaskQueueToolbar.vue';
-// 平台設定改成五個分頁；內容在 components/settings/ 底下。原本掛在這裡的
+// 平台設定分成八個分類；內容在 components/settings/ 底下。原本掛在這裡的
 // DirectoryPicker／LineLinks／NotificationManager／SystemHealth／ProjectActions／
-// ProjectRemoval 全部都還在，只是移到對應分頁裡，沒有任何設定被拿掉。
+// ProjectRemoval 全部都還在，只是移到對應分類裡，沒有任何設定被拿掉。
 import SettingsPage from './components/settings/SettingsPage.vue';
 import ExecutionApproval from './ExecutionApproval.vue';
 import ValidationSkip from './ValidationSkip.vue';

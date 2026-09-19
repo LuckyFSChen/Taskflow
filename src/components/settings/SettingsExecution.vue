@@ -1,13 +1,8 @@
 <script setup lang="ts">
-// AI 與執行：執行服務、同時執行上限、各角色使用的模型，以及執行邊界。
-//
-// 「各角色使用的模型」是唯讀的事實展示，直接讀 src/task-defaults.js 的同一份對應表
-// （建立任務表單與 LINE 流程也用它），不是另外寫死一份文案。
+// 執行：執行服務開關、同時執行上限，以及不可關閉的執行邊界。
 import {computed,ref} from 'vue';
-import {Radio,ShieldCheck,Sparkles} from 'lucide-vue-next';
+import {Radio,ShieldCheck} from 'lucide-vue-next';
 import {api,useTaskStore} from '../../store';
-import {ENGINE_LABELS,ROLE_LABELS,TASK_TYPES,taskEngineDefaults} from '../../task-defaults.js';
-const engineLabels=ENGINE_LABELS as Record<string,string>;
 
 const props=defineProps<{busy:boolean;run:(fn:()=>Promise<any>)=>Promise<void>;notify:(message:string)=>void}>();
 const store=useTaskStore();
@@ -16,11 +11,6 @@ const editingLimit=ref(false);
 const concurrencyDraft=ref<number|null>(null);
 const concurrencyInput=computed({get:()=>concurrencyDraft.value??store.runner.maxConcurrent,set:(value:number)=>{concurrencyDraft.value=value;}});
 const validConcurrency=computed(()=>Number.isInteger(concurrencyInput.value)&&concurrencyInput.value>=1&&concurrencyInput.value<=32);
-const roles=Object.entries(ROLE_LABELS) as [string,string][];
-const defaultsByType=computed(()=>TASK_TYPES.map((type:{value:string;label:string})=>{
-  const engines=taskEngineDefaults(type.value) as Record<string,string>;
-  return {...type,engines:roles.map(([role,label])=>({role,label,engine:engineLabels[engines[role]]||engines[role]}))};
-}));
 
 async function saveLimit(){
   await props.run(async()=>{
@@ -69,17 +59,6 @@ async function saveLimit(){
           <button class="primary compact" :disabled="props.busy||!validConcurrency||concurrencyInput===store.runner.maxConcurrent">儲存</button>
         </div>
       </form>
-    </section>
-
-    <section class="surface-card">
-      <div class="card-head"><div><h2><Sparkles :size="18"/>AI 模式與角色安排</h2><p>建立任務時選「自動選擇」，就會依任務類型套用下面這組安排；選「自訂」可以逐一指定。這裡顯示的就是系統實際使用的預設值。</p></div></div>
-      <div v-for="type in defaultsByType" :key="type.value" class="engine-row">
-        <strong>{{type.label}}</strong>
-        <span class="engine-chips">
-          <span v-for="item in type.engines" :key="item.role" class="engine-chip"><small>{{item.label}}</small>{{item.engine}}</span>
-        </span>
-      </div>
-      <p class="subtle">要更換某個任務的安排，請在建立任務時選「自訂」；已建立的任務可用「補充需求」重新規劃。</p>
     </section>
 
     <section class="surface-card">

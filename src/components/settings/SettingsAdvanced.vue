@@ -1,9 +1,9 @@
 <script setup lang="ts">
-// 系統：執行環境檢查（Node / Claude CLI / Codex CLI / Git / Browser 驗證環境 / Runner /
+// 進階：執行環境檢查（Node / Claude CLI / Codex CLI / Git / Browser 驗證環境 / Runner /
 // 專案路徑 / LINE）與 TaskFlow 版本、runtime 資訊。
 //
 // SystemHealth.vue 原封不動沿用，重新檢查的按鈕也在它裡面；這一頁只是把它放進
-// 「系統」分頁，並補上後端回報的版本與 runtime。沒有任何數值是前端自己編的：
+// 「進階」分頁，並補上後端回報的版本與 runtime。沒有任何數值是前端自己編的：
 // 讀不到就顯示「尚未取得」。
 import {computed,onMounted} from 'vue';
 import {Cpu} from 'lucide-vue-next';
