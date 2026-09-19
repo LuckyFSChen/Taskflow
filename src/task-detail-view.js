@@ -341,8 +341,18 @@ function reviewSteps(task) {
   const running = runningThread(task, ['review']);
   const passed = completedThreads(task, 'review').some(th => th.result?.passed === true);
   const skipped = list(task.validationSkips).some(skip => skip.planVersion === task.planVersion);
+  // 最終驗證是 group-level 的：它只能在計畫步驟全部完成之後才代表「整份計畫已驗證」。
+  // 曾經有一次 review 通過，不等於它涵蓋了還沒執行的步驟——否則畫面會同時出現
+  // 「3 / 9 個進度項目已完成」與「最終驗證：已完成」這種互相矛盾的狀態。
+  const totalSteps = list(task.plan?.steps).length;
+  const completedSteps = Number.isInteger(task.completedSteps) ? task.completedSteps : 0;
+  const stepsRemaining = Math.max(totalSteps - completedSteps, 0);
   if (task.manualCompletion) {
     return [step('review', '最終驗證', 'skipped', '任務由使用者手動完成', '手動完成不代表已通過 AI 驗證')];
+  }
+  if (passed && stepsRemaining > 0) {
+    return [step('review', '最終驗證', 'pending', '',
+      `尚有 ${stepsRemaining} 個計畫步驟未完成，先前那次驗證未涵蓋整份計畫`)];
   }
   if (passed) return [step('review', '最終驗證', 'done', skipped ? '部分項目經同意跳過，記為未驗證' : '')];
   if (task.validationSkipRequest) return [step('review', '最終驗證', 'blocked', '驗證工具受限，等待你決定')];

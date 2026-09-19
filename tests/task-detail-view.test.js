@@ -407,3 +407,27 @@ test('缺資料時不會丟例外', () => {
   const empty = progressSteps({ planVersion: 1, status: 'planning' });
   assert.deepEqual(empty.map(s => s.key), ['plan', 'approval', 'review']);
 });
+
+test('步驟還沒做完時，先前那次驗證不會被顯示成「最終驗證：已完成」', () => {
+  // 迴歸測試：Task Group 1 只完成 6 步中的第 1 步，畫面卻同時顯示
+  // 「3 / 9 個進度項目已完成」與「最終驗證：已完成」。最終驗證是 group-level 的，
+  // 只有在計畫步驟全部完成之後才能代表整份計畫已驗證。
+  const task = baseTask({
+    status: 'running',
+    completedSteps: 1,
+    threads: [thread({ id: 'th-review', phase: 'review', role: '獨立驗證', result: { passed: true, evidence: ['第 1 步已驗證'], summary: '第 1 步通過', questions: [] } })],
+  });
+  const review = progressSteps(task).find(s => s.key === 'review');
+  assert.equal(review.state, 'pending');
+  assert.match(review.note, /尚有 2 個計畫步驟未完成/);
+  assert.notEqual(progressSummary(task).done, progressSummary(task).total);
+});
+
+test('步驟全部完成後，通過的驗證才顯示為已完成', () => {
+  const task = baseTask({
+    status: 'completed',
+    completedSteps: 3,
+    threads: [thread({ id: 'th-review', phase: 'review', role: '獨立驗證', result: { passed: true, evidence: ['全部驗證'], summary: '通過', questions: [] } })],
+  });
+  assert.equal(progressSteps(task).find(s => s.key === 'review').state, 'done');
+});
