@@ -33,7 +33,7 @@ test('CLI available: both engines report ok and a fully healthy system aggregate
   store.setSetting('runnerEnabled',true);
   store.setSetting('inboxLastSuccess','2026-01-01T00:00:00.000Z');
   addProject(store,'demo',workspace);
-  const cli=cliStub({'codex-bin':'codex 1.2.3\n','claude-bin':'claude 2.0.0\n'});
+  const cli=cliStub({'codex-bin':'codex 1.2.3\n','claude-bin':'claude 2.0.0\n',git:'git version 2.45.1\n'});
   const report=await systemHealth(store,healthOptions({store,dir,cli,env:{INBOX_URL:'https://inbox.example.com',INBOX_TOKEN:'t'}}));
   assert.equal(report.checks.codex.status,'ok');
   assert.match(report.checks.codex.message,/Codex CLI 可使用/);
@@ -42,9 +42,31 @@ test('CLI available: both engines report ok and a fully healthy system aggregate
   assert.equal(report.checks.runner.message,'任務服務已啟用');
   assert.equal(report.status,'ok');
   assert.equal(report.checks.runtime.status,'ok');
-  assert.deepEqual(Object.keys(report.checks),['runtime','runner','codex','claude','browser','projects','line']);
+  // Git 與兩個 CLI 走同一條唯讀路徑：只問版本，回報實際印出來的版本字串。
+  assert.equal(report.checks.git.status,'ok');
+  assert.equal(report.checks.git.message,'git version 2.45.1 可使用');
+  assert.deepEqual(Object.keys(report.checks),['runtime','runner','codex','claude','git','browser','projects','line']);
   for(const check of Object.values(report.checks))assert.ok(HEALTH_STATUSES.includes(check.status));
   assert.ok(!Number.isNaN(Date.parse(report.checkedAt)));
+  // 平台設定的「系統」分頁會顯示這兩個欄位；讀不到版本時是 null，不會編一個號碼出來。
+  assert.ok(report.version===null||typeof report.version==='string');
+  assert.equal(report.runtime.node,'24.0.0');
+  assert.ok(typeof report.runtime.platform==='string'&&typeof report.runtime.arch==='string');
+});
+
+test('Git 無法執行時，系統狀態直接是 error 並說明影響的流程',async t=>{
+  const {store,dir}=fixture(t);
+  const workspace=join(dir,'project');mkdirSync(workspace);
+  store.setSetting('runnerEnabled',true);
+  addProject(store,'demo',workspace);
+  const cli=cliStub({'codex-bin':'codex 1.2.3\n','claude-bin':'claude 2.0.0\n',git:new Error('spawn git ENOENT')});
+  const report=await systemHealth(store,healthOptions({store,dir,cli}));
+  assert.equal(report.checks.git.status,'error');
+  assert.match(report.checks.git.message,/Git 無法執行/);
+  assert.match(report.checks.git.message,/GIT_BIN/);
+  assert.equal(report.status,'error');
+  // 檢查本身仍然是唯讀的：只問過版本，沒有任何會修改系統的參數。
+  for(const call of cli.calls)assert.deepEqual(call.args,['--version']);
 });
 
 test('CLI unavailable: the engine reports error, names the override variable, and drives the overall status to error',async t=>{
@@ -85,8 +107,8 @@ test('Node runtime is read from the running process only, and a version below th
   const report=await systemHealth(store,healthOptions({store,dir,cli,nodeVersion:'20.11.0'}));
   assert.equal(report.checks.runtime.status,'error');
   assert.equal(report.status,'error');
-  // 這個檢查只讀字串，不會多 spawn 任何行程。
-  assert.equal(cli.calls.length,2);
+  // 這個檢查只讀字串，不會多 spawn 任何行程。三次 spawn 是 Codex、Claude 與 Git 各問一次版本。
+  assert.equal(cli.calls.length,3);
 });
 
 test('Runner disabled is a warning, not an error, and the overall status follows',async t=>{
@@ -165,7 +187,8 @@ test('the check is read-only: it only ever runs --version, and changes no stored
   const before=store.db.prepare('SELECT key,value FROM settings ORDER BY key').all();
   const cli=cliStub({default:'v1\n'});
   await systemHealth(store,healthOptions({store,dir,cli}));
-  assert.equal(cli.calls.length,2);
+  // Codex、Claude、Git：每個工具都只問一次 --version。
+  assert.equal(cli.calls.length,3);
   for(const call of cli.calls){
     assert.deepEqual(call.args,['--version']);
     assert.ok(call.options.timeout>0,'every CLI probe must be bounded by a timeout');
@@ -184,16 +207,16 @@ test('repeated polling reuses the cached report; a manual re-check cannot spawn 
   const cli=cliStub({default:'v1\n'});
   const health=createSystemHealth(store,{...healthOptions({store,dir,cli}),ttlMs:15000,minIntervalMs:3000,clock:()=>at});
   await health.get();
-  assert.equal(cli.calls.length,2);
+  assert.equal(cli.calls.length,3);
   at+=1000;await health.get();
-  assert.equal(cli.calls.length,2,'a poll inside the TTL must not spawn a CLI again');
+  assert.equal(cli.calls.length,3,'a poll inside the TTL must not spawn a CLI again');
   // Manual 重新檢查 within the minimum interval is served from cache.
   await health.get({force:true});
-  assert.equal(cli.calls.length,2);
+  assert.equal(cli.calls.length,3);
   at+=2000;await health.get({force:true});
-  assert.equal(cli.calls.length,4,'a manual re-check after the minimum interval runs the checks again');
+  assert.equal(cli.calls.length,6,'a manual re-check after the minimum interval runs the checks again');
   at+=20000;await health.get();
-  assert.equal(cli.calls.length,6,'an expired cache is refreshed on the next read');
+  assert.equal(cli.calls.length,9,'an expired cache is refreshed on the next read');
 });
 
 test('concurrent callers share one run instead of spawning one set of CLI probes each',async t=>{
@@ -203,6 +226,6 @@ test('concurrent callers share one run instead of spawning one set of CLI probes
   const execFileImpl=(file,args,options,callback)=>{calls.push(file);setTimeout(()=>callback(null,'v1\n',''),5);};
   const health=createSystemHealth(store,{env:{CODEX_BIN:'codex-bin',CLAUDE_BIN:'claude-bin'},execFileImpl,browserCapability:browserOk});
   const [a,b,c]=await Promise.all([health.get(),health.get(),health.get()]);
-  assert.equal(calls.length,2);
+  assert.equal(calls.length,3);
   assert.equal(a,b);assert.equal(b,c);
 });

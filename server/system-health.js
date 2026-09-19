@@ -4,7 +4,7 @@
 // attempted and no setting is written. CLI discovery is delegated to
 // resolveCliExecutable() and Browser MCP to checkClaudeBrowserCapability(); this
 // file deliberately re-implements neither, so a fix there fixes health too.
-import {existsSync} from 'node:fs';
+import {existsSync,readFileSync} from 'node:fs';
 import {execFile} from 'node:child_process';
 import {resolveCliExecutable} from './cli-executable.js';
 import {checkClaudeBrowserCapability} from './browser-capability.js';
@@ -26,8 +26,7 @@ export function aggregateStatus(checks){
 // `--version` is the only argument ever passed: it prints and exits, so it cannot
 // log in, install, or change configuration. No shell is involved, so nothing in the
 // resolved path can be interpreted as a command.
-export function probeCliVersion(engine,{env=process.env,execFileImpl=execFile,timeoutMs=10000}={}){
-  const executable=resolveCliExecutable(engine,{env});
+export function probeExecutableVersion(executable,{execFileImpl=execFile,timeoutMs=10000}={}){
   return new Promise(resolve=>{
     try{
       execFileImpl(executable,['--version'],{timeout:timeoutMs,windowsHide:true},(error,stdout)=>{
@@ -36,6 +35,16 @@ export function probeCliVersion(engine,{env=process.env,execFileImpl=execFile,ti
       });
     }catch(error){resolve({executable,available:false,version:null,error:String(error.message||error).slice(0,300)});}
   });
+}
+export function probeCliVersion(engine,{env=process.env,execFileImpl=execFile,timeoutMs=10000}={}){
+  return probeExecutableVersion(resolveCliExecutable(engine,{env}),{execFileImpl,timeoutMs});
+}
+
+// Git 走和兩個 CLI 完全一樣的路徑：只問 `git --version`，不讀版本庫、不改設定。
+// TaskFlow 的任務分支與合併流程都靠它，沒有 Git 就不是「要注意」而是真的做不了。
+export function gitCheck(probe){
+  if(probe?.available)return {status:'ok',message:probe.version?`${probe.version} 可使用`:'Git 可使用'};
+  return {status:'error',message:`Git 無法執行，任務分支與合併流程將無法運作。請安裝 Git 後重新啟動服務，或以 GIT_BIN 指定執行檔路徑。${probe?.error?`（${probe.error}）`:''}`};
 }
 
 export function engineCheck(engine,probe,label){
@@ -86,10 +95,17 @@ export function lineCheck(store,{env=process.env}={}){
   return {status:'ok',message:`已連線（最後同步 ${lastSync}）`};
 }
 
-export async function systemHealth(store,{env=process.env,execFileImpl,timeoutMs,browserCapability=checkClaudeBrowserCapability,exists=existsSync,clock=Date.now,nodeVersion=process.versions.node}={}){
-  const [codex,claude,browser]=await Promise.all([
+// 平台設定的「系統」分頁要顯示 TaskFlow 版本與 runtime 資訊。版本只讀 package.json，
+// 讀不到就回 null，不猜一個版本號。
+export function readPackageVersion({read=readFileSync}={}){
+  try{return JSON.parse(read(new URL('../package.json',import.meta.url),'utf8')).version||null;}catch{return null;}
+}
+
+export async function systemHealth(store,{env=process.env,execFileImpl,timeoutMs,browserCapability=checkClaudeBrowserCapability,exists=existsSync,clock=Date.now,nodeVersion=process.versions.node,platform=process.platform,arch=process.arch,version}={}){
+  const [codex,claude,git,browser]=await Promise.all([
     probeCliVersion('codex',{env,execFileImpl,timeoutMs}),
     probeCliVersion('claude',{env,execFileImpl,timeoutMs}),
+    probeExecutableVersion(env.GIT_BIN||'git',{execFileImpl,timeoutMs}),
     (async()=>browserCapability({env}))().catch(error=>({available:false,provider:null,error:String(error.message||error)}))
   ]);
   const checks={
@@ -97,11 +113,12 @@ export async function systemHealth(store,{env=process.env,execFileImpl,timeoutMs
     runner:runnerCheck(store),
     codex:engineCheck('codex',codex,'Codex CLI'),
     claude:engineCheck('claude',claude,'Claude CLI'),
+    git:gitCheck(git),
     browser:browserCheck(browser),
     projects:projectsCheck(store,{exists}),
     line:lineCheck(store,{env})
   };
-  return {status:aggregateStatus(checks),checkedAt:new Date(clock()).toISOString(),checks};
+  return {status:aggregateStatus(checks),checkedAt:new Date(clock()).toISOString(),checks,version:version??readPackageVersion(),runtime:{node:nodeVersion,platform,arch}};
 }
 
 // A health check spawns CLI processes, so callers must never be able to turn polling
