@@ -1,7 +1,10 @@
 import {defineStore} from 'pinia';
 import {api} from './api';
 export {api} from './api';
-export const useTaskStore=defineStore('tasks',{state:()=>({user:null as any,defaultProjectRoot:'',tasks:[] as any[],projects:[] as any[],runner:{enabled:false,busy:false,maxConcurrent:1,activeCount:0,activeTaskId:null as string|null},integrations:{lineConfigured:false,lastSync:null,error:null,pendingNotifications:0} as any,health:{status:'unknown',checkedAt:null,checks:{}} as any,healthLoading:false,healthError:'',
+export const useTaskStore=defineStore('tasks',{state:()=>({user:null as any,defaultProjectRoot:'',tasks:[] as any[],projects:[] as any[],
+  // 方案群組（Plan Group）：任務佇列的分組依據，由 /api/state 帶回來。
+  // 只有 id／名稱／專案這些穩定座標；完成度與狀態都在 src/plan-group.js 依真實 task state 算。
+  planGroups:[] as any[],runner:{enabled:false,busy:false,maxConcurrent:1,activeCount:0,activeTaskId:null as string|null},integrations:{lineConfigured:false,lastSync:null,error:null,pendingNotifications:0} as any,health:{status:'unknown',checkedAt:null,checks:{}} as any,healthLoading:false,healthError:'',
   // 首次設定狀態由後端 /api/state 帶回（server/onboarding.js），前端不自己猜是不是第一次登入。
   onboarding:{completed:false,dismissed:false,configured:false,hasProjectRoot:false,hasProject:false,canConfigure:false,show:false} as any,
   loaded:false,offline:false}),actions:{
