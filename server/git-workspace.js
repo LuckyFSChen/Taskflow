@@ -46,6 +46,12 @@ const AUTHORIZED_COMMANDS = {
   abort_merge: args => args[0] === 'merge' && args.includes('--abort'),
   // 只有在已經逐一確認「剩下的全是 TaskFlow 自己的暫存檔」之後才會用到，見 cleanupTaskBranch。
   remove_internal_only_worktree: args => args[0] === 'worktree' && args[1] === 'remove',
+  // 使用者在網頁上明確按下「推送」時才會用到。形狀鎖死成 `push <remote> <branch>`：
+  // 不接受任何旗標（--force、--mirror、--delete、--tags 都進不來），也不接受
+  // `src:dst` 這種 refspec，所以這個通道推不出「把別的東西覆蓋掉」的指令。
+  push_base_branch: args =>
+    args.length === 3 && args[0] === 'push' &&
+    args.slice(1).every(value => /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(value) && !value.includes(':') && !value.includes('..')),
 };
 function assertAllowed(args, authorizedAs) {
   if (authorizedAs) {
@@ -523,6 +529,56 @@ export function revertMergeCommit({ repositoryPath, baseBranch, mergeCommit, sub
   return { reverted: true, commit: firstLine(git(repositoryPath, ['rev-parse', 'HEAD']).stdout) || head, mergeCommit };
 }
 
+// Phase 4：把本機正式分支推到遠端。
+//
+// 這是整條流程最後一個還會把人趕回終端機的步驟。它**不是**自動化的一環：
+// 預設不推，必須由使用者在網頁上明確按下去（計畫書第十六章）。
+//
+// 四個不可妥協的原則：
+//   1. 只推正式分支到指定 remote，形狀鎖死（見 AUTHORIZED_COMMANDS.push_base_branch）。
+//   2. 落後遠端時一律拒絕。那代表遠端有你沒有的 commit，需要先合併或 rebase——
+//      TaskFlow 不會替你決定怎麼整合別人的工作。
+//   3. 工作樹不乾淨、或不在正式分支上，都不推。
+//   4. 推完再確認一次真的推上去了（ahead 歸零），不是送出指令就宣稱成功。
+export function remoteStatus({ repositoryPath, baseBranch, remote = 'origin', git, fetch = true }) {
+  const url = git(repositoryPath, ['remote', 'get-url', remote], { allowFailure: true });
+  if (!url.ok) return { configured: false, remote, reason: 'no_remote' };
+  // fetch 是唯讀的：它只更新遠端追蹤分支，不會動到你的任何 commit 或工作樹。
+  if (fetch) git(repositoryPath, ['fetch', '--quiet', remote, baseBranch], { allowFailure: true });
+
+  const counts = git(repositoryPath, ['rev-list', '--left-right', '--count', `${remote}/${baseBranch}...${baseBranch}`], { allowFailure: true });
+  if (!counts.ok) {
+    return { configured: true, remote, url: firstLine(url.stdout), reason: 'no_upstream_branch', ahead: null, behind: null };
+  }
+  const [behind, ahead] = firstLine(counts.stdout).split(/\s+/).map(Number);
+  return { configured: true, remote, url: firstLine(url.stdout), baseBranch, ahead, behind, reason: null };
+}
+
+export function pushBaseBranch({ repositoryPath, baseBranch, remote = 'origin', git }) {
+  const state = assertMergeReady({ repositoryPath, baseBranch, git });
+  const status = remoteStatus({ repositoryPath, baseBranch, remote, git });
+  if (!status.configured) {
+    throw new GitSafetyError('no_remote', `專案沒有設定名為 ${remote} 的遠端，無法推送。`, { remote });
+  }
+  if (status.behind > 0) {
+    throw new GitSafetyError('behind_remote',
+      `${remote}/${baseBranch} 有 ${status.behind} 個你本機還沒有的 commit。TaskFlow 不會替你決定要用 merge 還是 rebase 整合別人的工作，請先自行處理後再推送。`,
+      { ahead: status.ahead, behind: status.behind });
+  }
+  if (status.ahead === 0) return { pushed: false, reason: 'up_to_date', remote, baseBranch };
+
+  git(repositoryPath, ['push', remote, baseBranch], { authorizedAs: 'push_base_branch' });
+
+  // 推完再問一次遠端：送出指令不等於推上去了。
+  const after = remoteStatus({ repositoryPath, baseBranch, remote, git });
+  if (after.ahead !== 0) {
+    throw new GitSafetyError('push_incomplete',
+      `推送後 ${remote}/${baseBranch} 仍落後 ${after.ahead} 個 commit，狀態不如預期，已停止並保留現況。`,
+      { ahead: after.ahead });
+  }
+  return { pushed: true, remote, baseBranch, commit: state.head, count: status.ahead };
+}
+
 export function createGitWorkspace({ git = createGitRunner() } = {}) {
   return {
     git,
@@ -536,5 +592,7 @@ export function createGitWorkspace({ git = createGitRunner() } = {}) {
     merge: (options) => mergeTaskBranch({ ...options, git }),
     cleanup: (options) => cleanupTaskBranch({ ...options, git }),
     revert: (options) => revertMergeCommit({ ...options, git }),
+    remoteStatus: (options) => remoteStatus({ ...options, git }),
+    push: (options) => pushBaseBranch({ ...options, git }),
   };
 }

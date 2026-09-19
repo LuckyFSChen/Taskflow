@@ -119,9 +119,22 @@ async function completionTest(){
   const taskId=selected.value.id;
   await run(async()=>{await api(`/tasks/${taskId}/completion/test`,{});notify('已開始測試比對；整套測試可能需要數分鐘，結果會自動更新。');});
 }
+// 合併後在正式分支重測：分支比對通過不代表合併後也通過。
+async function completionTestMain(){
+  if(!selected.value)return;
+  const taskId=selected.value.id;
+  await run(async()=>{await api(`/tasks/${taskId}/completion/test-main`,{});notify('已開始合併後重測；結果會自動更新。');});
+}
+// 推送遠端：唯一會影響本機以外的動作，所以一律由使用者明確按下，預設不在流程裡。
+async function completionPush(){
+  if(!selected.value)return;
+  const taskId=selected.value.id;
+  await run(async()=>{await api(`/tasks/${taskId}/completion/push`,{});notify('已推送至遠端。');});
+  await loadReview();
+}
 // 一次核准：只建立狀態機並記錄核准，實際推進由後端固定間隔的 tick 負責。
 // 重啟階段會殺掉那個行程，所以狀態存在任務資料裡，新的行程開機後會自己接著跑。
-async function completionApprove(options:{restart:boolean;validate:boolean;cleanup:boolean}){
+async function completionApprove(options:{testMain:boolean;restart:boolean;validate:boolean;push:boolean;cleanup:boolean}){
   if(!selected.value)return;
   const taskId=selected.value.id,artifactVersion=selected.value.artifactVersion;
   await run(async()=>{await api(`/tasks/${taskId}/completion/approve`,{artifactVersion,options});notify('已核准部署流程；每個階段的進度會自動更新。');});
@@ -275,7 +288,7 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
         <ValidationSkip :request="selected.validationSkipRequest" :skips="selected.validationSkips" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/validation/decision`,{requestId:selected.validationSkipRequest.id,decision}))"/>
         <ExecutionApproval v-if="selected.executionApproval" :request="selected.executionApproval" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/execution/decision`,{requestId:selected.executionApproval.id,decision}))"/>
         <!-- 部署與驗收：核准合併、清理與撤銷都在這裡完成，不需要再開 PowerShell。 -->
-        <Completion :task="selected" :review="gitReview" :busy="busy" :loading="reviewLoading" @refresh="loadReview" @test="completionTest" @restart="completionRestart" @validate="completionValidate" @approve="completionApprove" @retry="completionRetry" @cancel-pipeline="completionCancel" @merge="completionMerge" @rollback="completionRollback"/>
+        <Completion :task="selected" :review="gitReview" :busy="busy" :loading="reviewLoading" @refresh="loadReview" @test="completionTest" @test-main="completionTestMain" @push="completionPush" @restart="completionRestart" @validate="completionValidate" @approve="completionApprove" @retry="completionRetry" @cancel-pipeline="completionCancel" @merge="completionMerge" @rollback="completionRollback"/>
         <section v-if="selected.validationFailure" class="questions"><h3>最近未通過的驗證：第 {{selected.round}} 輪修正</h3><p class="prewrap">{{selected.validationFailure.summary}}</p><ul><li v-for="(e,i) in selected.validationFailure.evidence" :key="i">{{e}}</li></ul><p v-if="!selected.validationFailure.evidence.length">驗證缺少可確認的證據。</p><p v-for="(q,i) in selected.validationFailure.questions" :key="i">待確認：{{q}}</p><p v-if="selected.status==='repair_planning'">正在唯讀分析原因與解法，尚未執行修正。</p><template v-if="selected.repairPlan"><h3>問題原因與修正方案</h3><p class="prewrap">{{selected.repairPlan.summary}}</p><div v-for="(step,i) in selected.repairPlan.steps" :key="i" class="plan-step"><span class="step-number">{{Number(i)+1}}</span><div><strong>{{step.title}}</strong><p>{{step.instructions}}</p></div></div><h3>重新驗證標準</h3><ul><li v-for="(item,i) in selected.repairPlan.acceptance" :key="i">{{item}}</li></ul><p v-for="(q,i) in selected.repairPlan.questions" :key="i">待確認：{{q}}</p><template v-if="selected.status==='awaiting_repair_approval'&&!selected.validationSkipRequest"><button class="primary full" :disabled="busy||selected.repairPlan.questions.length>0" @click="run(()=>api(`/tasks/${selected.id}/repair/approve`,{proposalId:selected.repairPlan.id}))">核准此修正方案並執行</button><form @submit.prevent="run(async()=>{await api(`/tasks/${selected.id}/repair/revise`,{proposalId:selected.repairPlan.id,answer});answer='';})"><label>補充或修改修正方案<textarea v-model="answer" rows="3" minlength="2" maxlength="8000" required/></label><button class="secondary" :disabled="busy">重新提出方案，待我審核</button></form></template></template></section>
         <div v-if="selected.questions.length&&!selected.executionApproval&&!selected.validationSkipRequest&&!selected.manualAction" class="questions"><h3>需要你確認</h3><p v-for="(q,i) in selected.questions" :key="i">{{Number(i)+1}}. {{q}}</p></div>
 

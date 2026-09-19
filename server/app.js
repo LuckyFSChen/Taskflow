@@ -23,11 +23,11 @@ import {checkClaudeBrowserCapability} from './browser-capability.js';
 import {createSystemHealth} from './system-health.js';
 import {onboardingStatus,completeOnboarding} from './onboarding.js';
 import {recoverTaskOutput,taskOriginalOutput,outputIssueRecoverable} from './output-issue.js';
-import {taskGitReview,decideGitReview,rollbackTaskMerge,applyCleanup} from './git-review.js';
+import {taskGitReview,decideGitReview,rollbackTaskMerge,applyCleanup,pushTaskBaseBranch} from './git-review.js';
 // 一次核准就依序跑完的部署流程；它自己不執行任何操作，只推進下面這幾個既有子系統。
 import {createCompletion,createCompletionPipeline,completionPublic} from './completion-pipeline.js';
 // 測試基準比對：在 main 與任務分支各跑一次完整測試，用結構化比對取代「AI 說那 3 個是既有失敗」。
-import {createCompletionTests,completionTestPublic} from './completion-test.js';
+import {createCompletionTests,completionTestPublic,completionMainTestPublic} from './completion-test.js';
 // 部署重啟：主 server 不自己殺自己，只把請求寫進共用資料庫，由獨立的守護程式執行。
 import {guardianAlive,initControlRequests,isSelfProject,latestRestart,recoverStuckRestarts,requestRestart,restartBlockReason,restartView} from './control-requests.js';
 // 合併後的部署驗收：開一個 Preview 驗 API，停掉它，並確認 PID 真的消失。
@@ -65,6 +65,7 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
       return null;
     },
     restartStatus:(s,task)=>restartView(latestRestart(s,task.id)),
+    push:(s,user,task)=>pushTaskBaseBranch(s,user,task.id,{},{gitWorkspace}),
     cleanup:(s,task)=>{
       applyCleanup(s,s.task(task.id),{gitWorkspace,deleteUnmerged:false});
       const latest=s.task(task.id);
@@ -129,6 +130,7 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     // 測試比對的紀錄裡有伺服器磁碟上的 log 路徑，和 workspace 一樣不送到瀏覽器；
     // 只送結論、數量與失敗項目名稱。
     completionTest:completionTestPublic(t),
+    completionMainTest:completionMainTestPublic(t),
     completionValidation:completionValidationPublic(t),
     completion:completionPublic(t),
     selfProject,
@@ -188,6 +190,11 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     z.object({}).strict().parse(req.body||{});
     res.json(decorated(completionTests.start(store,req.user,req.params.id)));
   });
+  // 合併後在正式分支重跑一次：分支比對通過不代表合併後也通過。
+  app.post('/api/tasks/:id/completion/test-main',(req,res)=>{
+    z.object({}).strict().parse(req.body||{});
+    res.json(decorated(completionTests.startMain(store,req.user,req.params.id)));
+  });
   // Level B：使用者核准後才會重新啟動正式 TaskFlow。這條路徑只寫一筆固定 action 的請求，
   // 不執行任何指令、也不接受任何指令字串；真正動手的是獨立的守護程式。
   app.post('/api/tasks/:id/completion/restart',(req,res)=>{
@@ -204,7 +211,7 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   // 一次核准，依序跑完。approve 只建立狀態機並記錄核准，實際推進由固定間隔的 tick 負責；
   // 重啟階段會殺掉這個行程，狀態因此存在任務資料裡，新的行程開機後自己接著跑。
   app.post('/api/tasks/:id/completion/approve',(req,res)=>{
-    const input=z.object({artifactVersion:z.string().max(200),options:z.object({restart:z.boolean().optional(),validate:z.boolean().optional(),cleanup:z.boolean().optional()}).strict().optional()}).strict().parse(req.body||{});
+    const input=z.object({artifactVersion:z.string().max(200),options:z.object({push:z.boolean().optional(),testMain:z.boolean().optional(),restart:z.boolean().optional(),validate:z.boolean().optional(),cleanup:z.boolean().optional()}).strict().optional()}).strict().parse(req.body||{});
     const t=requireTask(store,req.user,req.params.id);
     if(t.git?.mode!=='worktree')throw new HttpError(409,'此任務不是以 Git 模式執行，沒有可部署的分支。');
     if(t.status!=='completed'||t.manualCompletion)throw new HttpError(409,'只有通過獨立驗證而完成的任務才能部署；手動標記完成不代表驗收通過。');
@@ -241,6 +248,11 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/tasks/:id/completion/validate',(req,res)=>{
     z.object({}).strict().parse(req.body||{});
     res.json(decorated(completionValidations.start(store,req.user,req.params.id)));
+  });
+  // Level B：推送遠端一律要使用者明確核准，預設不在自動流程裡（計畫書第十六章）。
+  app.post('/api/tasks/:id/completion/push',(req,res)=>{
+    const input=z.object({baseBranch:z.string().max(200).optional()}).strict().parse(req.body||{});
+    res.json(decorated(pushTaskBaseBranch(store,req.user,req.params.id,input,{gitWorkspace})));
   });
   app.post('/api/tasks/:id/git/rollback',(req,res)=>{
     const input=z.object({mergeCommit:z.string().min(7).max(64)}).strict().parse(req.body||{});

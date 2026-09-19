@@ -29,7 +29,15 @@ const logFile = (dataDir, taskId, label) => join(dataDir, 'completion', taskId, 
  * 並把失敗清單截短，避免一份壞掉的測試把整包 /state 撐爆。
  */
 export function completionTestPublic(task) {
-  const report = task?.completionTest;
+  return testReportPublic(task?.completionTest);
+}
+
+/** 合併後在正式分支重測的結果（semantic conflict 只有這一步抓得到）。 */
+export function completionMainTestPublic(task) {
+  return testReportPublic(task?.completionMainTest);
+}
+
+function testReportPublic(report) {
   if (!report) return null;
   const run = value => value ? {
     ok: !!value.ok,
@@ -68,16 +76,18 @@ export function completionTestPublic(task) {
  * 那會讓畫面永遠顯示「執行中」，而且擋住重新執行。比照 runner.js 開機時對 thread 的復原。
  */
 export function recoverCompletionTests(store) {
+  const message = '上次的測試比對在服務重新啟動時中斷，尚未取得結果。請重新執行。';
   for (const task of store.tasks()) {
-    if (task.completionTest?.status !== 'running') continue;
-    task.completionTest = {
-      ...task.completionTest,
-      status: 'interrupted',
-      finishedAt: now(),
-      error: '上次的測試比對在服務重新啟動時中斷，尚未取得結果。請重新執行。',
-    };
+    let changed = false;
+    // 兩種報告都要收：合併後重測正好發生在重啟前後，最容易被打斷。
+    for (const field of ['completionTest', 'completionMainTest']) {
+      if (task[field]?.status !== 'running') continue;
+      task[field] = { ...task[field], status: 'interrupted', finishedAt: now(), error: message };
+      changed = true;
+    }
+    if (!changed) continue;
     store.saveTask(task);
-    store.event(task.id, 'completion_test_interrupted', task.completionTest.error);
+    store.event(task.id, 'completion_test_interrupted', message);
   }
 }
 
@@ -119,14 +129,45 @@ export function createCompletionTests({
     return { repository, baseline, current, ...compareTestRuns(baseline, current) };
   }
 
-  function finish(store, taskId, testId, patch) {
+  /**
+   * 合併後在正式分支重跑一次。
+   *
+   * 為什麼需要這一步：分支比對通過只證明「這條分支自己沒有製造新的失敗」，
+   * 但兩邊各自都對、合起來卻壞掉是真實存在的情況（semantic conflict）——
+   * 那種失敗只有在合併後的正式分支上才看得到。
+   *
+   * 基準沿用合併前那一次比對取得的 main 結果：新增的失敗就是這次合併造成的。
+   */
+  async function compareMain(store, taskId) {
+    const task = store.task(taskId);
+    const repository = gitWorkspace.inspect(task.git.repositoryPath);
+    if (repository.branch !== task.git.baseBranch) {
+      throw new Error(`專案目錄目前在 ${repository.branch || 'detached HEAD'}，不是 ${task.git.baseBranch}；無法在正式分支上重測。`);
+    }
+    // 沒有合併前的基準就無從判斷這次合併造成了什麼——照實說，不用別的數字硬湊。
+    const baseline = task.completionTest?.baseline?.ok
+      ? { ...task.completionTest.baseline }
+      : { label: 'baseline', ok: false, reason: 'no_pre_merge_baseline', total: 0, passed: 0, failed: [], at: now() };
+    const current = await suiteIn({ cwd: task.git.repositoryPath, label: 'main', commit: repository.head, taskId: task.id, install: false });
+    return { repository, baseline, current, ...compareTestRuns(baseline, current) };
+  }
+
+  function finish(store, taskId, field, testId, patch) {
     // 測試要跑好幾分鐘，期間使用者可能已經取消、補充需求或重新規劃。只寫回最新的任務資料，
     // 而且只有在這份結果仍然屬於同一次比對時才寫，絕不用舊快照覆蓋使用者剛做的變更。
     const latest = store.task(taskId);
-    if (!latest || latest.completionTest?.id !== testId) return;
-    latest.completionTest = { ...latest.completionTest, ...patch, finishedAt: now() };
+    if (!latest || latest[field]?.id !== testId) return;
+    latest[field] = { ...latest[field], ...patch, finishedAt: now() };
     store.saveTask(latest);
     return latest;
+  }
+
+  function newReport({ task, user, testId }) {
+    return {
+      id: testId, planVersion: task.planVersion, status: 'running', startedAt: now(), finishedAt: null,
+      baseBranch: task.git.baseBranch, verdict: null, newFailures: [], resolvedFailures: [],
+      baseline: null, current: null, error: null, startedBy: user.id,
+    };
   }
 
   return {
@@ -142,27 +183,13 @@ export function createCompletionTests({
       if (running.size) throw new HttpError(409, '目前已有另一個任務在執行測試比對；同時執行會互相干擾，請稍候再試。');
 
       const testId = id();
-      task.completionTest = {
-        id: testId,
-        planVersion: task.planVersion,
-        status: 'running',
-        startedAt: now(),
-        finishedAt: null,
-        baseBranch: task.git.baseBranch,
-        verdict: null,
-        newFailures: [],
-        resolvedFailures: [],
-        baseline: null,
-        current: null,
-        error: null,
-        startedBy: user.id,
-      };
+      task.completionTest = newReport({ task, user, testId });
       store.saveTask(task);
       store.event(taskId, 'completion_test_started', `${user.name} 開始測試比對：先取得 ${task.git.baseBranch} 的基準，再執行任務分支的測試。`);
 
       const job = compare(store, taskId)
         .then(outcome => {
-          const updated = finish(store, taskId, testId, {
+          const updated = finish(store, taskId, 'completionTest', testId, {
             status: 'completed',
             verdict: outcome.verdict,
             newFailures: outcome.newFailures,
@@ -181,8 +208,54 @@ export function createCompletionTests({
           if (outcome.verdict !== VERDICTS.NO_REGRESSION) store.notify(updated, summary);
         })
         .catch(error => {
-          finish(store, taskId, testId, { status: 'failed', error: String(error?.message || error).slice(0, 1000) });
+          finish(store, taskId, 'completionTest', testId, { status: 'failed', error: String(error?.message || error).slice(0, 1000) });
           store.event(taskId, 'completion_test_failed', `測試比對未完成：${String(error?.message || error).slice(0, 500)}`);
+        })
+        .finally(() => running.delete(taskId));
+
+      running.set(taskId, job);
+      return store.task(taskId);
+    },
+
+    /**
+     * 合併之後在正式分支上重測。分支比對通過不代表合併後也通過：
+     * 兩邊各自沒問題、合起來壞掉（semantic conflict）只有這一步抓得到。
+     */
+    startMain(store, user, taskId) {
+      const task = requireTask(store, user, taskId);
+      if (task.git?.mode !== 'worktree') throw new HttpError(409, '此任務不是以 Git 模式執行。');
+      if (!task.gitMerge) throw new HttpError(409, '尚未合併到正式分支，還沒有可以重測的對象。');
+      if (running.has(taskId)) throw new HttpError(409, '此任務的測試比對正在執行中。');
+      if (running.size) throw new HttpError(409, '目前已有另一個任務在執行測試比對；同時執行會互相干擾，請稍候再試。');
+
+      const testId = id();
+      task.completionMainTest = newReport({ task, user, testId });
+      store.saveTask(task);
+      store.event(taskId, 'completion_main_test_started', `${user.name} 開始合併後重測：在 ${task.git.baseBranch} 上重跑同一套測試，與合併前的基準比對。`);
+
+      const job = compareMain(store, taskId)
+        .then(outcome => {
+          const updated = finish(store, taskId, 'completionMainTest', testId, {
+            status: 'completed',
+            verdict: outcome.verdict,
+            newFailures: outcome.newFailures,
+            resolvedFailures: outcome.resolvedFailures,
+            baseline: outcome.baseline,
+            current: outcome.current,
+          });
+          if (!updated) return;
+          const summary = {
+            [VERDICTS.NO_REGRESSION]: `合併後重測完成：${task.git.baseBranch} 上沒有新的失敗。`,
+            [VERDICTS.REGRESSION]: `合併後重測發現 ${outcome.newFailures.length} 項新的失敗——這些在合併前的 ${task.git.baseBranch} 與任務分支上都沒有出現，是合併本身造成的。\n${outcome.newFailures.slice(0, 10).join('\n')}`,
+            [VERDICTS.BASELINE_UNAVAILABLE]: `沒有合併前的基準，無法判斷這次合併造成了什麼（${outcome.baseline.reason || '原因不明'}）。`,
+            [VERDICTS.PARSE_FAILED]: `無法判讀 ${task.git.baseBranch} 上的測試結果（${outcome.current.reason || '原因不明'}）。讀不懂一律不當成通過。`,
+          }[outcome.verdict];
+          store.event(taskId, 'completion_main_test_result', summary);
+          if (outcome.verdict !== VERDICTS.NO_REGRESSION) store.notify(updated, summary);
+        })
+        .catch(error => {
+          finish(store, taskId, 'completionMainTest', testId, { status: 'failed', error: String(error?.message || error).slice(0, 1000) });
+          store.event(taskId, 'completion_main_test_failed', `合併後重測未完成：${String(error?.message || error).slice(0, 500)}`);
         })
         .finally(() => running.delete(taskId));
 

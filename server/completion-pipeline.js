@@ -15,13 +15,15 @@
 //      是等待，下一個 tick 再試；只有後者才讓 pipeline 停下來等人。
 import {id, now} from './db.js';
 
-export const PIPELINE_STAGES = ['test', 'merge', 'restart', 'validate', 'cleanup'];
+export const PIPELINE_STAGES = ['test', 'merge', 'test_main', 'restart', 'validate', 'push', 'cleanup'];
 
 export const STAGE_LABELS = {
   test: '測試比對',
   merge: '合併到正式分支',
+  test_main: '合併後在正式分支重測',
   restart: '重新啟動正式 TaskFlow',
   validate: '部署驗收',
+  push: '推送到遠端',
   cleanup: '清理工作副本與分支',
 };
 
@@ -35,6 +37,11 @@ export const STAGE_LABELS = {
  */
 export function plannedStages({ selfProject = false, options = {} } = {}) {
   return PIPELINE_STAGES.filter(stage => {
+    // 合併後重測要跑第二輪完整測試，所以可以關掉；預設開著，因為 semantic conflict
+    // （兩邊各自都對、合起來壞掉）只有這一步抓得到。
+    if (stage === 'test_main') return options.testMain !== false;
+    // 推送遠端預設**不做**：它是唯一會影響本機以外的動作，必須每次明確勾選（計畫書第十六章）。
+    if (stage === 'push') return options.push === true;
     if (stage === 'restart') return selfProject && options.restart !== false;
     if (stage === 'validate') return selfProject && options.validate !== false;
     if (stage === 'cleanup') return options.cleanup !== false;
@@ -53,7 +60,7 @@ export function createCompletion({ task, user, selfProject, options = {} }) {
     planVersion: task.planVersion,
     artifactVersion: task.artifactVersion || null,
     stages: plannedStages({ selfProject, options }),
-    options: { restart: options.restart !== false, validate: options.validate !== false, cleanup: options.cleanup !== false },
+    options: { push: options.push === true, testMain: options.testMain !== false, restart: options.restart !== false, validate: options.validate !== false, cleanup: options.cleanup !== false },
     stage: null,
     status: 'running',
     approvedBy: user.id,
@@ -110,6 +117,32 @@ function mergeStage(store, task, user, deps) {
   } catch (error) { return failed(String(error?.message || error)); }
 }
 
+/**
+ * 合併後在正式分支重測。分支比對通過只證明「這條分支自己沒有製造新的失敗」；
+ * 兩邊各自都對、合起來卻壞掉的情況，只有在合併後的正式分支上才看得到。
+ *
+ * 這一階段失敗時流程會停住，而且刻意不自動做任何補救：撤銷合併是不可逆的決定，
+ * 要由人按下去（既有的「撤銷這次合併」會補一個反向 commit，不刪任何歷史）。
+ */
+function testMainStage(store, task, user, deps) {
+  const report = task.completionMainTest;
+  const mine = report && report.startedAt && report.startedAt >= task.completion.approvedAt;
+  if (!mine) {
+    try { deps.tests.startMain(store, user, task.id); return waiting('已開始合併後重測'); }
+    catch (error) { return error?.status === 409 ? waiting(String(error.message)) : failed(String(error?.message || error)); }
+  }
+  if (report.status === 'running') return waiting();
+  if (report.status !== 'completed') return failed(report.error || '合併後重測沒有完成。');
+  if (report.verdict === 'regression') {
+    const count = report.newFailureCount || report.newFailures?.length || 0;
+    return failed(`合併後在正式分支出現 ${count} 項新的失敗；這些在合併前與任務分支上都沒有出現，是合併本身造成的。若要退回，請使用「撤銷這次合併」。`);
+  }
+  return done({
+    verdict: report.verdict,
+    note: report.verdict === 'no_regression' ? null : '沒有合併前的基準或無法判讀結果，這一項未能證明合併沒有造成新的失敗。',
+  });
+}
+
 /** 重新啟動：只送出請求，實際動手的是守護程式；這個行程很可能會在這一階段被殺掉。 */
 function restartStage(store, task, user, deps) {
   const request = deps.restartStatus(store, task);
@@ -141,6 +174,18 @@ function validateStage(store, task, user, deps) {
   return done({ checks: (report.checks || []).length });
 }
 
+/** 推送到遠端。失敗（落後遠端、沒有 remote）就停住等人，絕不自作主張整合別人的工作。 */
+function pushStage(store, task, user, deps) {
+  if (task.gitPush) return done({ remote: task.gitPush.remote, count: task.gitPush.count, skipped: true });
+  try {
+    const updated = deps.push(store, user, task);
+    const pushed = updated?.gitPush;
+    return done(pushed
+      ? { remote: pushed.remote, count: pushed.count }
+      : { remote: 'origin', count: 0, note: '遠端已經是最新的，沒有需要推送的 commit。' });
+  } catch (error) { return failed(String(error?.message || error)); }
+}
+
 /**
  * 清理。清不掉不算 pipeline 失敗：worktree 裡還有沒提交的東西時，既有的清理邏輯
  * 本來就會保留不動並照實回報，那是正確行為，不該讓整條已經完成的部署變成紅色。
@@ -152,7 +197,7 @@ function cleanupStage(store, task, user, deps) {
   } catch (error) { return done({ removed: false, note: `清理未完成：${String(error?.message || error)}` }); }
 }
 
-const HANDLERS = { test: testStage, merge: mergeStage, restart: restartStage, validate: validateStage, cleanup: cleanupStage };
+const HANDLERS = { test: testStage, merge: mergeStage, test_main: testMainStage, restart: restartStage, validate: validateStage, push: pushStage, cleanup: cleanupStage };
 
 /**
  * 推進一個任務的 pipeline 一步。每次都重讀最新的任務資料，回傳更新後的任務。

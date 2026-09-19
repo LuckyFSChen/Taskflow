@@ -211,7 +211,7 @@ test('已撤銷過的合併不再提供第二次撤銷', () => {
 
 test('階段清單只由真實資料推導，未知的一律 pending', () => {
   const stages = completionStages(baseTask({ status: 'running' }), null);
-  assert.deepEqual(stages.map(s => s.key), ['implementation', 'review', 'test', 'merge', 'validate', 'cleanup']);
+  assert.deepEqual(stages.map(s => s.key), ['implementation', 'review', 'test', 'merge', 'test_main', 'validate', 'cleanup']);
   assert.equal(stages.find(s => s.key === 'test').state, 'pending');
   assert.equal(stages.find(s => s.key === 'implementation').state, 'pending');
   assert.equal(stages.find(s => s.key === 'review').state, 'pending');
@@ -493,6 +493,74 @@ test('流程結束或停止之後不再擋住單顆按鈕', () => {
     assert.equal(view.pipeline.running, false, status);
     assert.equal(view.canRunTest, true, status);
   }
+});
+
+test('合併之前不提供合併後重測；合併之後才可以執行', () => {
+  const before = completionView(baseTask(), baseReview());
+  assert.equal(before.canRunMainTest, false);
+  assert.equal(before.mainTest, null);
+  assert.equal(before.stages.find(s => s.key === 'test_main').detail, '合併後才需要');
+
+  const after = completionView(mergedTask(), baseReview());
+  assert.equal(after.canRunMainTest, true);
+});
+
+test('合併後重測抓到新的失敗：階段標記未通過，數字照實顯示', () => {
+  const view = completionView(mergedTask({
+    completionMainTest: {
+      id: 'm1', status: 'completed', verdict: 'regression',
+      newFailures: ['tests/a.test.js > 合起來才壞'], newFailureCount: 1,
+      baseline: { ok: true, total: 344, failedCount: 3 }, current: { ok: true, total: 344, failedCount: 4 },
+    },
+  }), baseReview());
+
+  assert.equal(view.mainTest.verdict, 'regression');
+  assert.equal(view.mainTest.newFailureCount, 1);
+  assert.equal(view.mainTest.toneClass, 'failed');
+  assert.equal(view.stages.find(s => s.key === 'test_main').state, 'failed');
+});
+
+test('沒有合併前基準時，原因要翻成看得懂的說明', () => {
+  const view = completionView(mergedTask({
+    completionMainTest: { id: 'm1', status: 'completed', verdict: 'baseline_unavailable', baseline: { ok: false, reason: 'no_pre_merge_baseline' }, current: { ok: true, total: 344 } },
+  }), baseReview());
+  assert.match(view.mainTest.baseline.reasonText, /沒有合併前的基準/);
+  assert.equal(view.stages.find(s => s.key === 'test_main').state, 'blocked');
+});
+
+// --- 推送遠端 ------------------------------------------------------------------
+
+const remote = (extra = {}) => ({ configured: true, remote: 'origin', baseBranch: 'main', url: 'git@example.com:me/taskflow.git', ahead: 0, behind: 0, ...extra });
+
+test('沒有設定遠端時照實說，也不給按鈕', () => {
+  const view = completionView(mergedTask(), baseReview({ remote: { configured: false, remote: 'origin', reason: 'no_remote' } }));
+  assert.equal(view.push.configured, false);
+  assert.equal(view.canPush, false);
+  assert.match(view.push.note, /沒有設定 origin/);
+});
+
+test('領先遠端時才提供推送，並顯示領先幾個 commit', () => {
+  const ahead = completionView(mergedTask(), baseReview({ remote: remote({ ahead: 5 }) }));
+  assert.equal(ahead.canPush, true);
+  assert.match(ahead.push.label, /領先 origin\/main 5 個 commit/);
+
+  const synced = completionView(mergedTask(), baseReview({ remote: remote() }));
+  assert.equal(synced.canPush, false);
+  assert.equal(synced.push.label, '與遠端同步');
+});
+
+test('落後遠端時擋住推送，並說明 TaskFlow 不替你選 merge 還是 rebase', () => {
+  const view = completionView(mergedTask(), baseReview({ remote: remote({ ahead: 2, behind: 3 }) }));
+  assert.equal(view.canPush, false);
+  assert.equal(view.push.blockedByBehind, true);
+  assert.match(view.push.note, /merge 還是 rebase/);
+});
+
+test('尚未合併就不顯示推送；推送過後顯示推了幾個', () => {
+  assert.equal(completionView(baseTask(), baseReview({ remote: remote({ ahead: 2 }) })).canPush, false);
+
+  const view = completionView(mergedTask({ gitPush: { remote: 'origin', baseBranch: 'main', count: 5, at: '2026-09-19T06:00:00.000Z' } }), baseReview({ remote: remote() }));
+  assert.equal(view.push.pushed.count, 5);
 });
 
 test('明講目前尚未涵蓋 Browser Validation，不把未實作畫成尚未開始', () => {

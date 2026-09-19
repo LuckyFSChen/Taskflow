@@ -6,14 +6,16 @@ import {computed,ref} from 'vue';
 import {completionView} from './completion-view.js';
 const props=defineProps<{task?:any;review?:any;busy:boolean;loading?:boolean}>();
 const emit=defineEmits<{
-  refresh:[];test:[];restart:[];validate:[];
-  approve:[options:{restart:boolean;validate:boolean;cleanup:boolean}];
+  refresh:[];test:[];testMain:[];restart:[];validate:[];push:[];
+  approve:[options:{testMain:boolean;restart:boolean;validate:boolean;push:boolean;cleanup:boolean}];
   retry:[completionId:string];cancelPipeline:[completionId:string];
   merge:[options:{cleanup:boolean}];rollback:[mergeCommit:string];
 }>();
 // 一次核准要跑哪些階段。重啟與部署驗收只有 TaskFlow 自己這個專案才有意義，
 // 所以那兩個勾選框只在 selfProject 時出現（勾了也不會排進其他專案的流程）。
-const runRestart=ref(true),runValidate=ref(true);
+const runRestart=ref(true),runValidate=ref(true),runTestMain=ref(true);
+// 推送預設不勾：它是唯一會影響本機以外的動作。
+const runPush=ref(false);
 const view=computed(()=>completionView(props.task,props.review));
 // 預設勾選＝沿用後端既有預設（合併成功後移除 worktree 並刪除已合併分支）。
 // 取消勾選時分支與工作副本原樣保留，之後仍可手動處理。
@@ -75,8 +77,10 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
       <ol class="completion-plan">
         <li>測試比對：在 <code>{{view.branch.base}}</code> 取基準，再跑任務分支，有新增失敗就停住</li>
         <li>以 <code>git merge --no-ff</code> 併入 <code>{{view.branch.base}}</code></li>
+        <li v-if="runTestMain">合併後在 <code>{{view.branch.base}}</code> 重跑同一套測試（抓兩邊各自都對、合起來壞掉的情況）</li>
         <li v-if="view.restart&&runRestart">重新啟動正式 TaskFlow（先建置，建置失敗不會停掉現在的服務）</li>
         <li v-if="view.restart&&runValidate">部署驗收：驗 API 並確認 Preview 程序結束</li>
+        <li v-if="runPush">推送 <code>{{view.branch.base}}</code> 到遠端</li>
         <li v-if="cleanup">清理 worktree 與已合併分支</li>
       </ol>
       <div class="completion-options">
@@ -87,11 +91,17 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
           <input v-model="runValidate" type="checkbox" :disabled="busy"> 重啟後執行部署驗收
         </label>
         <label class="completion-option">
+          <input v-model="runTestMain" type="checkbox" :disabled="busy"> 合併後在正式分支重測
+        </label>
+        <label v-if="view.push?.configured" class="completion-option">
+          <input v-model="runPush" type="checkbox" :disabled="busy"> 完成後推送到 {{view.push.remote}}（預設不推）
+        </label>
+        <label class="completion-option">
           <input v-model="cleanup" type="checkbox" :disabled="busy"> 全部完成後清理工作副本與分支
         </label>
       </div>
       <button type="button" class="primary" :disabled="busy"
-              @click="emit('approve',{restart:runRestart,validate:runValidate,cleanup})">核准並完成</button>
+              @click="emit('approve',{testMain:runTestMain,restart:runRestart,validate:runValidate,push:runPush,cleanup})">核准並完成</button>
       <p class="subtle">任一階段失敗都會停在那裡等你，不會繼續往下跑；已完成的階段不會重做。</p>
     </div>
 
@@ -148,6 +158,48 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
         <p v-if="view.test.verdict==='baseline_unavailable'||view.test.verdict==='parse_failed'" class="subtle">
           這種情況不會自動擋住合併，但也不代表沒有 regression——讀不懂結果就是讀不懂，請自行判斷後再決定。
         </p>
+      </template>
+    </div>
+
+    <!-- 合併後重測：分支比對通過只證明分支自己沒問題。 -->
+    <div v-if="view.merge" class="completion-test">
+      <div class="setting-row">
+        <strong>合併後重測</strong>
+        <span v-if="view.mainTest?.verdictLabel" class="badge" :class="view.mainTest.toneClass">{{view.mainTest.verdictLabel}}</span>
+        <span v-else-if="view.mainTest?.running" class="badge queued">執行中</span>
+        <span v-else-if="view.mainTest?.interrupted" class="badge paused">已中斷</span>
+        <span v-else class="badge queued">尚未重測</span>
+        <button v-if="view.canRunMainTest" type="button" class="secondary" :disabled="busy"
+                @click="emit('testMain')">{{view.mainTest?'重新執行':'在正式分支重測'}}</button>
+      </div>
+
+      <p v-if="!view.mainTest" class="subtle">
+        在合併後的 <code>{{view.branch.base}}</code> 上重跑同一套測試，與合併前的基準比對。
+        兩邊各自都通過、合起來卻壞掉的情況，只有這一步看得到。
+      </p>
+      <p v-else-if="view.mainTest.running" class="subtle">正在重跑；結果會自己更新。</p>
+      <p v-else-if="view.mainTest.error" class="error-text">{{view.mainTest.error}}</p>
+
+      <template v-if="view.mainTest&&!view.mainTest.running">
+        <ul class="completion-test-runs">
+          <li v-if="view.mainTest.baseline">
+            <span class="grow">合併前的基準</span>
+            <small v-if="view.mainTest.baseline.ok">{{view.mainTest.baseline.total}} 項，{{view.mainTest.baseline.failedCount}} 項失敗</small>
+            <small v-else class="error-text">{{view.mainTest.baseline.reasonText||'無法判讀'}}</small>
+          </li>
+          <li v-if="view.mainTest.current">
+            <span class="grow">合併後的 <code>{{view.branch.base}}</code> <code>{{view.mainTest.current.commit}}</code></span>
+            <small v-if="view.mainTest.current.ok">{{view.mainTest.current.total}} 項，{{view.mainTest.current.failedCount}} 項失敗</small>
+            <small v-else class="error-text">{{view.mainTest.current.reasonText||'無法判讀'}}</small>
+          </li>
+        </ul>
+        <template v-if="view.mainTest.newFailureCount">
+          <h4>合併造成的新失敗（{{view.mainTest.newFailureCount}}）</h4>
+          <ul class="completion-test-failures">
+            <li v-for="key in view.mainTest.newFailures" :key="key"><code>{{key}}</code></li>
+          </ul>
+          <p class="subtle">這些在合併前的正式分支與任務分支上都沒有出現。若要退回，請使用下方的「撤銷這次合併」。</p>
+        </template>
       </template>
     </div>
 
@@ -212,6 +264,25 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
         </p>
         <p v-if="view.validation.note" class="subtle">{{view.validation.note}}</p>
       </template>
+    </div>
+
+    <!-- 推送遠端：整條流程最後一個還會把人趕回終端機的步驟。預設不做，要明確按。 -->
+    <div v-if="view.push&&view.merge" class="completion-push">
+      <div class="setting-row">
+        <strong>推送到遠端</strong>
+        <span class="badge" :class="view.push.toneClass">{{view.push.label}}</span>
+        <button v-if="view.canPush" type="button" class="secondary" :disabled="busy"
+                @click="emit('push')">推送 {{view.push.remote}}/{{view.push.baseBranch}}</button>
+      </div>
+      <p v-if="view.push.note" class="subtle">{{view.push.note}}</p>
+      <p v-if="view.push.pushed" class="subtle">
+        已於 {{time(view.push.pushed.at)}} 推送 {{view.push.pushed.count}} 個 commit 到
+        <code>{{view.push.pushed.remote}}/{{view.push.pushed.baseBranch}}</code>。
+      </p>
+      <p v-else-if="view.canPush" class="subtle">
+        這一步會把本機的 <code>{{view.branch.base}}</code> 送上遠端，是唯一會影響你電腦以外的動作。
+        TaskFlow 只會推這一條分支，不會強推、不會推標籤，落後遠端時會直接拒絕。
+      </p>
     </div>
 
     <!-- 擋住的原因逐條列出，每一條都附「所以我該做什麼」。 -->
@@ -286,6 +357,8 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
 .completion-options{display:flex;flex-direction:column;gap:2px;margin:8px 0}
 .completion-test{margin:10px 0;padding:10px 12px;border:1px solid var(--line,rgba(127,127,127,.25));border-radius:8px}
 .completion-restart{margin:10px 0;padding:10px 12px;border:1px solid var(--line,rgba(127,127,127,.25));border-radius:8px}
+.completion-push{margin:10px 0;padding:10px 12px;border:1px solid var(--line,rgba(127,127,127,.25));border-radius:8px}
+.completion-push .setting-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .completion-validation{margin:10px 0;padding:10px 12px;border:1px solid var(--line,rgba(127,127,127,.25));border-radius:8px}
 .completion-validation .setting-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .completion-checks{margin:8px 0;padding-left:2px;list-style:none}

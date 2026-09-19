@@ -28,7 +28,7 @@ export const STAGE_LABELS = {
 // 合併後的 Browser Validation 尚未納入，這件事必須明講——把還沒實作的階段畫成
 // 「尚未開始」會讓人以為系統等一下就會自己做。
 export const COMPLETION_SCOPE_NOTE =
-  '目前這個區塊涵蓋：檢視變更 → 測試比對 → 核准合併 → 重新啟動正式 TaskFlow → 部署驗收（API 與程序）→ 清理任務分支。畫面互動的 Browser Validation 尚未納入，仍需另行驗收。';
+  '目前這個區塊涵蓋：檢視變更 → 測試比對 → 核准合併 → 合併後重測 → 重新啟動正式 TaskFlow → 部署驗收（API 與程序）→ 推送遠端（需另行勾選）→ 清理任務分支。畫面互動的 Browser Validation 尚未納入，仍需另行驗收。';
 
 // 狀態 → 既有 badge 樣式。刻意放在這裡而不是寫成 template 裡的行內對照表：
 // template 會被 vue-tsc 嚴格檢查，少一個鍵就整個 build 失敗；放在這個模組還能被測試涵蓋。
@@ -59,6 +59,7 @@ export const TEST_REASONS = {
   timed_out: '測試執行逾時，被中斷的部分從未跑完。',
   install_failed: '安裝相依套件失敗，測試沒有開始。',
   not_on_base_branch: '專案目錄目前不在正式分支上，取到的基準不會是正式分支的結果。',
+  no_pre_merge_baseline: '沒有合併前的基準（合併前沒有先做測試比對），無法判斷這次合併造成了什麼。',
 };
 
 const MERGE_GUARANTEES = [
@@ -156,6 +157,15 @@ export function testComparisonView(task) {
 }
 
 /**
+ * 合併後在正式分支重測的結果。分支比對通過只證明分支自己沒問題；
+ * 兩邊各自都對、合起來壞掉（semantic conflict）只有這一步看得到。
+ * @param {any} task
+ */
+export function mainTestView(task) {
+  return testComparisonView({ completionTest: task?.completionMainTest });
+}
+
+/**
  * 重新啟動正式 TaskFlow 的狀態。只有 TaskFlow 自己這個專案才有這一段。
  *
  * 這件事不是主 server 自己做的：重啟會殺掉執行它的行程，所以請求寫進資料庫，
@@ -190,6 +200,44 @@ export function restartStatusView(task) {
     expectedCommit: shortCommit(request?.expectedCommit),
     requestedAt: text(request?.requestedAt) || null,
     finishedAt: text(request?.finishedAt) || null,
+  };
+}
+
+/**
+ * 遠端推送狀態。整條流程最後一個還會把人趕回終端機的步驟。
+ *
+ * 刻意的限制：這一段完全依賴後端上一次 fetch 的結果（開啟審核畫面不觸發網路操作），
+ * 所以數字可能稍舊；真正按下推送時後端會自己先 fetch 再判斷。
+ * @param {any} task
+ * @param {any} review
+ */
+export function pushStatusView(task, review) {
+  const remote = review?.remote;
+  const pushed = task?.gitPush || review?.push || null;
+  if (!remote) return null;
+  if (!remote.configured) {
+    return { configured: false, label: '沒有設定遠端', toneClass: 'queued', note: '這個專案沒有設定 origin，沒有可以推送的對象。', ahead: 0, behind: 0, pushed: null };
+  }
+  const ahead = Number.isInteger(remote.ahead) ? remote.ahead : null;
+  const behind = Number.isInteger(remote.behind) ? remote.behind : null;
+  return {
+    configured: true,
+    remote: text(remote.remote) || 'origin',
+    baseBranch: text(remote.baseBranch) || text(task?.git?.baseBranch),
+    url: text(remote.url) || null,
+    ahead,
+    behind,
+    // 落後遠端是「要先自己處理」，不是失敗；說清楚 TaskFlow 不會替你選 merge 還是 rebase。
+    blockedByBehind: (behind || 0) > 0,
+    label: (behind || 0) > 0 ? `落後遠端 ${behind} 個 commit`
+      : ahead === null ? '遠端尚無這個分支'
+        : ahead > 0 ? `領先 ${remote.remote || 'origin'}/${remote.baseBranch} ${ahead} 個 commit`
+          : '與遠端同步',
+    toneClass: (behind || 0) > 0 ? 'paused' : ahead ? 'queued' : 'completed',
+    note: (behind || 0) > 0
+      ? `${remote.remote}/${remote.baseBranch} 有 ${behind} 個你本機還沒有的 commit。TaskFlow 不會替你決定要用 merge 還是 rebase，請先自行整合後再推送。`
+      : ahead === null ? '遠端還沒有這個分支，或尚未 fetch 過；按下推送時後端會先 fetch 再判斷。' : null,
+    pushed: pushed ? { remote: text(pushed.remote), baseBranch: text(pushed.baseBranch), count: pushed.count || 0, at: text(pushed.at) } : null,
   };
 }
 
@@ -424,6 +472,17 @@ export function completionStages(task, review) {
         ? stage('merge', `合併到 ${base}`, 'blocked', blockers[0].message)
         : stage('merge', `合併到 ${base}`, 'pending', '等待你核准'));
 
+  const mainTest = mainTestView(task);
+  stages.push(!mainTest
+    ? stage('test_main', '合併後在正式分支重測', 'pending', task?.gitMerge ? '合併後可執行' : '合併後才需要')
+    : mainTest.running
+      ? stage('test_main', '合併後在正式分支重測', 'active', '執行中')
+      : mainTest.verdict === 'no_regression'
+        ? stage('test_main', '合併後在正式分支重測', 'done', '合併沒有造成新的失敗')
+        : mainTest.verdict === 'regression'
+          ? stage('test_main', '合併後在正式分支重測', 'failed', `${mainTest.newFailureCount} 項新的失敗`)
+          : stage('test_main', '合併後在正式分支重測', 'blocked', mainTest.verdictLabel || mainTest.error || '尚未取得結果'));
+
   // 重新啟動只在 TaskFlow 自己這個專案才是流程的一部分；別的專案顯示這一列只會誤導。
   const restart = restartStatusView(task);
   if (restart) {
@@ -475,6 +534,8 @@ export function completionView(task, review = null) {
   // 還沒讀到 review 就不能說「可以合併」：正式分支乾不乾淨只有那支 API 知道。
   const canMerge = loaded && !merged && !blockers.length;
   const pipeline = pipelineView(task);
+  const mainTest = mainTestView(task);
+  const pushView = pushStatusView(task, review);
 
   const state = merged ? (rolledBack ? 'rolled_back' : 'merged')
     : conflicted ? 'conflict'
@@ -531,8 +592,14 @@ export function completionView(task, review = null) {
     artifactVersion: text(task.artifactVersion) || null,
     pipeline: pipelineView(task),
     test: testComparisonView(task),
+    mainTest,
+    // 合併之後才有對象可以重測；執行中不能重複觸發。
+    canRunMainTest: merged && !mainTest?.running && !pipeline?.running,
     restart: restartStatusView(task),
     validation: validationStatusView(task),
+    push: pushStatusView(task, review),
+    // 只有合併完成、遠端存在、沒有落後、而且真的有東西要推時才給按鈕。
+    canPush: merged && !pipeline?.running && !!pushView && pushView.configured && !pushView.blockedByBehind && (pushView.ahead === null || pushView.ahead > 0),
     // 驗的是合併後的正式分支，所以合併之前不提供；執行中不能重複觸發。
     canValidate: merged && !validationStatusView(task)?.running && !pipelineView(task)?.running,
     // 只有「合併完成、守護程式活著、目前沒有重啟在進行」時才給按鈕。

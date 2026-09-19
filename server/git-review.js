@@ -48,6 +48,7 @@ export function taskGitReview(store, user, tid, { gitWorkspace = shared } = {}) 
     merge: t.gitMerge || null,
     conflict: t.gitConflict || null,
     rollback: t.gitRollback || null,
+    push: t.gitPush || null,
     cleanedUp: !!t.git.cleanedUp,
   };
 
@@ -55,6 +56,9 @@ export function taskGitReview(store, user, tid, { gitWorkspace = shared } = {}) 
     if (!t.git.cleanedUp && t.workspace) {
       review.commits = gitWorkspace.commits({ workingDirectory: t.workspace, baseCommit: t.git.baseCommit });
     }
+    // fetch:false —— 開啟審核畫面不該觸發網路操作；這裡顯示的是上次 fetch 之後的狀態，
+    // 真正要推送時 pushBaseBranch() 會自己先 fetch 一次。
+    review.remote = gitWorkspace.remoteStatus({ repositoryPath: t.git.repositoryPath, baseBranch: t.git.baseBranch, fetch: false });
     const state = gitWorkspace.inspect(t.git.repositoryPath);
     review.repository = {
       branch: state.branch, clean: state.dirty.length === 0,
@@ -163,6 +167,30 @@ export function decideGitReview(store, user, tid, input, { gitWorkspace = shared
     return updated;
   }
   throw new HttpError(400, '不支援的審核決定');
+}
+
+/**
+ * 把本機正式分支推到遠端。這是整條流程最後一個還會把人趕回終端機的步驟。
+ *
+ * 它不在自動化流程裡：預設不推，必須由使用者明確按下去（計畫書第十六章）。
+ * 落後遠端、工作樹不乾淨、不在正式分支上，都會拒絕並說明原因——TaskFlow 不會
+ * 替你決定要用 merge 還是 rebase 整合別人的工作。
+ */
+export function pushTaskBaseBranch(store, user, tid, input, { gitWorkspace = shared } = {}) {
+  const t = gitTask(store, user, tid);
+  if (!t.gitMerge) throw new HttpError(409, '尚未合併到正式分支，沒有屬於這個任務的成果可以推送。');
+  if (input?.baseBranch && input.baseBranch !== t.gitMerge.baseBranch) throw new HttpError(409, '分支不符，請重新查看後再推送。');
+
+  const outcome = gitWorkspace.push({ repositoryPath: t.git.repositoryPath, baseBranch: t.gitMerge.baseBranch });
+  if (!outcome.pushed) {
+    store.event(t.id, 'git_push_skipped', `${outcome.remote}/${outcome.baseBranch} 已經是最新的，沒有需要推送的 commit。`);
+    return store.task(t.id);
+  }
+  t.gitPush = { remote: outcome.remote, baseBranch: outcome.baseBranch, count: outcome.count, commit: outcome.commit, by: user.id, at: now() };
+  store.saveTask(t);
+  store.event(t.id, 'git_pushed', `${user.name} 核准推送：${outcome.count} 個 commit 已送上 ${outcome.remote}/${outcome.baseBranch}（${String(outcome.commit).slice(0, 8)}）`);
+  store.notify(t, `已推送至 ${outcome.remote}/${outcome.baseBranch}（${outcome.count} 個 commit）。`);
+  return store.task(t.id);
 }
 
 // Rollback 不回頭找舊資料夾，而是在正式分支上補一個反向 commit，歷史完整保留。

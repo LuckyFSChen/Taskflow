@@ -46,6 +46,12 @@ function deps(store, overrides = {}) {
         task.completionTest = { status: 'completed', verdict: 'no_regression', startedAt: new Date().toISOString(), newFailures: [] };
         s.saveTask(task);
       },
+      startMain(s, u, taskId) {
+        calls.push('test_main.start');
+        const task = s.task(taskId);
+        task.completionMainTest = { status: 'completed', verdict: 'no_regression', startedAt: new Date().toISOString(), newFailures: [] };
+        s.saveTask(task);
+      },
     },
     validations: {
       start(s, u, taskId) {
@@ -70,9 +76,22 @@ function deps(store, overrides = {}) {
       return null; // null = 沒有阻擋原因
     },
     restartStatus: (s, task) => s.task(task.id).restartRequest || null,
+    push(s, u, task) {
+      calls.push('push');
+      const latest = s.task(task.id);
+      latest.gitPush = { remote: 'origin', baseBranch: 'main', count: 3, at: new Date().toISOString() };
+      s.saveTask(latest);
+      return latest;
+    },
     cleanup(s, task) { calls.push('cleanup'); return { removed: true, branchDeleted: true }; },
   };
-  return { ...base, ...overrides };
+  // tests／validations 做子物件合併：測試通常只想換掉其中一個方法，
+  // 整個物件覆蓋會讓它意外丟掉其他方法（新增協作者方法時就會踩到）。
+  return {
+    ...base, ...overrides,
+    tests: { ...base.tests, ...overrides.tests },
+    validations: { ...base.validations, ...overrides.validations },
+  };
 }
 
 // 推進到指定階段開始等待為止。每個階段可能要兩個 tick：一個送出／啟動，一個讀結果。
@@ -94,10 +113,14 @@ function runToCompletion(store, taskId, d, limit = 25) {
 }
 
 test('TaskFlow 自己的專案跑完整五個階段；其他專案只跑測試、合併、清理', () => {
-  assert.deepEqual(plannedStages({ selfProject: true }), ['test', 'merge', 'restart', 'validate', 'cleanup']);
-  assert.deepEqual(plannedStages({ selfProject: false }), ['test', 'merge', 'cleanup']);
-  assert.deepEqual(plannedStages({ selfProject: true, options: { restart: false, validate: false } }), ['test', 'merge', 'cleanup']);
-  assert.deepEqual(plannedStages({ selfProject: false, options: { cleanup: false } }), ['test', 'merge']);
+  // 推送預設不排：它是唯一會影響本機以外的動作
+  assert.deepEqual(plannedStages({ selfProject: true }), ['test', 'merge', 'test_main', 'restart', 'validate', 'cleanup']);
+  assert.deepEqual(plannedStages({ selfProject: true, options: { push: true } }), ['test', 'merge', 'test_main', 'restart', 'validate', 'push', 'cleanup']);
+  // 合併後重測與專案是誰無關：semantic conflict 每個專案都會發生
+  assert.deepEqual(plannedStages({ selfProject: false }), ['test', 'merge', 'test_main', 'cleanup']);
+  assert.deepEqual(plannedStages({ selfProject: true, options: { restart: false, validate: false } }), ['test', 'merge', 'test_main', 'cleanup']);
+  assert.deepEqual(plannedStages({ selfProject: false, options: { cleanup: false } }), ['test', 'merge', 'test_main']);
+  assert.deepEqual(plannedStages({ selfProject: false, options: { testMain: false } }), ['test', 'merge', 'cleanup']);
 });
 
 test('一次核准就依序跑完，順序不會亂', t => {
@@ -106,8 +129,8 @@ test('一次核准就依序跑完，順序不會亂', t => {
   const task = runToCompletion(f.store, f.taskId, d);
 
   assert.equal(task.completion.status, 'completed');
-  assert.deepEqual(d.calls, ['test.start', 'merge', 'restart.request', 'validate.start', 'cleanup']);
-  for (const stage of ['test', 'merge', 'restart', 'validate', 'cleanup']) {
+  assert.deepEqual(d.calls, ['test.start', 'merge', 'test_main.start', 'restart.request', 'validate.start', 'cleanup']);
+  for (const stage of ['test', 'merge', 'test_main', 'restart', 'validate', 'cleanup']) {
     assert.equal(task.completion.results[stage].ok, true, stage);
   }
   assert.ok(f.store.events(f.taskId).some(e => e.kind === 'completion_finished'));
@@ -171,7 +194,7 @@ test('失敗之後重試只從失敗的那一階段開始，已完成的階段�
   assert.equal(stopped.completion.status, 'failed');
   assert.equal(stopped.completion.failure.stage, 'validate');
   assert.match(stopped.completion.failure.message, /login/);
-  assert.deepEqual(d.calls, ['test.start', 'merge', 'restart.request', 'validate.start']);
+  assert.deepEqual(d.calls, ['test.start', 'merge', 'test_main.start', 'restart.request', 'validate.start']);
 
   // 使用者按下「從失敗階段重試」：合併與重啟的結果都還在，不會再做一次。
   failValidation = false;
@@ -181,7 +204,7 @@ test('失敗之後重試只從失敗的那一階段開始，已完成的階段�
   const finished = runToCompletion(f.store, f.taskId, d);
 
   assert.equal(finished.completion.status, 'completed');
-  assert.deepEqual(d.calls, ['test.start', 'merge', 'restart.request', 'validate.start', 'validate.start', 'cleanup']);
+  assert.deepEqual(d.calls, ['test.start', 'merge', 'test_main.start', 'restart.request', 'validate.start', 'validate.start', 'cleanup']);
   assert.equal(d.calls.filter(c => c === 'merge').length, 1);
   assert.equal(d.calls.filter(c => c === 'restart.request').length, 1);
 });
@@ -329,6 +352,96 @@ test('使用者中途取消之後，tick 不會再推進它', t => {
   assert.equal(f.store.task(f.taskId).completion.results.test.ok, true);
 });
 
+test('合併後重測抓到新的失敗時停住，並指出那是合併造成的、可以撤銷', t => {
+  const f = fixture(t);
+  const d = deps(f.store, {
+    tests: {
+      start(s, u, taskId) {
+        d.calls.push('test.start');
+        const task = s.task(taskId);
+        task.completionTest = { status: 'completed', verdict: 'no_regression', startedAt: new Date().toISOString() };
+        s.saveTask(task);
+      },
+      startMain(s, u, taskId) {
+        d.calls.push('test_main.start');
+        const task = s.task(taskId);
+        task.completionMainTest = { status: 'completed', verdict: 'regression', newFailureCount: 1, startedAt: new Date().toISOString() };
+        s.saveTask(task);
+      },
+    },
+  });
+  const task = runToCompletion(f.store, f.taskId, d);
+
+  assert.equal(task.completion.status, 'failed');
+  assert.equal(task.completion.failure.stage, 'test_main');
+  assert.match(task.completion.failure.message, /合併本身造成的/);
+  assert.match(task.completion.failure.message, /撤銷這次合併/);
+  // 合併已經發生，流程不會自作主張退回去；也不會繼續往重啟走。
+  assert.ok(f.store.task(f.taskId).gitMerge);
+  assert.equal(d.calls.includes('restart.request'), false);
+});
+
+test('沒有合併前的基準時通過但留下警告，不假裝證明了合併沒問題', t => {
+  const f = fixture(t);
+  const d = deps(f.store, {
+    tests: {
+      start(s, u, taskId) {
+        const task = s.task(taskId);
+        task.completionTest = { status: 'completed', verdict: 'no_regression', startedAt: new Date().toISOString() };
+        s.saveTask(task);
+      },
+      startMain(s, u, taskId) {
+        const task = s.task(taskId);
+        task.completionMainTest = { status: 'completed', verdict: 'baseline_unavailable', startedAt: new Date().toISOString() };
+        s.saveTask(task);
+      },
+    },
+  });
+  const task = runToCompletion(f.store, f.taskId, d);
+
+  assert.equal(task.completion.status, 'completed');
+  assert.match(task.completion.results.test_main.note, /未能證明合併沒有造成新的失敗/);
+});
+
+test('可以關掉合併後重測，但預設是開著的', t => {
+  const f = fixture(t, { options: { testMain: false } });
+  const d = deps(f.store);
+  const task = runToCompletion(f.store, f.taskId, d);
+
+  assert.equal(task.completion.status, 'completed');
+  assert.equal(d.calls.includes('test_main.start'), false);
+  assert.equal(task.completion.options.testMain, false);
+});
+
+test('勾選推送時才會推，且落後遠端就停住等人', t => {
+  const pushed = fixture(t, { options: { push: true } });
+  const ok = deps(pushed.store);
+  const done = runToCompletion(pushed.store, pushed.taskId, ok);
+  assert.equal(done.completion.status, 'completed');
+  assert.equal(ok.calls.includes('push'), true);
+  assert.equal(done.completion.results.push.count, 3);
+
+  const blocked = fixture(t, { options: { push: true } });
+  const refusing = deps(blocked.store, {
+    push() { throw new Error('origin/main 有 2 個你本機還沒有的 commit。TaskFlow 不會替你決定要用 merge 還是 rebase'); },
+  });
+  const stopped = runToCompletion(blocked.store, blocked.taskId, refusing);
+  assert.equal(stopped.completion.status, 'failed');
+  assert.equal(stopped.completion.failure.stage, 'push');
+  assert.match(stopped.completion.failure.message, /merge 還是 rebase/);
+  // 推送失敗不影響已經完成的階段
+  assert.equal(stopped.completion.results.merge.ok, true);
+});
+
+test('預設的一次核准不會推送任何東西到遠端', t => {
+  const f = fixture(t);
+  const d = deps(f.store);
+  const task = runToCompletion(f.store, f.taskId, d);
+  assert.equal(task.completion.status, 'completed');
+  assert.equal(d.calls.includes('push'), false);
+  assert.equal(task.completion.options.push, false);
+});
+
 test('nextStage 會跳過已經成功的階段', () => {
   assert.equal(nextStage({ stages: ['test', 'merge'], results: {} }), 'test');
   assert.equal(nextStage({ stages: ['test', 'merge'], results: { test: { ok: true } } }), 'merge');
@@ -342,7 +455,7 @@ test('送到瀏覽器的形狀：每個階段的標籤、完成與否、目前�
 
   const view = completionPublic(f.store.task(f.taskId));
   assert.equal(view.status, 'running');
-  assert.deepEqual(view.stages.map(s => s.key), ['test', 'merge', 'restart', 'validate', 'cleanup']);
+  assert.deepEqual(view.stages.map(s => s.key), ['test', 'merge', 'test_main', 'restart', 'validate', 'cleanup']);
   assert.equal(view.stages[0].label, '測試比對');
   assert.equal(view.stages[0].ok, true);
   assert.equal(view.approvedByName, 'Lucky');
