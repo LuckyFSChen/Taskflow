@@ -104,7 +104,50 @@ export function completionAvailable(task) {
  */
 export function shouldLoadReview(task) {
   if (!completionAvailable(task)) return false;
-  return task.status === 'completed' || !!task.gitMerge || !!task.gitConflict || !!task.gitReview;
+  // Git 現況與「任務完成了沒」是兩個不同維度。停在 waiting_input、驗證未通過或等待修正的
+  // 任務，同樣可能已經有實作 commit——先前只在 completed／已合併／有衝突時才讀，等於要求
+  // 使用者在任務完成前都無從得知分支上有什麼，而空的 commits 還會被推導成「尚未產生 commit」。
+  // 只要任務有自己的 Git 工作副本與分支，讀 Git 現況就有意義。
+  //
+  // 成本沒有變：這支 API 會實際執行 git 指令，所以仍然只在開啟任務、合併完成或使用者按
+  // 「重新讀取 Git 狀態」時取一次，絕不放進三秒一次的 /state 輪詢（見 server/git-review.js）。
+  return !!text(task.git?.workingBranch);
+}
+
+/**
+ * /api/tasks/:id/git/review 的讀取狀態。
+ *
+ * 這一層必須存在：沒有它，「還沒去問」與「問過了、真的沒有」會被壓成同一個空陣列，
+ * 畫面就會把「尚未讀取」講成「尚未產生 commit」——那是一句假話。
+ */
+export const GIT_REVIEW_STATES = ['not_loaded', 'loading', 'loaded', 'error'];
+
+function reviewLoadState(review, reviewState) {
+  if (GIT_REVIEW_STATES.includes(reviewState)) return reviewState;
+  // 舊的呼叫端只傳 review：有物件就是讀到了，沒有就是還沒讀。
+  return review ? 'loaded' : 'not_loaded';
+}
+
+// 實作階段這一列的唯一推導處。commit 清單只有 /git/review 知道，所以這裡必須同時看
+// 讀取狀態與任務自己就有的 Git 座標：headCommit 已經和 baseCommit 不同時，commit 確實
+// 存在，即使清單還沒讀回來，也不能說沒有。
+function implementationStage(task, review, commits, loadState) {
+  const label = '實作與階段 commit';
+  if (commits.length) return stage('implementation', label, 'done', `${commits.length} 個 commit`);
+  if (review?.cleanedUp) return stage('implementation', label, 'done', '工作副本已清理，commit 清單不再讀取');
+  if (loadState === 'loading') return stage('implementation', label, 'active', '正在讀取 Git 狀態');
+  if (loadState === 'error') {
+    return stage('implementation', label, 'blocked', '讀取 Git 狀態失敗，無法確認是否已有 commit',
+      '讀取失敗不等於沒有 commit；請按「重新讀取 Git 狀態」再試一次。');
+  }
+  const headCommit = text(task?.git?.headCommit);
+  const baseCommit = text(task?.git?.baseCommit);
+  const commitsExist = !!headCommit && !!baseCommit && headCommit !== baseCommit;
+  if (loadState === 'not_loaded') {
+    return stage('implementation', label, 'pending',
+      commitsExist ? '工作分支已有 commit，尚未讀取清單' : '尚未讀取 Git 狀態');
+  }
+  return stage('implementation', label, 'pending', '尚未產生 commit');
 }
 
 /**
@@ -442,17 +485,15 @@ export function mergeBlockers(task, review) {
  * 合併與清理的階段清單。只由真實資料推導，無法判斷的一律 pending。
  * @param {any} task
  * @param {any} review
+ * @param {string|null} [reviewState] Git 現況的讀取狀態（GIT_REVIEW_STATES 之一）；
+ *   省略時由 review 有無推回舊行為。
  */
-export function completionStages(task, review) {
+export function completionStages(task, review, reviewState = null) {
   const stages = [];
   const commits = list(review?.commits);
   const validation = list(review?.validation);
 
-  stages.push(commits.length
-    ? stage('implementation', '實作與階段 commit', 'done', `${commits.length} 個 commit`)
-    : review?.cleanedUp
-      ? stage('implementation', '實作與階段 commit', 'done', '工作副本已清理，commit 清單不再讀取')
-      : stage('implementation', '實作與階段 commit', 'pending', '尚未產生 commit'));
+  stages.push(implementationStage(task, review, commits, reviewLoadState(review, reviewState)));
 
   const reviewThread = validation.filter(v => v.phase === 'review').at(-1);
   stages.push(reviewThread
@@ -531,8 +572,10 @@ export function completionStages(task, review) {
  * 部署與驗收區塊要顯示的全部內容。沒有可顯示的東西就回傳 null。
  * @param {any} task 由 /api/tasks/:id 取得的任務
  * @param {any} review 由 /api/tasks/:id/git/review 取得的審核資料；尚未載入時為 null
+ * @param {string|null} [reviewState] Git 現況的讀取狀態（GIT_REVIEW_STATES 之一）。
+ *   省略時由 review 有無推回舊行為，讓既有呼叫端不受影響。
  */
-export function completionView(task, review = null) {
+export function completionView(task, review = null, reviewState = null) {
   if (!completionAvailable(task)) return null;
 
   const git = task.git || {};
@@ -591,7 +634,7 @@ export function completionView(task, review = null) {
       subject: text(c.subject),
       at: text(c.at),
     })),
-    stages: completionStages(task, review),
+    stages: completionStages(task, review, reviewState),
     blockers,
     guarantees: MERGE_GUARANTEES,
     merge: task.gitMerge ? { ...task.gitMerge, short: shortCommit(task.gitMerge.commit), at: text(task.gitMerge.at) } : null,

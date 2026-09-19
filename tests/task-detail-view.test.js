@@ -431,3 +431,161 @@ test('步驟全部完成後，通過的驗證才顯示為已完成', () => {
   });
   assert.equal(progressSteps(task).find(s => s.key === 'review').state, 'done');
 });
+
+// ---- 重新規劃之後，舊版本的紀錄不得污染目前狀態 -------------------------------
+// 真實事故：Task Group 2 重新規劃到 v5 之後，畫面顯示 7/11 個項目已完成、v5 的第 3、4 步
+// 打勾、還多出「第 1 輪修正方案」——但 v5 只完成 2 步，第 3 步是失敗的，第 4 步沒跑過，
+// 而 v5 的 round 是 0。原因是讀取端每個推導函式都直接讀 task.threads（所有版本），
+// 沒有套用 runner 派工時用的同一條規則（只看 version === planVersion）。
+
+function replannedTask(extra = {}) {
+  // v1 跑過三步、做過一輪修正、也跑過一次通過的最終驗證；使用者接著補充需求重新規劃成 v2。
+  return baseTask({
+    planVersion: 2,
+    approvedVersion: 2,
+    round: 0,
+    completedSteps: 0,
+    threads: [
+      thread({ id: 'v1-s1', version: 1, result: { passed: true, questions: [], evidence: ['v1 證據一'], summary: 'v1 第一步' } }),
+      thread({ id: 'v1-s2', version: 1, result: { passed: true, questions: [], evidence: ['v1 證據二'], summary: 'v1 第二步' } }),
+      thread({ id: 'v1-s3', version: 1, result: { passed: true, questions: [], evidence: [], summary: 'v1 第三步' } }),
+      thread({ id: 'v1-repair-plan', version: 1, phase: 'repair_plan', round: 1, result: { questions: [] } }),
+      thread({ id: 'v1-repair', version: 1, phase: 'repair', round: 1, result: { passed: true, questions: [], evidence: [], summary: 'v1 修正' } }),
+      thread({ id: 'v1-review', version: 1, phase: 'review', role: '獨立驗證', result: { passed: true, questions: [], evidence: ['v1 驗證通過'], summary: 'v1 全部通過' } }),
+      thread({ id: 'v1-browser', version: 1, result: { passed: true, questions: [], evidence: [], summary: 'v1 瀏覽器', browserValidation: { required: true, status: 'passed', executed: true, passed: true, toolCallCount: 4, url: 'http://127.0.0.1:1111' } } }),
+    ],
+    ...extra,
+  });
+}
+
+test('舊版本已完成的步驟不會被算進目前計畫的進度', () => {
+  const task = replannedTask();
+  // v1 有三步通過，但 v2 一步都還沒跑完。
+  assert.deepEqual(states(task), ['✓ 整理需求與計畫', '✓ 核准執行計畫', '→ 分析需求', '○ 修改程式', '○ 執行測試', '○ 最終驗證']);
+  assert.equal(progressSummary(task).done, 2, '只有規劃與核准兩項屬於目前狀態');
+});
+
+test('舊版本的修正輪次不會出現在目前計畫的進度裡', () => {
+  const labels = progressSteps(replannedTask()).map(s => s.label);
+  assert.ok(!labels.some(label => label.includes('修正')), labels.join(' | '));
+});
+
+test('舊版本通過的最終驗證不會讓目前計畫顯示為已驗證', () => {
+  const review = progressSteps(replannedTask()).find(s => s.key === 'review');
+  assert.equal(review.state, 'pending', 'v1 的驗證不能代表 v2');
+});
+
+test('舊版本的 Browser 驗證不會成為目前的 Browser 驗證狀態', () => {
+  const task = replannedTask();
+  assert.equal(browserValidations(task).length, 0, 'v1 的紀錄不屬於目前版本');
+  assert.ok(!progressSteps(task).some(s => s.key === 'browser'), '目前版本還沒有任何 Browser 驗證紀錄，就不該畫這一列');
+});
+
+test('舊版本的驗證證據不會顯示為目前的證據', () => {
+  const task = replannedTask();
+  assert.deepEqual(validationEvidence(task), [], 'v1 的證據屬於歷史，不是 v2 的成果');
+  const withCurrent = replannedTask({
+    threads: [...replannedTask().threads,
+      thread({ id: 'v2-s1', version: 2, result: { passed: true, questions: [], evidence: ['v2 證據'], summary: 'v2 第一步' } })],
+  });
+  assert.deepEqual(validationEvidence(withCurrent).map(e => e.evidence).flat(), ['v2 證據']);
+});
+
+test('目前版本的紀錄照常採計，過濾不會把現在的東西也濾掉', () => {
+  const task = replannedTask({
+    completedSteps: 1,
+    threads: [...replannedTask().threads,
+      thread({ id: 'v2-s1', version: 2, result: { passed: true, questions: [], evidence: ['v2 證據'], summary: 'v2 第一步' } })],
+  });
+  assert.deepEqual(states(task).slice(2, 5), ['✓ 分析需求', '→ 修改程式', '○ 執行測試']);
+});
+
+test('歷史不會被刪掉：所有版本的工作階段仍然看得到', () => {
+  const task = replannedTask();
+  assert.equal(task.threads.length, 7, '推導不得改動來源資料');
+  const facts = technicalFacts(task);
+  assert.equal(facts.find(f => f.label === '工作階段數').value, '7', '技術資訊是歷史檢視，要涵蓋每個版本');
+  assert.match(facts.find(f => f.label === '計畫版本').value, /^v2/);
+});
+
+// ---- 目前計畫的步驟狀態必須分得出 pending / running / passed / failed ----------
+// 真實事故：v5 的第 3 步實際回傳 passed=false，進度卻畫成「尚未開始」，而待處理橫幅
+// 同時寫著「此步驟未通過驗收：test minimal」——兩邊互相矛盾。
+
+function stepState(task, key = 'step-0') {
+  return progressSteps(task).find(s => s.key === key);
+}
+
+test('目前版本的步驟失敗時顯示 failed，而不是「尚未開始」', () => {
+  const task = replannedTask({
+    status: 'waiting_input',
+    questions: ['此步驟未通過驗收：測試沒過'],
+    threads: [...replannedTask().threads,
+      thread({ id: 'v2-s1', version: 2, result: { passed: false, questions: [], evidence: [], summary: '測試沒過' } })],
+  });
+  const first = stepState(task);
+  assert.equal(first.state, 'failed');
+  assert.equal(first.note, '驗收未通過：測試沒過');
+  assert.equal(first.label, '分析需求', '標題必須維持計畫裡的步驟名稱');
+});
+
+test('步驟尚未執行時顯示 pending', () => {
+  const task = replannedTask({ status: 'paused' });
+  assert.equal(stepState(task).state, 'pending');
+});
+
+test('步驟通過時顯示 done', () => {
+  const task = replannedTask({
+    completedSteps: 1,
+    threads: [...replannedTask().threads,
+      thread({ id: 'v2-s1', version: 2, result: { passed: true, questions: [], evidence: ['ok'], summary: '做完了' } })],
+  });
+  assert.equal(stepState(task).state, 'done');
+});
+
+test('步驟執行中時顯示 active，不會因為上一次失敗就標成 failed', () => {
+  const task = replannedTask({
+    status: 'running',
+    threads: [...replannedTask().threads,
+      thread({ id: 'v2-s1-fail', version: 2, result: { passed: false, questions: [], evidence: [], summary: '第一次沒過' } }),
+      thread({ id: 'v2-s1-retry', version: 2, status: 'running', result: null })],
+  });
+  assert.equal(stepState(task).state, 'active');
+});
+
+test('平台已經在重跑（queued）時不再標成失敗', () => {
+  const task = replannedTask({
+    status: 'queued',
+    threads: [...replannedTask().threads,
+      thread({ id: 'v2-s1', version: 2, result: { passed: false, questions: [], evidence: [], summary: '沒過' } })],
+  });
+  assert.equal(stepState(task).state, 'active');
+});
+
+test('失敗摘要會截斷，不把任意長度的 agent 輸出塞進進度列', () => {
+  const task = replannedTask({
+    status: 'waiting_input',
+    threads: [...replannedTask().threads,
+      thread({ id: 'v2-s1', version: 2, result: { passed: false, questions: [], evidence: [], summary: '錯'.repeat(400) } })],
+  });
+  const first = stepState(task);
+  assert.ok(first.note.length < 80, `實際長度 ${first.note.length}`);
+  assert.match(first.note, /^驗收未通過：/);
+  assert.match(first.note, /…$/);
+});
+
+test('失敗但沒有摘要時仍然說得出「驗收未通過」', () => {
+  const task = replannedTask({
+    status: 'waiting_input',
+    threads: [...replannedTask().threads,
+      thread({ id: 'v2-s1', version: 2, result: { passed: false, questions: [], evidence: [], summary: '' } })],
+  });
+  assert.equal(stepState(task).note, '驗收未通過');
+});
+
+test('推導是純函式：重複計算結果完全一致', () => {
+  const task = replannedTask();
+  assert.deepEqual(progressSteps(task), progressSteps(task));
+  assert.deepEqual(progressSummary(task), progressSummary(task));
+  assert.deepEqual(browserValidations(task), browserValidations(task));
+});

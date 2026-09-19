@@ -57,6 +57,23 @@ function threads(task) {
   return list(task?.threads);
 }
 
+// 目前這個計畫版本的工作階段。
+//
+// TaskFlow 的 canonical rule 是「一個 Task 在任一時間只有一個有效的計畫版本」，runner 派工時
+// 就是這樣判斷的（runner.js：`all=store.threads(t.id).filter(x=>x.version===t.planVersion)`）。
+// 讀取端過去沒有套用同一條規則：每個推導函式都直接讀 threads(task)，於是重新規劃之後，舊版本
+// 留下的 execute／repair／browser 紀錄會被算進目前的進度、修正輪次與驗證狀態——畫面因此可能
+// 顯示某一步「已完成」，但那一步其實屬於上一個版本，在目前版本甚至是失敗或還沒執行。
+//
+// 歷史不會因此消失：工作階段清單與技術資訊等歷史檢視仍然讀 threads()，每個版本都看得到。
+// version 不是整數時（理論上不存在，所有 thread 建立時都會帶 planVersion）保守回傳全部，
+// 寧可顯示得多，也不要讓畫面整個空掉。
+function activeThreads(task) {
+  const version = task?.planVersion;
+  if (!Number.isInteger(version)) return threads(task);
+  return threads(task).filter(th => th.version === version);
+}
+
 // --- 需要我處理的事情 ---------------------------------------------------------
 //
 // 與「待我處理」列表（src/attention.js）不同：列表只需要一個分類，
@@ -176,11 +193,21 @@ export function pendingBanner(task) {
 // --- 執行進度 -----------------------------------------------------------------
 
 function runningThread(task, phases) {
-  return threads(task).find(th => phases.includes(th.phase) && th.status === 'running') || null;
+  return activeThreads(task).find(th => phases.includes(th.phase) && th.status === 'running') || null;
 }
 
 function completedThreads(task, phase) {
-  return threads(task).filter(th => th.phase === phase && th.status === 'completed');
+  return activeThreads(task).filter(th => th.phase === phase && th.status === 'completed');
+}
+
+// 失敗摘要是 agent 自由輸出的文字，長度與內容都不可控，不能整段塞進進度列；
+// 標題一律維持計畫裡的步驟名稱，摘要只放在副標並截斷。
+const FAILURE_DETAIL_LIMIT = 60;
+function failureDetail(thread) {
+  const summary = text(thread?.result?.summary);
+  if (!summary) return '驗收未通過';
+  const clipped = summary.length > FAILURE_DETAIL_LIMIT ? `${summary.slice(0, FAILURE_DETAIL_LIMIT)}…` : summary;
+  return `驗收未通過：${clipped}`;
 }
 
 function step(key, label, state, detail = '', note = '') {
@@ -213,6 +240,16 @@ function executionSteps(task) {
   const done = Number.isInteger(task.completedSteps) ? task.completedSteps : 0;
   const running = runningThread(task, ['execute']);
   const blocked = !!task.manualAction || !!task.environmentIssue || !!task.executionApproval || !!task.gitRequest;
+  // 目前這一步已經跑過、而且回報未通過時，不能顯示成「尚未開始」：待處理橫幅正在說
+  // 「此步驟未通過驗收」，進度卻畫一個空心圈，兩邊互相矛盾。
+  //
+  // 判斷依據是「目前計畫版本最後一次跑完的 execute」：只挑最後一次失敗會誤判——那一步
+  // 後來可能又重跑成功、或正在重跑，此時最新的紀錄才算數。status 仍為 queued/running 時
+  // 代表平台已經在重試，就不該繼續標成失敗。
+  const lastExecute = activeThreads(task)
+    .filter(th => th.phase === 'execute' && th.status === 'completed')
+    .at(-1) || null;
+  const currentFailed = lastExecute?.result?.passed === false;
   return steps.map((planStepItem, index) => {
     const key = `step-${index}`;
     const label = text(planStepItem?.title) || `步驟 ${index + 1}`;
@@ -222,6 +259,9 @@ function executionSteps(task) {
     if (running) return step(key, label, 'active', role);
     if (blocked) return step(key, label, 'blocked', role, '需要你處理後才會繼續');
     if (task.status === 'failed') return step(key, label, 'failed', role);
+    if (currentFailed && ['waiting_input', 'paused'].includes(task.status)) {
+      return step(key, label, 'failed', role, failureDetail(lastExecute));
+    }
     if (['queued', 'running'].includes(task.status)) return step(key, label, 'active', role, '等待派工');
     return step(key, label, 'pending', role);
   });
@@ -231,7 +271,7 @@ function executionSteps(task) {
 // 再加上目前正在處理的這一輪。沒有修正就完全不出現。
 function repairRounds(task) {
   const rounds = new Set(
-    threads(task)
+    activeThreads(task)
       .filter(th => ['repair_plan', 'repair'].includes(th.phase) && Number.isInteger(th.round) && th.round > 0)
       .map(th => th.round),
   );
@@ -243,11 +283,11 @@ function repairSteps(task) {
   const steps = [];
   for (const round of repairRounds(task)) {
     const current = task.round === round;
-    const planned = threads(task).some(th => th.phase === 'repair_plan' && th.round === round && th.status === 'completed');
-    const repaired = threads(task).some(th => th.phase === 'repair' && th.round === round && th.status === 'completed' && th.result?.passed && !list(th.result?.questions).length);
+    const planned = activeThreads(task).some(th => th.phase === 'repair_plan' && th.round === round && th.status === 'completed');
+    const repaired = activeThreads(task).some(th => th.phase === 'repair' && th.round === round && th.status === 'completed' && th.result?.passed && !list(th.result?.questions).length);
     const planningNow = current && task.status === 'repair_planning';
     const awaitingApproval = current && task.status === 'awaiting_repair_approval';
-    const repairingNow = current && !!threads(task).find(th => th.phase === 'repair' && th.round === round && th.status === 'running');
+    const repairingNow = current && !!activeThreads(task).find(th => th.phase === 'repair' && th.round === round && th.status === 'running');
 
     steps.push(step(
       `repair-plan-${round}`,
@@ -318,7 +358,7 @@ export function attemptLabel(run, index) {
  * @returns {{threadId:string,role:string,phase:string,validation:any}[]}
  */
 export function browserValidations(task) {
-  return threads(task)
+  return activeThreads(task)
     .filter(th => th.result?.browserValidation?.required)
     .map(th => ({ threadId: th.id, role: text(th.role), phase: text(th.phase), validation: th.result.browserValidation }));
 }
@@ -406,7 +446,7 @@ export function progressSummary(task) {
  * @returns {{threadId:string,role:string,phase:string,summary:string,evidence:string[]}[]}
  */
 export function validationEvidence(task) {
-  return threads(task)
+  return activeThreads(task)
     .filter(th => list(th.result?.evidence).length)
     .map(th => ({
       threadId: th.id,

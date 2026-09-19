@@ -4,7 +4,7 @@
 // 按鈕能不能按也由那裡決定，避免 UI 比後端寬鬆。
 import {computed,ref} from 'vue';
 import {completionView} from './completion-view.js';
-const props=defineProps<{task?:any;review?:any;busy:boolean;loading?:boolean}>();
+const props=defineProps<{task?:any;review?:any;busy:boolean;loading?:boolean;reviewState?:string}>();
 const emit=defineEmits<{
   refresh:[];test:[];testMain:[];restart:[];validate:[];push:[];
   approve:[options:{testMain:boolean;restart:boolean;validate:boolean;push:boolean;cleanup:boolean}];
@@ -16,7 +16,7 @@ const emit=defineEmits<{
 const runRestart=ref(true),runValidate=ref(true),runTestMain=ref(true);
 // 推送預設不勾：它是唯一會影響本機以外的動作。
 const runPush=ref(false);
-const view=computed(()=>completionView(props.task,props.review));
+const view=computed(()=>completionView(props.task,props.review,props.reviewState));
 // 預設勾選＝沿用後端既有預設（合併成功後移除 worktree 並刪除已合併分支）。
 // 取消勾選時分支與工作副本原樣保留，之後仍可手動處理。
 const cleanup=ref(true);

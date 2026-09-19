@@ -5,6 +5,7 @@ import {
   shouldLoadReview,
   mergeBlockers,
   completionStages,
+  GIT_REVIEW_STATES,
   completionView,
   shortCommit,
 } from '../src/completion-view.js';
@@ -65,12 +66,20 @@ test('只有 git worktree 模式的任務才有部署與驗收', () => {
   assert.equal(completionView({ git: null }), null);
 });
 
-test('只有可能要合併時才去讀會實際執行 git 指令的 review API', () => {
+test('只要任務有自己的 Git 工作分支就能讀 Git 現況，不必等任務完成', () => {
+  // Git 現況與「任務完成了沒」是兩個維度：停在 waiting_input／驗證未過／等待修正的任務，
+  // 同樣可能已經有實作 commit。這支 API 會實際跑 git 指令，成本控制靠的是「只在開啟任務或
+  // 使用者按重新讀取時取一次」，而不是把它鎖到任務完成之後才准看。
   assert.equal(shouldLoadReview(baseTask()), true);
-  assert.equal(shouldLoadReview(baseTask({ status: 'running' })), false);
+  assert.equal(shouldLoadReview(baseTask({ status: 'running' })), true);
+  assert.equal(shouldLoadReview(baseTask({ status: 'waiting_input' })), true);
+  assert.equal(shouldLoadReview(baseTask({ status: 'repair_planning' })), true);
   assert.equal(shouldLoadReview(baseTask({ status: 'running', gitMerge: { commit: 'ab3e585' } })), true);
   assert.equal(shouldLoadReview(baseTask({ status: 'running', gitConflict: { files: ['a.js'] } })), true);
+  // 沒有 Git 工作副本的任務仍然不讀：那支 API 對它沒有意義。
   assert.equal(shouldLoadReview({ git: { mode: 'legacy' }, status: 'completed' }), false);
+  assert.equal(shouldLoadReview(baseTask({ git: { mode: 'worktree', baseBranch: 'main', workingBranch: '' } })), false);
+  assert.equal(shouldLoadReview({ status: 'completed' }), false);
 });
 
 test('狀態正常時沒有任何阻擋原因', () => {
@@ -617,4 +626,69 @@ test('明講目前尚未涵蓋 Browser Validation，不把未實作畫成尚未�
   const view = completionView(baseTask(), baseReview());
   assert.match(view.scopeNote, /尚未納入/);
   assert.equal(view.stages.some(s => /Browser/.test(s.label)), false);
+});
+
+// ---- 「還沒查」不能被講成「沒有」 --------------------------------------------
+// 真實事故：Task Group 2 的工作分支已經有三個階段 commit（headCommit 7c7ec100 已經不等於
+// baseCommit），畫面卻顯示「實作與階段 commit：尚未開始（尚未產生 commit）」。
+// 原因是 shouldLoadReview() 只在任務可能要合併時才去讀 /git/review，這個任務停在
+// waiting_input，前端從來沒問過；空的 commits 被當成「沒有 commit」。
+
+test('還沒讀取 git review 時，不得把「還沒查」說成「尚未產生 commit」', () => {
+  const task = baseTask({ status: 'waiting_input', git: { mode: 'worktree', baseBranch: 'main', workingBranch: 'taskflow/x', baseCommit: '40aa7dab', headCommit: '7c7ec100' } });
+  const implementation = completionStages(task, null).find(s => s.key === 'implementation');
+  assert.equal(implementation.state, 'pending');
+  assert.match(implementation.detail, /已有 commit/);
+  assert.doesNotMatch(implementation.detail, /尚未產生/);
+});
+
+test('還沒讀取，且工作分支確實還沒有 commit 時，說的是「尚未讀取」而不是「沒有」', () => {
+  const task = baseTask({ status: 'queued', git: { mode: 'worktree', baseBranch: 'main', workingBranch: 'taskflow/x', baseCommit: '40aa7dab', headCommit: '40aa7dab' } });
+  const implementation = completionStages(task, null).find(s => s.key === 'implementation');
+  assert.equal(implementation.state, 'pending');
+  assert.match(implementation.detail, /尚未讀取/);
+});
+
+test('真的讀取過而且確實沒有 commit 時，才說「尚未產生 commit」', () => {
+  const task = baseTask({ status: 'running', git: { mode: 'worktree', baseBranch: 'main', workingBranch: 'taskflow/x', baseCommit: '40aa7dab', headCommit: '40aa7dab' } });
+  const implementation = completionStages(task, baseReview({ commits: [] })).find(s => s.key === 'implementation');
+  assert.equal(implementation.detail, '尚未產生 commit');
+});
+
+test('讀到 commit 清單時照常顯示數量', () => {
+  const task = baseTask({ status: 'completed' });
+  const implementation = completionStages(task, baseReview({ commits: [{ hash: 'a' }, { hash: 'b' }] })).find(s => s.key === 'implementation');
+  assert.equal(implementation.state, 'done');
+  assert.match(implementation.detail, /2 個 commit/);
+});
+
+test('Git review 讀取中：說正在讀取，不說沒有 commit', () => {
+  const task = baseTask({ status: 'waiting_input', git: { mode: 'worktree', baseBranch: 'main', workingBranch: 'taskflow/x', baseCommit: '40aa7dab', headCommit: '7c7ec100' } });
+  const implementation = completionStages(task, null, 'loading').find(s => s.key === 'implementation');
+  assert.equal(implementation.state, 'active');
+  assert.match(implementation.detail, /正在讀取/);
+  assert.doesNotMatch(implementation.detail, /尚未產生/);
+});
+
+test('Git review 讀取失敗：說讀取失敗，絕不能當成沒有 commit', () => {
+  const task = baseTask({ status: 'waiting_input', git: { mode: 'worktree', baseBranch: 'main', workingBranch: 'taskflow/x', baseCommit: '40aa7dab', headCommit: '7c7ec100' } });
+  const implementation = completionStages(task, null, 'error').find(s => s.key === 'implementation');
+  assert.equal(implementation.state, 'blocked');
+  assert.match(implementation.detail, /讀取 Git 狀態失敗/);
+  assert.doesNotMatch(implementation.detail, /尚未產生/);
+  assert.match(implementation.note, /讀取失敗不等於沒有 commit/);
+});
+
+test('明確標示 loaded 且 commits 為空時，才說「尚未產生 commit」', () => {
+  const task = baseTask({ status: 'running', git: { mode: 'worktree', baseBranch: 'main', workingBranch: 'taskflow/x', baseCommit: '40aa7dab', headCommit: '40aa7dab' } });
+  const implementation = completionStages(task, baseReview({ commits: [] }), 'loaded').find(s => s.key === 'implementation');
+  assert.equal(implementation.detail, '尚未產生 commit');
+});
+
+test('讀取狀態只有這四種，且沒帶狀態時由 review 有無推回相容行為', () => {
+  assert.deepEqual(GIT_REVIEW_STATES, ['not_loaded', 'loading', 'loaded', 'error']);
+  const task = baseTask({ status: 'running', git: { mode: 'worktree', baseBranch: 'main', workingBranch: 'taskflow/x', baseCommit: 'aaa', headCommit: 'aaa' } });
+  // 舊呼叫端（只傳 review）行為不變：沒有 review 當成尚未讀取，有 review 當成已讀取。
+  assert.match(completionStages(task, null).find(s => s.key === 'implementation').detail, /尚未讀取/);
+  assert.equal(completionStages(task, baseReview({ commits: [] })).find(s => s.key === 'implementation').detail, '尚未產生 commit');
 });

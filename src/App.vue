@@ -150,15 +150,18 @@ const outputRaw=ref<any>(null),outputRecovery=ref<any>(null);
 // 部署與驗收的 Git 現況。/git/review 會實際執行 git 指令（讀 commit、讀正式分支狀態），
 // 所以絕不能放進三秒一次的 /state 輪詢——只在開啟任務、完成合併或使用者按重新讀取時取一次。
 const gitReview=ref<any>(null),reviewLoading=ref(false),reviewLoadedFor=ref<string|null>(null);
+// Git 現況的讀取狀態。沒有這一層，「還沒去問」和「問過了、真的沒有」在畫面上無從分辨，
+// 空的 commit 清單就會被講成「尚未產生 commit」（見 completion-view.js 的 GIT_REVIEW_STATES）。
+const reviewState=ref<'not_loaded'|'loading'|'loaded'|'error'>('not_loaded');
 async function loadReview(){
-  if(!selected.value||!shouldLoadReview(selected.value)){gitReview.value=null;return;}
+  if(!selected.value||!shouldLoadReview(selected.value)){gitReview.value=null;reviewState.value='not_loaded';return;}
   const taskId=selected.value.id;
   // 先記下「這個任務已經試著讀過了」，失敗也算：否則下面的 watch 會在每次失敗後立刻重試，
   // 變成一邊跳錯誤訊息一邊不停跑 git 指令。要重試請按「重新讀取 Git 狀態」。
   reviewLoadedFor.value=taskId;
-  reviewLoading.value=true;
-  try{const review=await api(`/tasks/${taskId}/git/review`);if(selected.value?.id===taskId)gitReview.value=review;}
-  catch(e:any){gitReview.value=null;notify(e.message);}
+  reviewLoading.value=true;reviewState.value='loading';
+  try{const review=await api(`/tasks/${taskId}/git/review`);if(selected.value?.id===taskId){gitReview.value=review;reviewState.value='loaded';}}
+  catch(e:any){if(selected.value?.id===taskId){gitReview.value=null;reviewState.value='error';}notify(e.message);}
   finally{reviewLoading.value=false;}
 }
 // 測試比對只是「開始」：整套測試要跑好幾分鐘，結果由既有的三秒輪詢帶回來（completionTest 欄位）。
@@ -226,7 +229,7 @@ async function completionRollback(mergeCommit:string){
   await run(async()=>{await api(`/tasks/${taskId}/git/rollback`,{mergeCommit});notify('已撤銷合併；歷史完整保留，未刪除任何 commit');});
   await loadReview();
 }
-async function openTask(t:any){tab.value=DEFAULT_TAB;answer.value='';files.value=[];outputRaw.value=null;outputRecovery.value=null;gitReview.value=null;reviewLoadedFor.value=null;await run(()=>loadTask(t.id));await loadReview();}
+async function openTask(t:any){tab.value=DEFAULT_TAB;answer.value='';files.value=[];outputRaw.value=null;outputRecovery.value=null;gitReview.value=null;reviewState.value='not_loaded';reviewLoadedFor.value=null;await run(()=>loadTask(t.id));await loadReview();}
 // 任務有可能在詳情開著的時候才跑完；輪詢只讀 /state，不碰 /git/review，所以這裡補讀一次。
 // 條件包含任務 id，換任務時會重新判斷；同一個任務只會自動讀一次。
 watch(()=>selected.value&&shouldLoadReview(selected.value)&&reviewLoadedFor.value!==selected.value.id,need=>{if(need)void loadReview();});
@@ -383,7 +386,7 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
         <ValidationSkip :request="selected.validationSkipRequest" :skips="selected.validationSkips" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/validation/decision`,{requestId:selected.validationSkipRequest.id,decision}))"/>
         <ExecutionApproval v-if="selected.executionApproval" :request="selected.executionApproval" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/execution/decision`,{requestId:selected.executionApproval.id,decision}))"/>
         <!-- 部署與驗收：核准合併、清理與撤銷都在這裡完成，不需要再開 PowerShell。 -->
-        <Completion :task="selected" :review="gitReview" :busy="busy" :loading="reviewLoading" @refresh="loadReview" @test="completionTest" @test-main="completionTestMain" @push="completionPush" @restart="completionRestart" @validate="completionValidate" @approve="completionApprove" @retry="completionRetry" @cancel-pipeline="completionCancel" @merge="completionMerge" @rollback="completionRollback"/>
+        <Completion :task="selected" :review="gitReview" :busy="busy" :loading="reviewLoading" :review-state="reviewState" @refresh="loadReview" @test="completionTest" @test-main="completionTestMain" @push="completionPush" @restart="completionRestart" @validate="completionValidate" @approve="completionApprove" @retry="completionRetry" @cancel-pipeline="completionCancel" @merge="completionMerge" @rollback="completionRollback"/>
         <section v-if="selected.validationFailure" class="questions"><h3>最近未通過的驗證：第 {{selected.round}} 輪修正</h3><p class="prewrap">{{selected.validationFailure.summary}}</p><ul><li v-for="(e,i) in selected.validationFailure.evidence" :key="i">{{e}}</li></ul><p v-if="!selected.validationFailure.evidence.length">驗證缺少可確認的證據。</p><p v-for="(q,i) in selected.validationFailure.questions" :key="i">待確認：{{q}}</p>
         <!-- reconcileCompletionState 的權威判定（server/completion-state.js）：AI 自己回報的
              passed/evidence 只是 claim，這裡列出的才是實際擋住完成的 deterministic 原因。 -->
