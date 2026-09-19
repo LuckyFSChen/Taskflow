@@ -313,6 +313,45 @@ A ──────── M
 - TaskFlow **不會**替你選 `ours` 或 `theirs`。
 - 你可以自己在專案裡處理完再回來核准，或改走「要求修改」讓 AI 重做。
 
+### 真正執行的 merge 一樣不信任 exit code
+
+預檢通過只代表「當下看起來沒問題」；預檢與真正執行 `git merge --no-ff --no-edit` 之間可能有新的
+變化，舊版 git 的探測本身也不夠準。所以這個 command 一律用 `allowFailure` 執行，不管它回報成功
+還是失敗，接下來都用 `inspectMergeState()`（`server/git-workspace.js`）重新讀 Git 本身的真實狀態
+做最終判斷：
+
+```
+git status --porcelain             一般 dirty 檔案
+git diff --name-only --diff-filter=U   目前未解決的衝突檔案
+git rev-parse -q --verify MERGE_HEAD   是否處於一個進行中的 merge
+目前 branch 與 HEAD                    HEAD 是否真的包含任務分支
+```
+
+只要 `mergeInProgress` 為真或 `unresolvedFiles` 非空，一律視為衝突：取未解決檔案清單、
+自動執行 `git merge --abort`（走專用授權通道）讓 `baseBranch` 回到合併前的乾淨狀態，
+再回報跟預檢衝突相同形狀的結果——即使 merge 指令本身回報「成功」也一樣不採信。
+只有 `inspectMergeState()` 確認乾淨、且 HEAD 確實包含任務分支時才算合併成功；其餘不一致的
+情況（工作樹髒污、HEAD 對不上）觸發 `merge_incomplete`，停下來等人工確認，不猜測、不重試。
+
+### `merge_in_progress` 與 `dirty_working_tree` 是两回事
+
+`assertMergeReady()` 在核准合併前，會先用 `inspectMergeState()` 檢查 `MERGE_HEAD` 是否存在。
+`MERGE_HEAD` 存在但沒有 `unresolvedFiles`，代表「衝突已經解決、只是還沒 commit」——這跟一般
+的未提交修改（`dirty_working_tree`）是完全不同的處境，不需要使用者再解一次衝突，只差一個
+commit 或一次 `git merge --abort`。因此這個狀態會先被獨立分類成 `merge_in_progress`（附上仍未
+解決的檔案清單），不會被下面籠統的 `dirty_working_tree` 訊息蓋過去。`mergeDecision`
+（`server/git-review.js`）接住這個例外後，一樣寫入 `t.gitConflict` 並發出 Human Action
+Request，不會變成無結構的純文字錯誤直接往外拋。
+
+### 使用者手動解決衝突並完成 merge commit 之後
+
+如果你已經自己在專案目錄處理完衝突並手動完成了 merge commit（`workingBranch` 的內容已經在
+`baseBranch` 上），`mergeTaskBranch` 會用 `merge-base --is-ancestor` 偵測到並回報
+`already_merged`。這不會被當成錯誤擋下：`mergeDecision` 會重新呼叫 `gitWorkspace.inspect()`
+核對一次正式分支目前的 HEAD，等同重新執行一次 Git state reconciliation，然後把這次核對的結果
+視為合併完成——寫入 `t.gitMerge`（帶 `reconciled: true`）、清除 `gitConflict`、照常觸發清理與
+通知，流程繼續往下走，不再回傳 409 擋住使用者。
+
 ## 要求修改
 
 `{"decision":"changes","answer":"…"}`
@@ -386,3 +425,10 @@ Phase 3：`--no-ff` 合併與成果真的進入專案、手動完成與成果版
 base branch 時不合併且不替使用者切換分支、衝突時完全不動正式分支（HEAD 不變、無 `MERGE_HEAD`）、
 要求修改沿用同一分支、拒絕預設保留分支、清理拒絕丟掉未提交內容、rollback 後歷史仍保留原 merge
 commit、授權通道只放行它自己那一個指令、legacy 轉換不刪舊資料夾也不自行刪檔。
+
+`inspectMergeState()` 與 merge conflict guard 額外涵蓋五種情境：clean merge（HEAD 真的包含
+`workingBranch`）、真實衝突（自動 `abort` 後 `baseBranch` 保持乾淨、無 `MERGE_HEAD` 殘留）、衝突
+已解決但尚未 commit（判定為 `merge_in_progress` 而非籠統的 `dirty_working_tree`）、使用者手動解決
+衝突並完成 merge commit 後透過 reconciliation 補上 `t.gitMerge`（不再是 409）、以及 merge 指令
+本身回報成功但 repository 實際仍有 unresolved files（不採信該回報，一樣判定為衝突並自動
+abort）。
