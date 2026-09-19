@@ -65,6 +65,10 @@ function testReportPublic(report) {
     newFailureCount: (report.newFailures || []).length,
     resolvedFailures: (report.resolvedFailures || []).slice(0, MAX_LISTED_FAILURES),
     resolvedFailureCount: (report.resolvedFailures || []).length,
+    existingFailures: (report.existingFailures || []).slice(0, MAX_LISTED_FAILURES),
+    existingFailureCount: (report.existingFailures || []).length,
+    unchangedFailures: (report.unchangedFailures || []).slice(0, MAX_LISTED_FAILURES),
+    unchangedFailureCount: (report.unchangedFailures || []).length,
     baseline: run(report.baseline),
     current: run(report.current),
     error: report.error || null,
@@ -166,6 +170,7 @@ export function createCompletionTests({
     return {
       id: testId, planVersion: task.planVersion, status: 'running', startedAt: now(), finishedAt: null,
       baseBranch: task.git.baseBranch, verdict: null, newFailures: [], resolvedFailures: [],
+      existingFailures: [], unchangedFailures: [],
       baseline: null, current: null, error: null, startedBy: user.id,
     };
   }
@@ -194,6 +199,8 @@ export function createCompletionTests({
             verdict: outcome.verdict,
             newFailures: outcome.newFailures,
             resolvedFailures: outcome.resolvedFailures,
+            existingFailures: outcome.existingFailures,
+            unchangedFailures: outcome.unchangedFailures,
             baseline: outcome.baseline,
             current: outcome.current,
           });
@@ -240,6 +247,8 @@ export function createCompletionTests({
             verdict: outcome.verdict,
             newFailures: outcome.newFailures,
             resolvedFailures: outcome.resolvedFailures,
+            existingFailures: outcome.existingFailures,
+            unchangedFailures: outcome.unchangedFailures,
             baseline: outcome.baseline,
             current: outcome.current,
           });
