@@ -132,7 +132,10 @@ test('改名只改名稱；成員只看得到自己的方案，管理者看得�
 test('舊資料庫：沒有 plan_groups 與 plan_group_id 也要能升級，舊任務原封不動讀出來',t=>{
   const root=mkdtempSync(join(tmpdir(),'tf-plan-group-legacy-'));
   const file=join(root,'legacy.sqlite');
-  t.after(()=>rmSync(root,{recursive:true,force:true}));
+  // Windows 上 SQLite 檔案只要還開著就刪不掉（EPERM）。after hook 依註冊順序執行，
+  // 所以關檔與刪目錄必須在同一個 hook 裡，而且關檔要先做。
+  const open=[];
+  t.after(()=>{for(const s of open)try{s.close();}catch{}rmSync(root,{recursive:true,force:true});});
 
   // 用升級前的 schema 手工造一個舊資料庫：tasks 只有原本的 8 個欄位，沒有 plan_groups。
   const legacy=new DatabaseSync(file);
@@ -148,7 +151,7 @@ test('舊資料庫：沒有 plan_groups 與 plan_group_id 也要能升級，舊�
   legacy.close();
 
   // 新版程式開啟同一個檔案：只補欄位與資料表，不改任何既有資料。
-  const store=createStore(file);
+  const store=createStore(file);open.push(store);
   const loaded=store.task(taskId);
   assert.equal(loaded.title,'升級前就在的任務');
   assert.equal(loaded.planVersion,2);
@@ -167,8 +170,7 @@ test('舊資料庫：沒有 plan_groups 與 plan_group_id 也要能升級，舊�
 
   // 再開一次：遷移必須是冪等的。
   store.close();
-  const again=createStore(file);
-  t.after(()=>again.close());
+  const again=createStore(file);open.push(again);
   assert.equal(again.task(taskId).title,'升級前就在的任務');
   assert.equal(again.task(taskId).planGroupId,undefined);
 });
@@ -176,7 +178,8 @@ test('舊資料庫：沒有 plan_groups 與 plan_group_id 也要能升級，舊�
 test('備份還原：JSON 裡已經有 planGroupId 時，升級會把它同步到欄位，但不會憑空造方案',t=>{
   const root=mkdtempSync(join(tmpdir(),'tf-plan-group-restore-'));
   const file=join(root,'restore.sqlite');
-  t.after(()=>rmSync(root,{recursive:true,force:true}));
+  const open=[];
+  t.after(()=>{for(const s of open)try{s.close();}catch{}rmSync(root,{recursive:true,force:true});});
   const groupId=id(),userId=id(),projectId=id(),taskId=id();
   const legacy=new DatabaseSync(file);
   legacy.exec(`CREATE TABLE users(id TEXT PRIMARY KEY,name TEXT NOT NULL,username TEXT NOT NULL UNIQUE,password TEXT NOT NULL,role TEXT NOT NULL,line_id TEXT UNIQUE,link_hash TEXT,link_expires INTEGER);
@@ -187,8 +190,7 @@ test('備份還原：JSON 裡已經有 planGroupId 時，升級會把它同步�
   legacy.prepare('INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?)').run(taskId,userId,projectId,'queued',1,1,'2025-12-01T00:00:00.000Z',JSON.stringify({id:taskId,ownerId:userId,projectId,planGroupId:groupId,title:'還原的任務'}));
   legacy.close();
 
-  const store=createStore(file);
-  t.after(()=>store.close());
+  const store=createStore(file);open.push(store);
   assert.equal(store.db.prepare('SELECT plan_group_id FROM tasks WHERE id=?').get(taskId).plan_group_id,groupId);
   assert.equal(store.task(taskId).planGroupId,groupId);
   // 方案本身沒被還原：欄位保留座標，但不會幫忙生一筆 plan_groups。
