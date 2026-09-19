@@ -24,6 +24,8 @@ import {gitIssueRequest,decideGitIssue,gitIssuePending,closePendingRequestsOnCan
 import {createProjectPreview,detectWebProject,openFolder} from './project-preview.js';
 import {checkClaudeBrowserCapability} from './browser-capability.js';
 import {createSystemHealth} from './system-health.js';
+// Chat Provider：LINE 一般對話用哪一個 CLI／模型。與 Task Runner 的引擎設定完全分開。
+import {chatSettingsView,createChatProviderHealth,updateChatSettings} from './chat-provider.js';
 import {onboardingStatus,completeOnboarding} from './onboarding.js';
 import {recoverTaskOutput,taskOriginalOutput,outputIssueRecoverable} from './output-issue.js';
 import {taskGitReview,decideGitReview,rollbackTaskMerge,applyCleanup,pushTaskBaseBranch,closeTask} from './git-review.js';
@@ -50,7 +52,7 @@ export function allowedOrigins(publicOrigin=process.env.PUBLIC_ORIGIN) {
   return [...allowed];
 }
 
-export function createApp(store,runner,{dist=resolve('dist'),previews=createProjectPreview(),folderOpener=openFolder,health=createSystemHealth(store),gitWorkspace=createGitWorkspace(),completionTests=createCompletionTests({gitWorkspace}),completionValidations=createCompletionValidations({previews}),taskflowRoot=resolve('.')}={}) {
+export function createApp(store,runner,{dist=resolve('dist'),previews=createProjectPreview(),folderOpener=openFolder,health=createSystemHealth(store),chatHealth=createChatProviderHealth(),gitWorkspace=createGitWorkspace(),completionTests=createCompletionTests({gitWorkspace}),completionValidations=createCompletionValidations({previews}),taskflowRoot=resolve('.')}={}) {
   const app=express(),attempts=new Map();app.disable('x-powered-by');
   initControlRequests(store.db);
   const selfProjectFor=t=>isSelfProject(store.project(t.projectId)?.path,taskflowRoot);
@@ -338,6 +340,13 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     store.setSetting('defaultProjectRoot',directory.path);
     res.json({path:directory.path,created:directory.created});
   });
+  // Chat Provider／Model：只有管理者能讀寫。Provider 限 codex｜claude，Model 只收白名單
+  // 字元的字串——這個 API 沒有任何欄位可以傳入 command 或 CLI 路徑。設定寫進 settings
+  // 資料表，下一個 Chat job 解析設定時就生效，不需要重新啟動 TaskFlow。
+  app.get('/api/admin/chat-settings',admin,async(req,res)=>res.json(chatSettingsView(store,await chatHealth.get({force:req.query.refresh==='1'}))));
+  const saveChatSettings=async(req,res)=>{updateChatSettings(store,req.body);res.json(chatSettingsView(store,await chatHealth.get()));};
+  app.post('/api/admin/chat-settings',admin,saveChatSettings);
+  app.put('/api/admin/chat-settings',admin,saveChatSettings);
   app.post('/api/admin/runner',admin,(req,res)=>{const input=z.object({enabled:z.boolean().optional(),maxConcurrent:z.number().int().min(1).max(32).optional()}).strict().refine(v=>v.enabled!==undefined||v.maxConcurrent!==undefined).parse(req.body);if(input.enabled!==undefined)store.setSetting('runnerEnabled',input.enabled);if(input.maxConcurrent!==undefined)store.setSetting('runnerMaxConcurrent',input.maxConcurrent);res.json({ok:true});});
   // Unknown API endpoints must never fall through to the Vue HTML entry point.
   app.use('/api',(req,res)=>res.status(404).json({error:'找不到此功能，服務可能仍在更新，請重新整理後再試。'}));

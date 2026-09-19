@@ -78,7 +78,7 @@ const hint=computed(()=>TABS.find(item=>item.id===tab.value)?.hint||'');
           @reload-users="emit('reload-users')"
         />
       </template>
-      <SettingsAIModels v-else-if="tab==='ai-models'"/>
+      <SettingsAIModels v-else-if="tab==='ai-models'" :busy="props.busy" :run="props.run" :notify="props.notify"/>
       <SettingsExecution v-else-if="tab==='execution'" :busy="props.busy" :run="props.run" :notify="props.notify"/>
       <SettingsGit v-else-if="tab==='git'"/>
       <SettingsPreview v-else-if="tab==='preview'"/>
