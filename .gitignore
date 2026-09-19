@@ -7,3 +7,4 @@ Projects/
 cloud-inbox/.wrangler/
 cloud-inbox/.dev.vars
 cloud-inbox/.dev.vars.*
+.taskflow/
