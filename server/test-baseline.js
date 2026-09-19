@@ -170,17 +170,25 @@ export async function runTestSuite({ cwd, logPath = null, timeoutMs, run, commit
 /**
  * 比對兩次執行。回傳 verdict 與逐項差異。
  * 只有 no_regression 代表「這條分支沒有製造出新的測試失敗」。
+ *
+ * 四個欄位對應需求裡的四種分類：
+ *   - existingFailures：baseline 本來就有的失敗（不論這次有沒有修好）。
+ *   - newFailures：只在 current 出現、baseline 沒有的失敗——唯一會判定 regression 的依據。
+ *   - resolvedFailures：baseline 有、這次不再出現的失敗（即需求所稱 fixedFailures）。
+ *   - unchangedFailures：baseline 與 current 都有的失敗，即既有失敗中「這次仍未修復」的子集。
  */
 export function compareTestRuns(baseline, current) {
   const baseFailed = new Set(baseline?.ok ? baseline.failed : []);
   const currentFailed = new Set(current?.ok ? current.failed : []);
+  const existingFailures = [...baseFailed];
   const newFailures = [...currentFailed].filter(key => !baseFailed.has(key));
   const resolvedFailures = [...baseFailed].filter(key => !currentFailed.has(key));
+  const unchangedFailures = [...baseFailed].filter(key => currentFailed.has(key));
 
   const verdict = !current?.ok ? VERDICTS.PARSE_FAILED
     : !baseline?.ok ? VERDICTS.BASELINE_UNAVAILABLE
       : newFailures.length ? VERDICTS.REGRESSION
         : VERDICTS.NO_REGRESSION;
 
-  return { verdict, newFailures, resolvedFailures };
+  return { verdict, existingFailures, newFailures, resolvedFailures, unchangedFailures };
 }
