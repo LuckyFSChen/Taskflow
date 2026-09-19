@@ -92,7 +92,10 @@ function applyAutoEngines(){const engines=taskEngineDefaults(newTask.type);newTa
 // 自動模式跟著任務類型走；自訂模式不覆蓋使用者自己挑的引擎，改用建議文字提示。
 watch(()=>newTask.type,()=>{if(newTask.aiMode===AUTO)applyAutoEngines();});
 watch(()=>newTask.aiMode,mode=>{if(mode===AUTO)applyAutoEngines();else showAdvanced.value=true;});
-const statuses:Record<string,string>={planning:'等待規劃',awaiting_approval:'待審核',queued:'排隊中',running:'執行中',waiting_input:'等待回答',waiting_user_action:'需要你的協助',waiting_git_confirmation:'需要確認 Git 修改',paused:'已暫停',completed:'已完成',repair_planning:'分析修正方案',awaiting_repair_approval:'待審核修正方案',rate_limited:'等待額度恢復',failed:'需要處理',cancelled:'已取消'};
+// completed 不再是「任務已完全結束」：它只代表 AI 執行已結束（Execution Terminal State），
+// 之後還要走過 Git 交付整合，只有使用者按下「關閉任務」的 closed 才是整個 workflow 的
+// terminal state（計畫書第四、二十四章）。
+const statuses:Record<string,string>={planning:'等待規劃',awaiting_approval:'待審核',queued:'排隊中',running:'執行中',waiting_input:'等待回答',waiting_user_action:'需要你的協助',waiting_git_confirmation:'需要確認 Git 修改',paused:'已暫停',completed:'等待整合',ready_to_close:'等待關閉',closed:'已關閉',repair_planning:'分析修正方案',awaiting_repair_approval:'待審核修正方案',rate_limited:'等待額度恢復',failed:'需要處理',cancelled:'已取消'};
 const browserStatuses:Record<string,string>={not_required:'不需要',pending:'待執行',running:'執行中',passed:'通過',failed:'未通過',blocked:'受阻（未驗證）'};
 const priorities=['低','一般','高','緊急'];
 const nav=[{path:'/',label:'工作總覽',icon:LayoutDashboard},{path:'/attention',label:'待我處理',icon:Inbox},{path:'/tasks',label:'任務佇列',icon:ListTodo},{path:'/threads',label:'角色工作階段',icon:GitBranch},{path:'/settings',label:'平台設定',icon:Settings2}];
@@ -159,9 +162,29 @@ async function loadReview(){
   // 先記下「這個任務已經試著讀過了」，失敗也算：否則下面的 watch 會在每次失敗後立刻重試，
   // 變成一邊跳錯誤訊息一邊不停跑 git 指令。要重試請按「重新讀取 Git 狀態」。
   reviewLoadedFor.value=taskId;
-  reviewLoading.value=true;reviewState.value='loading';
-  try{const review=await api(`/tasks/${taskId}/git/review`);if(selected.value?.id===taskId){gitReview.value=review;reviewState.value='loaded';}}
-  catch(e:any){if(selected.value?.id===taskId){gitReview.value=null;reviewState.value='error';}notify(e.message);}
+  reviewLoading.value=true;
+  reviewState.value='loading';
+
+  try{
+    const review=await api(`/tasks/${taskId}/git/review`);
+
+    if(selected.value?.id!==taskId)return;
+
+    gitReview.value=review;
+    reviewState.value='loaded';
+
+    // 讀取 Git 現況時，Server Domain 層可能已經把 completed 任務 reconcile 成
+    // ready_to_close（例如偵測到分支已在外部被合併）並持久化寫回；不補讀一次任務本體，
+    // 「關閉任務」按鈕會因為 selected.value.status 還停在舊值而不出現。
+    await loadTask(taskId);
+  }
+  catch(e:any){
+    if(selected.value?.id===taskId){
+      gitReview.value=null;
+      reviewState.value='error';
+    }
+    notify(e.message);
+  }
   finally{reviewLoading.value=false;}
 }
 // 測試比對只是「開始」：整套測試要跑好幾分鐘，結果由既有的三秒輪詢帶回來（completionTest 欄位）。
@@ -217,10 +240,12 @@ async function completionRestart(){
   await run(async()=>{await api(`/tasks/${taskId}/completion/restart`,{});notify('已核准重新啟動；守護程式會先建置再重啟，期間網頁可能短暫中斷。');});
 }
 // 合併與撤銷都走既有 endpoint；成敗都重讀一次 Git 現況，畫面才不會停在舊狀態。
-async function completionMerge(options:{cleanup:boolean}){
+// 清理不再是合併的一部分（cleanup 交給使用者按下「關閉任務」時才執行），所以這裡不再
+// 帶 cleanup 參數；後端 mergeDecision() 驗證通過後會自己把狀態推進到 ready_to_close。
+async function completionMerge(){
   if(!selected.value)return;
   const taskId=selected.value.id,artifactVersion=selected.value.artifactVersion;
-  await run(async()=>{await api(`/tasks/${taskId}/git/decision`,{decision:'merge',artifactVersion,cleanup:options.cleanup});notify('已合併至正式分支');});
+  await run(async()=>{await api(`/tasks/${taskId}/git/decision`,{decision:'merge',artifactVersion});notify('已合併至正式分支，等待你確認後關閉任務。');});
   await loadReview();
 }
 async function completionRollback(mergeCommit:string){
@@ -229,7 +254,43 @@ async function completionRollback(mergeCommit:string){
   await run(async()=>{await api(`/tasks/${taskId}/git/rollback`,{mergeCommit});notify('已撤銷合併；歷史完整保留，未刪除任何 commit');});
   await loadReview();
 }
-async function openTask(t:any){tab.value=DEFAULT_TAB;answer.value='';files.value=[];outputRaw.value=null;outputRecovery.value=null;gitReview.value=null;reviewState.value='not_loaded';reviewLoadedFor.value=null;await run(()=>loadTask(t.id));await loadReview();}
+// 生命週期最後一步：只有使用者按下這裡，任務才會從 ready_to_close 變成 closed。
+// 狀態轉換一律由後端 closeTask() 決定，這裡只是把使用者的動作送出去、拿結果重讀畫面。
+async function completionClose(options: { forceCleanup: boolean }) {
+  if (!selected.value) return;
+
+  const taskId = selected.value.id;
+
+  await run(async () => {
+    const result = await api(`/tasks/${taskId}/close`, {
+      forceCleanup: options.forceCleanup,
+    });
+
+    notify(
+      result.cleanupWarning
+        ? `任務尚未關閉：${result.cleanupWarning}`
+        : '任務已關閉。'
+    );
+  });
+
+  await loadTask(taskId);
+  await loadReview();
+}
+
+async function openTask(t: any) {
+  tab.value = DEFAULT_TAB;
+  answer.value = '';
+  files.value = [];
+  outputRaw.value = null;
+  outputRecovery.value = null;
+
+  gitReview.value = null;
+  reviewState.value = 'not_loaded';
+  reviewLoadedFor.value = null;
+
+  await run(() => loadTask(t.id));
+  await loadReview();
+}
 // 任務有可能在詳情開著的時候才跑完；輪詢只讀 /state，不碰 /git/review，所以這裡補讀一次。
 // 條件包含任務 id，換任務時會重新判斷；同一個任務只會自動讀一次。
 watch(()=>selected.value&&shouldLoadReview(selected.value)&&reviewLoadedFor.value!==selected.value.id,need=>{if(need)void loadReview();});
@@ -386,7 +447,25 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
         <ValidationSkip :request="selected.validationSkipRequest" :skips="selected.validationSkips" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/validation/decision`,{requestId:selected.validationSkipRequest.id,decision}))"/>
         <ExecutionApproval v-if="selected.executionApproval" :request="selected.executionApproval" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/execution/decision`,{requestId:selected.executionApproval.id,decision}))"/>
         <!-- 部署與驗收：核准合併、清理與撤銷都在這裡完成，不需要再開 PowerShell。 -->
-        <Completion :task="selected" :review="gitReview" :busy="busy" :loading="reviewLoading" :review-state="reviewState" @refresh="loadReview" @test="completionTest" @test-main="completionTestMain" @push="completionPush" @restart="completionRestart" @validate="completionValidate" @approve="completionApprove" @retry="completionRetry" @cancel-pipeline="completionCancel" @merge="completionMerge" @rollback="completionRollback"/>
+        <Completion
+          :task="selected"
+          :review="gitReview"
+          :busy="busy"
+          :loading="reviewLoading"
+          :review-state="reviewState"
+          @refresh="loadReview"
+          @test="completionTest"
+          @test-main="completionTestMain"
+          @push="completionPush"
+          @restart="completionRestart"
+          @validate="completionValidate"
+          @approve="completionApprove"
+          @retry="completionRetry"
+          @cancel-pipeline="completionCancel"
+          @merge="completionMerge"
+          @rollback="completionRollback"
+          @close="completionClose"
+        />
         <section v-if="selected.validationFailure" class="questions"><h3>最近未通過的驗證：第 {{selected.round}} 輪修正</h3><p class="prewrap">{{selected.validationFailure.summary}}</p><ul><li v-for="(e,i) in selected.validationFailure.evidence" :key="i">{{e}}</li></ul><p v-if="!selected.validationFailure.evidence.length">驗證缺少可確認的證據。</p><p v-for="(q,i) in selected.validationFailure.questions" :key="i">待確認：{{q}}</p>
         <!-- reconcileCompletionState 的權威判定（server/completion-state.js）：AI 自己回報的
              passed/evidence 只是 claim，這裡列出的才是實際擋住完成的 deterministic 原因。 -->
@@ -402,7 +481,9 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
           <div v-if="selected.status==='rate_limited'" class="notice">{{selected.retryEngine}} 額度限制，預計 {{new Date(selected.retryAt).toLocaleString('zh-TW',{timeZone:selected.retryTimeZone})}}（{{selected.retryTimeZone}}）自動重試目前步驟。暫停或取消任務可停止自動重試。</div>
           <div v-if="selected.manualCompletion" class="notice">此任務由使用者手動完成，不代表已通過 AI 驗證。</div>
           <div v-if="selected.error" class="notice warning">{{selected.error}}</div>
-          <label>變更任務狀態<select :value="selected.status" :disabled="busy" @change="setTaskStatus(selected,$event)"><option :value="selected.status">{{statusLabel(selected)}}</option><option v-if="selected.status!=='completed'" value="completed">標記完成</option><option v-if="selected.status!=='paused'" value="paused">暫停任務</option><option v-if="selected.status!=='cancelled'" value="cancelled">取消任務</option><option v-if="['completed','cancelled','paused','failed','waiting_input'].includes(selected.status)" value="reopen">恢復處理</option></select></label>
+          <!-- ready_to_close／closed 只能透過下方「部署與驗收」的核准合併／關閉任務推進，
+               這裡不提供會繞過那條狀態機的手動選項。 -->
+          <label>變更任務狀態<select :value="selected.status" :disabled="busy" @change="setTaskStatus(selected,$event)"><option :value="selected.status">{{statusLabel(selected)}}</option><option v-if="!['completed','ready_to_close','closed'].includes(selected.status)" value="completed">標記完成</option><option v-if="!['paused','ready_to_close','closed'].includes(selected.status)" value="paused">暫停任務</option><option v-if="!['cancelled','ready_to_close','closed'].includes(selected.status)" value="cancelled">取消任務</option><option v-if="['completed','cancelled','paused','failed','waiting_input'].includes(selected.status)" value="reopen">恢復處理</option></select></label>
         </section>
 
         <h3>原始需求</h3><p class="prewrap requirement">{{selected.description}}</p>
@@ -461,6 +542,6 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
         <div class="timeline"><div v-for="event in [...selected.events].reverse()" :key="event.seq" class="timeline-event"><i/><div><time>{{time(event.at)}} · {{event.kind}}</time><p class="prewrap">{{event.message}}</p></div></div></div>
       </template>
     </div>
-    <footer class="drawer-footer"><span>計畫 v{{selected.planVersion}} · {{selected.completedSteps}} / {{selected.totalSteps}} 步驟</span><div><button v-if="['planning','queued','running'].includes(selected.status)" class="secondary compact" @click="action('pause')"><Pause :size="15"/>暫停派工</button><button v-if="selected.threads.some((t:any)=>t.status==='running')" class="secondary compact danger" @click="action('stop')"><Square :size="14"/>中止</button><button v-if="['paused','failed'].includes(selected.status)" class="secondary compact" @click="action('resume')"><Play :size="15"/>恢復</button><button v-if="!['completed','cancelled'].includes(selected.status)" class="icon-button danger" title="取消任務" @click="action('cancel')"><X :size="18"/></button></div></footer></section></div>
+    <footer class="drawer-footer"><span>計畫 v{{selected.planVersion}} · {{selected.completedSteps}} / {{selected.totalSteps}} 步驟</span><div><button v-if="['planning','queued','running'].includes(selected.status)" class="secondary compact" @click="action('pause')"><Pause :size="15"/>暫停派工</button><button v-if="selected.threads.some((t:any)=>t.status==='running')" class="secondary compact danger" @click="action('stop')"><Square :size="14"/>中止</button><button v-if="['paused','failed'].includes(selected.status)" class="secondary compact" @click="action('resume')"><Play :size="15"/>恢復</button><button v-if="!['completed','ready_to_close','closed','cancelled'].includes(selected.status)" class="icon-button danger" title="取消任務" @click="action('cancel')"><X :size="18"/></button></div></footer></section></div>
   <div v-if="toast" class="toast" role="status"><AlertCircle :size="18"/>{{toast}}<button class="icon-button" title="關閉通知" @click="toast=''"><X :size="16"/></button></div>
 </template>

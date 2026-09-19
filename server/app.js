@@ -26,7 +26,7 @@ import {checkClaudeBrowserCapability} from './browser-capability.js';
 import {createSystemHealth} from './system-health.js';
 import {onboardingStatus,completeOnboarding} from './onboarding.js';
 import {recoverTaskOutput,taskOriginalOutput,outputIssueRecoverable} from './output-issue.js';
-import {taskGitReview,decideGitReview,rollbackTaskMerge,applyCleanup,pushTaskBaseBranch} from './git-review.js';
+import {taskGitReview,decideGitReview,rollbackTaskMerge,applyCleanup,pushTaskBaseBranch,closeTask} from './git-review.js';
 // 一次核准就依序跑完的部署流程；它自己不執行任何操作，只推進下面這幾個既有子系統。
 import {createCompletion,createCompletionPipeline,completionPublic} from './completion-pipeline.js';
 // 測試基準比對：在 main 與任務分支各跑一次完整測試，用結構化比對取代「AI 說那 3 個是既有失敗」。
@@ -198,6 +198,12 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     res.json(decorated(decideGitReview(store,req.user,req.params.id,input,{gitWorkspace})));
   });
   // 舊的 v1/v2 工作副本只在使用者按下轉換時才會搬進 Git，而且原資料夾一律保留不刪。
+  // 生命週期最後一步：只有使用者按下這裡，任務才會從 ready_to_close 變成 closed；
+  // TaskFlow 不會因為合併成功、部署驗收通過就自己關閉任務（計畫書第十七章）。
+  app.post('/api/tasks/:id/close',async(req,res)=>{
+    const input=z.object({forceCleanup:z.boolean().optional()}).strict().parse(req.body||{});
+    res.json(decorated(await closeTask(store,req.user,req.params.id,input,{gitWorkspace,previews})));
+  });
   app.get('/api/tasks/:id/git/legacy',(req,res)=>res.json(legacyWorkspaceStatus(store,req.user,req.params.id)));
   app.post('/api/tasks/:id/git/migrate',(req,res)=>{z.object({}).strict().parse(req.body||{});res.json(decorated(migrateLegacyWorkspace(store,req.user,req.params.id,{gitWorkspace})));});
   // 測試比對只「開始」，不等結果：整套測試要跑好幾分鐘，同步等待一定逾時。

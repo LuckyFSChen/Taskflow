@@ -187,6 +187,32 @@ test('合併完成後改為顯示已合併，並可撤銷', () => {
   assert.equal(view.stages.find(s => s.key === 'cleanup').state, 'done');
 });
 
+// 生命週期改造：合併驗證通過後 task.status 會被後端推進到 ready_to_close，
+// 這裡不再只看 gitMerge 存不存在——task.status 是唯一的權威來源（計畫書第二十八章）。
+test('合併驗證通過後 status=ready_to_close：隱藏 Merge 按鈕，改顯示關閉任務', () => {
+  const task = baseTask({ status: 'ready_to_close', readyToCloseAt: '2026-09-19T01:31:00.000Z', gitMerge: { commit: 'ab3e585333333333333333333333333333333333', baseBranch: 'main', workingBranch: 'taskflow/20415e0f-login', at: '2026-09-19T01:30:00.000Z' } });
+  const view = completionView(task, baseReview({ cleanedUp: false }));
+  assert.equal(view.state, 'ready_to_close');
+  assert.equal(view.badgeClass, 'queued');
+  assert.equal(view.canMerge, false);
+  assert.equal(view.canClose, true);
+  assert.equal(view.canRollback, true);
+  assert.match(view.message, /按下「關閉任務」/);
+});
+
+test('使用者關閉任務後 status=closed：不再提供撤銷或關閉按鈕', () => {
+  const task = baseTask({ status: 'closed', closedAt: '2026-09-19T02:00:00.000Z', closedBy: 'user-1', gitMerge: { commit: 'ab3e585333333333333333333333333333333333', baseBranch: 'main', workingBranch: 'taskflow/20415e0f-login', at: '2026-09-19T01:30:00.000Z' } });
+  const view = completionView(task, baseReview({ cleanedUp: true }));
+  assert.equal(view.state, 'closed');
+  assert.equal(view.badgeClass, 'completed');
+  assert.equal(view.canMerge, false);
+  assert.equal(view.canClose, false);
+  assert.equal(view.canRollback, false, 'closed 是 archive，不再提供撤銷');
+  // 關閉後歷史仍然完整可查：commits／merge metadata 都還在畫面資料裡。
+  assert.ok(view.merge);
+  assert.equal(view.commits.length, 1);
+});
+
 test('每個狀態都對應得到既有的 badge 樣式（template 不再自帶對照表）', () => {
   const merged = { commit: 'ab3e585333333333333333333333333333333333', baseBranch: 'main', at: '2026-09-19T01:30:00.000Z' };
   const cases = [
@@ -196,6 +222,8 @@ test('每個狀態都對應得到既有的 badge 樣式（template 不再自帶�
     [completionView(baseTask(), baseReview({ conflict: { files: ['a.js'] } })), 'conflict', 'failed'],
     [completionView(baseTask({ gitMerge: merged }), baseReview()), 'merged', 'completed'],
     [completionView(baseTask({ gitMerge: merged, gitRollback: { commit: 'dd11aa22' } }), baseReview()), 'rolled_back', 'cancelled'],
+    [completionView(baseTask({ status: 'ready_to_close', gitMerge: merged }), baseReview()), 'ready_to_close', 'queued'],
+    [completionView(baseTask({ status: 'closed', gitMerge: merged }), baseReview()), 'closed', 'completed'],
   ];
   for (const [view, state, badge] of cases) {
     assert.equal(view.state, state);
@@ -206,6 +234,58 @@ test('每個狀態都對應得到既有的 badge 樣式（template 不再自帶�
 test('merge 摘要帶好短碼，template 不必自己切字串', () => {
   const task = baseTask({ gitMerge: { commit: 'ab3e585333333333333333333333333333333333', baseBranch: 'main', at: '2026-09-19T01:30:00.000Z' } });
   assert.equal(completionView(task, baseReview()).merge.short, 'ab3e5853');
+});
+
+// 架構修正（第二輪修正，使用者指示）：state 一律只由 task.status 決定 ready_to_close／
+// closed，不允許前端自己依 review.externallyMerged 假造這兩個狀態——那會讓 Completion
+// 畫面與 Task Queue／Timeline 看到不一致的 task.status。這裡驗證：task 手上還是舊的
+// completed（Server 已經 reconcile，但這個物件還沒重新抓到最新狀態）時，state 不會
+// 變成 ready_to_close；但 mergeBlockers 仍要擋住合併，避免使用者按下一個會被後端
+// 409 拒絕的按鈕。
+test('completed 但 review.externallyMerged=true：不自己假造 ready_to_close，只擋住合併', () => {
+  const task = baseTask();
+  const review = baseReview({ merged: true, externallyMerged: true, mergeable: false });
+  const view = completionView(task, review);
+
+  assert.equal(view.state, 'blocked', 'state 不會變成 ready_to_close；有阻擋就是 blocked，只看 task.status 決定 ready_to_close');
+  assert.equal(view.canMerge, false);
+  assert.equal(view.canClose, false, 'canClose 依然只看 task.status===ready_to_close');
+  assert.ok(view.blockers.some(b => b.code === 'externally_merged'));
+
+  const blockers = mergeBlockers(task, review);
+  assert.equal(blockers.length, 1);
+  assert.equal(blockers[0].code, 'externally_merged');
+  assert.match(blockers[0].hint, /關閉任務/);
+});
+
+test('task.status 已經被 reconcile 為 ready_to_close：正常顯示關閉任務，不再需要 externally_merged 阻擋', () => {
+  const task = baseTask({ status: 'ready_to_close', readyToCloseAt: '2026-09-19T01:31:00.000Z', gitMerge: { commit: 'ab3e585333333333333333333333333333333333', baseBranch: 'main', workingBranch: 'taskflow/20415e0f-login', at: '2026-09-19T01:30:00.000Z', external: true } });
+  const review = baseReview({ merged: true, externallyMerged: true });
+  const view = completionView(task, review);
+
+  assert.equal(view.state, 'ready_to_close');
+  assert.equal(view.canClose, true);
+  assert.equal(view.canMerge, false);
+});
+
+// mainAdvanced／mainHead：只在還需要重新評估整合的階段顯示，避免整合已確認完成後
+// 還讓使用者以為需要重新 Merge（計畫書第九章、第二輪修正驗收條件）。
+test('mainAdvanced 只在尚未整合完成時顯示；ready_to_close／closed 一律不顯示', () => {
+  const advancingReview = baseReview({ mainAdvanced: true, mainHead: 'f00dbeef11111111111111111111111111111111' });
+
+  const ready = completionView(baseTask(), advancingReview);
+  assert.equal(ready.mainAdvanced, true);
+  assert.equal(ready.mainHead, 'f00dbeef');
+
+  const merged = { commit: 'ab3e585333333333333333333333333333333333', baseBranch: 'main', at: '2026-09-19T01:30:00.000Z' };
+  const readyToClose = completionView(baseTask({ status: 'ready_to_close', gitMerge: merged }), advancingReview);
+  assert.equal(readyToClose.mainAdvanced, false, 'ready_to_close 已經整合完成，不該再顯示需要重新整合的警告');
+
+  const closed = completionView(baseTask({ status: 'closed', gitMerge: merged }), advancingReview);
+  assert.equal(closed.mainAdvanced, false);
+
+  const notAdvanced = completionView(baseTask(), baseReview({ mainAdvanced: false }));
+  assert.equal(notAdvanced.mainAdvanced, false);
 });
 
 test('已撤銷過的合併不再提供第二次撤銷', () => {

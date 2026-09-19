@@ -35,6 +35,8 @@ export const COMPLETION_SCOPE_NOTE =
 const BADGE_CLASSES = {
   ready: 'completed',
   merged: 'completed',
+  ready_to_close: 'queued',
+  closed: 'completed',
   rolled_back: 'cancelled',
   conflict: 'failed',
   blocked: 'paused',
@@ -403,6 +405,21 @@ export function mergeBlockers(task, review) {
     return blockers;
   }
 
+  // 防禦層，不是狀態來源：ready_to_close／closed 一律由後端的 task.status 決定
+  // （見下方 completionView 的 state 計算），這裡不會、也不能自己把畫面切換成
+  // ready_to_close。它處理的是另一件事——GET /git/review 已經即時偵測到分支被
+  // 外部合併，Server 也已經把這個事實持久化，但使用者手上的 task 物件可能還沒
+  // 重新抓到最新的 status（那幾秒鐘的正常落差）。這裡先擋住「核准並合併」，避免
+  // 使用者按下一個註定會被後端以 409（此分支的內容已經在正式分支上了）拒絕的按鈕。
+  if (review?.externallyMerged) {
+    blockers.push({
+      code: 'externally_merged',
+      message: '此分支的內容已經在外部被合併，不需要（也不能）再次核准合併。',
+      hint: '請重新整理後改用「關閉任務」；TaskFlow 已經確認合併結果並記錄。',
+    });
+    return blockers;
+  }
+
   // 後端 mergeDecision 的第一道檢查：只有通過獨立驗證而完成的任務能合併。
   if (task.status !== 'completed') {
     blockers.push({
@@ -561,9 +578,11 @@ export function completionStages(task, review, reviewState = null) {
           ? stage('validate', '部署驗收（API 與程序）', 'done', `${deployment.checks.length} 項全部通過`)
           : stage('validate', '部署驗收（API 與程序）', 'failed', `${deployment.failedCount} 項未通過`));
 
+  // 清理不再是合併的一部分：worktree／分支要留到使用者按下「關閉任務」才會消失
+  // （計畫書第十九、二十一章），所以合併完成但還沒關閉時這裡仍然是 pending，不是 done。
   stages.push(review?.cleanedUp || task?.git?.cleanedUp
     ? stage('cleanup', '清理工作副本與分支', 'done', task?.git?.branchDeleted ? '已移除 worktree 並刪除任務分支' : '已移除 worktree')
-    : stage('cleanup', '清理工作副本與分支', 'pending', '合併成功後執行'));
+    : stage('cleanup', '清理工作副本與分支', 'pending', task?.gitMerge ? '關閉任務後執行' : '合併成功後才需要'));
 
   return stages;
 }
@@ -590,17 +609,24 @@ export function completionView(task, review = null, reviewState = null) {
   const mainTest = mainTestView(task);
   const pushView = pushStatusView(task, review);
 
-  const state = merged ? (rolledBack ? 'rolled_back' : 'merged')
-    : conflicted ? 'conflict'
-      : !loaded ? 'loading'
-        : blockers.length ? 'blocked'
-          : 'ready';
+  // ready_to_close／closed 一律由後端的 task.status 決定，前端不自己判斷這兩個狀態
+  // 什麼時候該出現（計畫書第二十八章）。舊資料（合併發生在這次改造之前、status 還停在
+  // completed）仍然落回原本的 merged／rolled_back 判斷，畫面不會因此壞掉。
+  const state = task.status === 'closed' ? 'closed'
+    : task.status === 'ready_to_close' ? 'ready_to_close'
+      : merged ? (rolledBack ? 'rolled_back' : 'merged')
+        : conflicted ? 'conflict'
+          : !loaded ? 'loading'
+            : blockers.length ? 'blocked'
+              : 'ready';
 
   const title = {
     ready: '此任務已完成開發，可以進行合併',
     blocked: '尚不能合併',
     conflict: '合併被衝突擋住',
     merged: '已合併至正式分支',
+    ready_to_close: '已合併，等待你關閉任務',
+    closed: '任務已關閉',
     rolled_back: '此次合併已撤銷',
     loading: '正在讀取 Git 狀態',
   }[state];
@@ -610,6 +636,8 @@ export function completionView(task, review = null, reviewState = null) {
     blocked: '以下每一項都必須先解決；TaskFlow 不會繞過任何一項。',
     conflict: 'TaskFlow 不會替你選 ours／theirs，也不會把正式分支留在解到一半的 merge 狀態。',
     merged: '成果已在正式分支上。若要撤銷，TaskFlow 會補一個反向 commit，不會刪除任何歷史。',
+    ready_to_close: '技術交付流程已完成：成果已在正式分支上。按下「關閉任務」後 TaskFlow 才會停止相關 Preview、移除 worktree 並刪除已合併的分支；TaskFlow 不會自己關閉這個任務。',
+    closed: '任務生命週期已正式結束。原始需求、計畫、執行紀錄、commits 與合併紀錄仍完整保留，只是預設不再出現在使用中的任務清單。',
     rolled_back: '已在正式分支補上反向 commit；歷史完整保留。',
     loading: '正在讀取正式分支目前的狀態，讀到之前不會顯示可否合併。若遲遲沒有結果，請按下方的重新讀取。',
   }[state];
@@ -628,6 +656,12 @@ export function completionView(task, review = null, reviewState = null) {
     },
     repository: review?.repository || null,
     repositoryError: text(review?.repositoryError) || null,
+    // 只在還需要重新評估整合的階段（尚未到 ready_to_close／closed）才顯示「正式分支
+    // 已在任務執行期間更新」；一旦整合已經確認完成，即使 review.mainAdvanced 歷史上
+    // 曾經是 true，也不再顯示，避免使用者誤以為還需要重新 Merge（計畫書第九章、
+    // 第二輪修正驗收條件）。
+    mainAdvanced: !['ready_to_close', 'closed'].includes(state) && !!review?.mainAdvanced,
+    mainHead: shortCommit(review?.mainHead),
     commits: list(review?.commits).map(c => ({
       commit: text(c.commit),
       short: shortCommit(c.commit),
@@ -665,7 +699,11 @@ export function completionView(task, review = null, reviewState = null) {
     canRunTest: !merged && !(review?.cleanedUp || git.cleanedUp) && !testComparisonView(task)?.running && !pipelineView(task)?.running,
     // 流程進行中時單獨合併會與流程互搶，一律停用。
     canMerge: canMerge && !pipeline?.running,
-    canRollback: merged && !rolledBack && !!text(task.gitMerge?.commit),
+    // Closed 是 archive：不再提供撤銷，避免使用者對一個已經結案的任務做出「改動 main」的動作。
+    canRollback: merged && !rolledBack && !!text(task.gitMerge?.commit) && state !== 'closed',
+    // 唯一會把任務從 ready_to_close 推進到 closed 的按鈕；只有使用者主動按下才會發生
+    // （計畫書第十七章），不會因為合併成功或部署驗收通過就自動出現在別的狀態。
+    canClose: state === 'ready_to_close' && !pipeline?.running,
     // 一律是字串（沒有就是空字串）：撤銷按鈕的事件型別才不會變成 string|null。
     mergeCommit: text(task.gitMerge?.commit),
   };
