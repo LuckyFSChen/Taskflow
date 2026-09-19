@@ -1,13 +1,13 @@
 import express from 'express';
 import {spawn} from 'node:child_process';
 import {createServer as createNetProbe} from 'node:net';
-import {randomBytes} from 'node:crypto';
 import {existsSync,readFileSync,realpathSync,statSync} from 'node:fs';
 import {dirname,join,resolve,relative,isAbsolute,extname} from 'node:path';
 import {HttpError} from './domain.js';
 import {killTree} from './runner.js';
 import {createStore} from './db.js';
 import {registerPreview,unregisterPreview,waitForExit} from './process-lifecycle.js';
+import {acceptanceEnvironment,cleanupAcceptanceContext,createAcceptanceContext} from './acceptance-auth.js';
 
 const KNOWN_SERVER_DEPS=['express','fastify','koa','hapi','restify'];
 // Only a bare `node <relative-file>.js` start script is trusted enough to auto-spawn;
@@ -95,13 +95,24 @@ export function createProjectPreview({npm=runNpm,registryPath=resolve('data/prev
     await npm(path,['run','build']);
     const port=await getFreePort();
     const previewDbPath=resolve('data/preview',safeKeyFragment(key),'taskflow.sqlite');
-    const username='taskflow-preview',password=randomBytes(18).toString('base64url');
-    const seedStore=createStore(previewDbPath);
-    try{if(!seedStore.db.prepare('SELECT id FROM users LIMIT 1').get())seedStore.addUser('TaskFlow Preview',username,password,'admin');}
-    finally{seedStore.close();}
+    // 驗收身份由 AcceptanceContext 產生，Preview 與 Deployment Validator 共用同一份。
+    // 兩邊各自產生帳密，就是 /api/login 永遠 401 的成因。
+    const acceptance=createAcceptanceContext({projectPath:path,key});
+    // 每一次啟動都把驗收帳號**重設**成這一輪的密碼。之前只在「資料庫完全沒有使用者」時
+    // 才寫入，而 Preview 資料庫是跨次保留的——第二次之後 validator 手上的新密碼
+    // 與資料庫裡的舊雜湊永遠對不起來，登入必定 401。
+    try{
+      const seedStore=createStore(previewDbPath);
+      try{seedStore.upsertUser('TaskFlow Preview',acceptance.username,acceptance.password,'admin');acceptance.injection.database=true;}
+      finally{seedStore.close();}
+    }catch(error){acceptance.injection.error=String(error?.message||error).slice(0,200);}
     const env={...process.env};
     for(const k of ['INBOX_TOKEN','LINE_CHANNEL_SECRET','LINE_CHANNEL_ACCESS_TOKEN','OPENAI_API_KEY','CODEX_API_KEY','ANTHROPIC_API_KEY'])delete env[k];
     env.PORT=String(port);env.HOST='127.0.0.1';env.TASKFLOW_DB_FILE=previewDbPath;
+    // 非 TaskFlow 結構的專案讀不到上面那個資料庫，但可以在啟動時看見這組環境變數，
+    // 自己建立同樣的暫時帳號（README 的 Acceptance Bootstrap 約定）。
+    Object.assign(env,acceptanceEnvironment(acceptance));
+    acceptance.injection.environment=true;
     const child=spawn(process.execPath,[serverFile],{cwd:path,env,shell:false,windowsHide:true});
     let stderr='';
     child.stderr?.on('data',d=>{stderr=(stderr+d).slice(-3000);});
@@ -127,7 +138,9 @@ export function createProjectPreview({npm=runNpm,registryPath=resolve('data/prev
       exitPromise.catch(()=>{});
     }
     startupSettled=true;
-    const info={url,kind:'fullstack',pid:child.pid,cwd:path,credentials:{username,password}};
+    // credentials 是既有呼叫端（runner.js 的 Browser Validation prompt）用的舊形狀，
+    // 值直接取自同一個 AcceptanceContext——不是另外產生的第二組。
+    const info={url,kind:'fullstack',pid:child.pid,cwd:path,acceptance,credentials:{username:acceptance.username,password:acceptance.password},previewDbPath};
     running.set(key,{child,info});
     registerPreview(registryPath,{key,pid:child.pid,url,kind:'fullstack',cwd:path});
     child.once('exit',()=>{if(running.get(key)?.child===child)running.delete(key);unregisterPreview(registryPath,key);});
@@ -171,6 +184,18 @@ export function createProjectPreview({npm=runNpm,registryPath=resolve('data/prev
     pending.set(key,job);
     try{return await job;}finally{pending.delete(key);}
   }
+  function clearAcceptance(info){
+    const acceptance=info?.acceptance;
+    if(!acceptance)return;
+    if(acceptance.injection?.database&&info.previewDbPath){
+      try{
+        const store=createStore(info.previewDbPath);
+        try{store.removeAcceptanceUser(acceptance.username);}finally{store.close();}
+      }catch{/* 清不掉就留著：下一次啟動一律重設密碼，不會因此卡住驗收 */}
+    }
+    cleanupAcceptanceContext(acceptance);
+    if(info.credentials)info.credentials={username:acceptance.username,password:null};
+  }
   async function stop(key){
     if(pending.has(key))throw new HttpError(409,'網頁正在準備，請完成後再停止');
     const item=running.get(key);
@@ -188,6 +213,9 @@ export function createProjectPreview({npm=runNpm,registryPath=resolve('data/prev
     // 這裡再向作業系統確認一次 PID 真的不見了；沒消失就照實回報 verified:false，不假裝停好了。
     const verified=await waitForExit(item.info?.pid,{timeoutMs:5000});
     unregisterPreview(registryPath,key);
+    // 一次性驗收身份到這裡為止：把帳號與工作階段從 Preview 資料庫刪掉，再把記憶體裡的
+    // 祕密抹掉。留著等下一次「反正會重設」不算隔離——Preview 資料庫在磁碟上是留著的。
+    clearAcceptance(item.info);
     return {stopped:true,pid:item.info?.pid??null,verified};
   }
   return {stopProject:async pid=>{const matches=key=>key===pid||key.startsWith(pid+':');if([...pending.keys()].some(matches))throw new HttpError(409,'網頁正在建置，請完成後再停止');await Promise.all([...running.keys()].filter(matches).map(stop));},hasProjectActivity:pid=>[...running.keys(),...pending.keys()].some(key=>key===pid||key.startsWith(pid+':')),start,stop,status:key=>running.get(key)?.info||null,close:async()=>{await Promise.allSettled([...pending.values()]);await Promise.all([...running.keys()].map(stop));}};

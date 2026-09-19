@@ -188,3 +188,77 @@ test('送到瀏覽器的版本不含帳密，並說明這一段沒有涵蓋畫�
   assert.match(report.note, /不包含實際的畫面互動/);
   assert.equal(completionValidationPublic({}), null);
 });
+
+// --- 驗收身份與結構化結果（部署驗收認證架構修正） -----------------------------
+
+test('驗收用的是 Preview 建立的同一個 AcceptanceContext，不是另外產生的第二組帳密', async t => {
+  const f = mergedTask(t);
+  const acceptance = { id: 'ctx-1', mode: 'credentials', username: 'taskflow-preview', password: 'one-time', injection: { environment: true, database: true, error: null } };
+  const previews = {
+    calls: [],
+    start: async (key, path) => { previews.calls.push({ op: 'start', key, path }); return { url: 'http://127.0.0.1:61347', pid: 48216, kind: 'fullstack', acceptance, credentials: { username: acceptance.username, password: acceptance.password } }; },
+    stop: async key => { previews.calls.push({ op: 'stop', key }); },
+  };
+  let received = null;
+  const validations = createCompletionValidations({ previews, validate: async options => { received = options; return passing; }, wait: async () => true });
+
+  validations.start(f.store, f.owner, f.taskId);
+  await validations.settled();
+
+  assert.equal(received.acceptance, acceptance);             // 同一個物件，不是複製或重建
+  assert.equal(received.credentials.password, acceptance.password);
+});
+
+test('結構化結果會帶到畫面：失敗在哪一層、哪一種失敗、該算在誰頭上', async t => {
+  const f = mergedTask(t);
+  const failing = {
+    passed: false,
+    state: 'AUTH_FAILED',
+    health: { passed: true, status: 200 },
+    authentication: {
+      required: true, attempted: true, passed: false, mode: 'credentials',
+      endpoint: 'POST /api/login', status: 401, failureCode: 'authentication_failed', failureCategory: 'project_defect',
+      diagnostic: { credentialsInjected: true, requestFields: 'username,password', responseBody: '{"error":"Invalid credentials"}' },
+    },
+    apiState: { attempted: false, passed: false, status: null, skippedReason: 'authentication_failed' },
+    checks: [
+      { name: 'health', method: 'GET', path: '/api/health', expected: '200', actual: 'HTTP 200', passed: true, detail: '' },
+      { name: 'login', method: 'POST', path: '/api/login', expected: '200', actual: 'HTTP 401', passed: false, detail: 'failureCode=authentication_failed' },
+      { name: 'state', method: 'GET', path: '/api/state', expected: '200', actual: '未執行', passed: false, detail: 'skippedReason=authentication_failed' },
+    ],
+  };
+  const validations = createCompletionValidations({ previews: fakePreviews(), validate: async () => failing, wait: async () => true });
+
+  validations.start(f.store, f.owner, f.taskId);
+  await validations.settled();
+
+  const view = completionValidationPublic(f.store.task(f.taskId));
+  assert.equal(view.state, 'AUTH_FAILED');
+  assert.equal(view.authentication.failureCode, 'authentication_failed');
+  assert.equal(view.authentication.failureCategory, 'project_defect');
+  assert.equal(view.authentication.diagnostic.credentialsInjected, true);
+  assert.equal(view.apiState.skippedReason, 'authentication_failed');
+  // 畫面要看得到 Health ✓ / Authentication ✗ / State skipped
+  assert.equal(view.checks.find(c => c.name === 'health').passed, true);
+});
+
+test('TaskFlow 自己沒把驗收身份準備好時，不得誤報成「使用者專案驗收失敗」', async t => {
+  const f = mergedTask(t);
+  const infrastructureFailure = {
+    passed: false,
+    state: 'AUTH_FAILED',
+    health: { passed: true, status: 200 },
+    authentication: { required: true, attempted: false, passed: false, mode: 'credentials', endpoint: null, status: null, failureCode: 'credentials_not_injected', failureCategory: 'taskflow_infrastructure', diagnostic: null },
+    apiState: { attempted: false, passed: false, status: null, skippedReason: 'credentials_not_injected' },
+    checks: [{ name: 'login', method: 'POST', path: '/api/login', expected: '200', actual: '未執行', passed: false, detail: 'credentials_not_injected' }],
+  };
+  const validations = createCompletionValidations({ previews: fakePreviews(), validate: async () => infrastructureFailure, wait: async () => true });
+
+  validations.start(f.store, f.owner, f.taskId);
+  await validations.settled();
+
+  const summary = f.store.events(f.taskId).find(e => e.kind === 'completion_validation_result')?.message || '';
+  assert.match(summary, /TaskFlow 驗收基礎設施問題/);
+  assert.match(summary, /不是專案驗收失敗/);
+  assert.match(summary, /credentials_not_injected/);
+});

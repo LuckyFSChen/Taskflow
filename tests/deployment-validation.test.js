@@ -2,6 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {validateDeployment} from '../server/deployment-validation.js';
+import {createAcceptanceContext} from '../server/acceptance-auth.js';
+
+// Preview 已經把身份注入進去的 AcceptanceContext。驗收流程要的前提只有這個。
+function acceptance(config) {
+  const context = createAcceptanceContext(config === undefined ? {} : {config});
+  context.injection = {environment: true, database: true, error: null};
+  return context;
+}
 
 // 起一個真的 HTTP 伺服器來驗：假的 fetch 很容易寫出「只有自己看得懂」的回應，
 // 而這裡要確認的正是真實世界的狀態碼、header 與 JSON 解析。
@@ -102,4 +110,118 @@ test('連不上時每一項都是未通過，而且留下原因', async () => {
   assert.equal(report.passed, false);
   assert.equal(find(report, 'health').actual, '沒有回應');
   assert.ok(find(report, 'health').detail.length > 0);
+});
+
+// --- 驗收狀態機與認證階段（計畫書第十一、十二、十三、十七、十八章） -------------
+
+test('Test 1：專案宣告不需要登入時，health → state 就走完，不會卡在登入', async t => {
+  const url = await server(t, {
+    ...healthy,
+    'GET /api/state': (req, res) => {
+      assert.equal(req.headers.cookie, undefined); // 沒有身份就不該憑空生出一個
+      json(res, 200, { user: { id: 'u1' }, tasks: [] });
+    },
+  });
+
+  const report = await validateDeployment({ url, acceptance: acceptance({ mode: 'none' }) });
+  assert.equal(report.passed, true);
+  assert.equal(report.state, 'PASSED');
+  assert.equal(report.authentication.required, false);
+  assert.equal(report.authentication.attempted, false);
+  assert.equal(find(report, 'login').passed, true);
+});
+
+test('Test 2：credentials 登入成功後，整條狀態機走到 PASSED', async t => {
+  const context = acceptance();
+  const url = await server(t, {
+    ...healthy, ...loginOk,
+    'GET /api/state': (req, res) => { assert.match(req.headers.cookie || '', /tf_session=abc/); json(res, 200, { user: { id: 'u1' }, tasks: [] }); },
+  });
+
+  const report = await validateDeployment({ url, acceptance: context });
+  assert.equal(report.passed, true);
+  assert.equal(report.authentication.passed, true);
+  assert.equal(report.authentication.sessionType, 'cookie');
+  assert.equal(report.apiState.passed, true);
+  assert.deepEqual(report.states, ['PREVIEW_READY', 'HEALTH_VALIDATED', 'AUTHENTICATING', 'AUTHENTICATED', 'API_VALIDATED', 'PASSED']);
+});
+
+test('Test 4：bearer 模式用注入的 token 通過狀態查詢', async t => {
+  const context = acceptance({ mode: 'bearer' });
+  const url = await server(t, {
+    ...healthy,
+    'GET /api/state': (req, res) => {
+      if (req.headers.authorization !== `Bearer ${context.token}`) return json(res, 401, { error: 'unauthorized' });
+      json(res, 200, { user: { id: 'u1' }, tasks: [] });
+    },
+  });
+
+  const report = await validateDeployment({ url, acceptance: context });
+  assert.equal(report.passed, true);
+  assert.equal(report.authentication.sessionType, 'bearer');
+});
+
+test('Test 5：401 停在 AUTH_FAILED，狀態查詢標成 skipped 並留下 failureCode', async t => {
+  const url = await server(t, { ...healthy, 'POST /api/login': (req, res) => json(res, 401, { error: 'Invalid credentials' }) });
+  const report = await validateDeployment({ url, acceptance: acceptance() });
+
+  assert.equal(report.passed, false);
+  assert.equal(report.state, 'AUTH_FAILED');
+  assert.equal(report.authentication.failureCode, 'authentication_failed');
+  assert.equal(report.authentication.failureCategory, 'project_defect');
+  assert.equal(report.apiState.attempted, false);
+  assert.equal(report.apiState.skippedReason, 'authentication_failed');
+  // 不得只留下「需要登入（尚未認證）」這種對除錯沒有價值的結論
+  assert.match(find(report, 'login').detail, /failureCode=authentication_failed/);
+});
+
+test('Test 6：帳密沒被注入時不送出空帳密登入，且標成 TaskFlow 基礎設施問題', async t => {
+  const context = createAcceptanceContext({}); // 沒有任何注入
+  let loginCalls = 0;
+  const url = await server(t, { ...healthy, 'POST /api/login': (req, res) => { loginCalls += 1; json(res, 200, {}); } });
+
+  const report = await validateDeployment({ url, acceptance: context });
+  assert.equal(loginCalls, 0);
+  assert.equal(report.authentication.failureCode, 'credentials_not_injected');
+  assert.equal(report.authentication.failureCategory, 'taskflow_infrastructure');
+  assert.equal(report.passed, false);
+});
+
+test('登入成功卻在 /api/state 被擋下，要算成工作階段沒有傳遞，不是專案拒絕帳密', async t => {
+  const url = await server(t, { ...healthy, ...loginOk, 'GET /api/state': (req, res) => json(res, 401, { error: 'unauthorized' }) });
+  const report = await validateDeployment({ url, acceptance: acceptance() });
+
+  assert.equal(report.passed, false);
+  assert.equal(report.state, 'API_FAILED');
+  assert.equal(report.authentication.failureCode, 'session_not_propagated');
+  assert.equal(report.authentication.failureCategory, 'taskflow_infrastructure');
+  assert.match(find(report, 'state').detail, /工作階段沒有帶到後續請求/);
+});
+
+test('Test 8：報告裡不得出現 password、token 或 cookie 值', async t => {
+  const context = acceptance();
+  const url = await server(t, {
+    ...healthy,
+    'POST /api/login': (req, res) => json(res, 401, { error: 'Invalid credentials', echo: `password=${context.password}` }),
+  });
+  const report = await validateDeployment({ url, acceptance: context });
+  const serialized = JSON.stringify(report);
+  assert.ok(!serialized.includes(context.password));
+  assert.ok(!serialized.includes(context.token));
+});
+
+test('專案設定檔指定的登入端點與欄位會被照著用，不做 convention 猜測', async t => {
+  const context = acceptance({ mode: 'credentials', login: { method: 'POST', path: '/session', body: { email: '$acceptance.email', password: '$acceptance.password' } }, state: { method: 'GET', path: '/me' } });
+  let received = null;
+  const url = await server(t, {
+    ...healthy,
+    'POST /session': (req, res) => { let body = ''; req.on('data', c => { body += c; }); req.on('end', () => { received = JSON.parse(body); json(res, 200, { token: 'abc-token-123' }); }); },
+    'GET /me': (req, res) => json(res, req.headers.authorization === 'Bearer abc-token-123' ? 200 : 401, { id: 'u1' }),
+  });
+
+  const report = await validateDeployment({ url, acceptance: context });
+  assert.equal(received.email, context.email);
+  assert.equal(find(report, 'login').path, '/session');
+  assert.equal(find(report, 'state').path, '/me');
+  assert.equal(report.passed, true);
 });

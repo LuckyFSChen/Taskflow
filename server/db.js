@@ -87,6 +87,33 @@ export function createStore(filename=resolve(process.env.TASKFLOW_DB_FILE||'data
     lineLink(lineId) {return db.prepare('SELECT * FROM line_links WHERE line_id=?').get(lineId);},
     unlinkLine(userId,linkId) {return store.transaction(()=>{const link=db.prepare('SELECT * FROM line_links WHERE id=? AND user_id=?').get(linkId,userId);if(!link)return false;db.prepare('UPDATE users SET line_id=NULL WHERE id=? AND line_id=?').run(userId,link.line_id);db.prepare('DELETE FROM line_links WHERE id=?').run(linkId);db.prepare('DELETE FROM line_flows WHERE user_id=? AND line_id=?').run(userId,link.line_id);db.prepare('DELETE FROM outbox WHERE line_id=? AND sent=0').run(link.line_id);db.prepare("UPDATE line_chats SET status='cancelled' WHERE user_id=? AND line_id=? AND status IN ('pending','running')").run(userId,link.line_id);return true;});},
     addUser(name,username,password,role='member') { const uid=id(); db.prepare('INSERT INTO users(id,name,username,password,role) VALUES (?,?,?,?,?)').run(uid,name,username,passwordHash(password),role); return store.user(uid); },
+    // Preview 驗收帳號專用：每次啟動 Preview 都要讓帳號的密碼**確定**是這一輪產生的那一組。
+    // 只在「資料庫完全沒有使用者」時才建立的舊寫法，遇到跨次保留的 Preview 資料庫就必定 401。
+    upsertUser(name,username,password,role='member') {
+      const existing=db.prepare('SELECT id FROM users WHERE username=?').get(username);
+      if(!existing)return store.addUser(name,username,password,role);
+      db.prepare('UPDATE users SET name=?,password=?,role=? WHERE id=?').run(name,passwordHash(password),role,existing.id);
+      db.prepare('DELETE FROM sessions WHERE user_id=?').run(existing.id);
+      return store.user(existing.id);
+    },
+    // 驗收結束的清除：帳號與它的工作階段一起消失，Preview 資料庫裡不留下可再登入的身份。
+    removeAcceptanceUser(username) {
+      const existing=db.prepare('SELECT id FROM users WHERE username=?').get(username);
+      if(!existing)return false;
+      return store.transaction(()=>{
+        db.prepare('DELETE FROM sessions WHERE user_id=?').run(existing.id);
+        db.prepare('DELETE FROM memberships WHERE user_id=?').run(existing.id);
+        db.prepare('DELETE FROM line_links WHERE user_id=?').run(existing.id);
+        // 這個帳號名下還有任務時不刪帳號（外鍵會擋，而且那代表它不只是驗收身份）：
+        // 改成把密碼換成無人知道的亂數，一樣登不進去。
+        if(db.prepare('SELECT 1 FROM tasks WHERE owner_id=?').get(existing.id)){
+          db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(randomBytes(24).toString('base64url')),existing.id);
+          return true;
+        }
+        db.prepare('DELETE FROM users WHERE id=?').run(existing.id);
+        return true;
+      });
+    },
     project(pid) {return db.prepare('SELECT * FROM projects WHERE id=?').get(pid);},
     hasProject(user,pid) {return !!store.project(pid) && (user.role==='admin'||!!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND project_id=?').get(user.id,pid));},
     task(tid) {const row=db.prepare('SELECT data FROM tasks WHERE id=?').get(tid);return row?JSON.parse(row.data):null;},

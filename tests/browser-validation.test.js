@@ -218,3 +218,29 @@ test('Backend-only task on a non-web project never triggers Browser MCP wiring',
   assert.equal(sawBrowserPrompt,false);
   assert.equal(f.store.task(task.id).status,'completed');
 });
+
+// Test 9（計畫書第十四、二十章）：Browser Validation 不得自己另外生一個身份。
+// 交給 Agent 的 Preview 帳密，必須就是 Preview 注入的那一個 AcceptanceContext 裡的那一組。
+test('Browser Validation 使用與 API 驗收相同的 Acceptance Identity',async t=>{
+  const f=browserFixture(t,{capabilityAvailable:true});
+  const acceptance={id:'ctx-browser',mode:'credentials',username:'taskflow-preview',password:'one-time-browser-pw',injection:{environment:true,database:true,error:null}};
+  const previews={
+    start:async()=>({url:'http://127.0.0.1:59999',kind:'fullstack',pid:1234,acceptance,credentials:{username:acceptance.username,password:acceptance.password}}),
+    stop:async()=>{},status:()=>null,close:async()=>{},
+  };
+  const prompts=[];
+  const runner=createRunner(f.store,{dataDir:join(f.dir,'runs'),recover:false,previews,checkBrowserCapability:f.checkBrowserCapability,
+    adapter:async o=>{prompts.push(o.prompt);if(o.readOnly)return {result:plan};
+      return {result:{summary:'已實際開啟 Preview 並登入操作',questions:[],artifacts:['index.html'],passed:true,evidence:['browser checked'],
+        browserValidation:{...defaultBrowserValidation(),required:true,status:'passed',executed:true,passed:true,toolUsed:true,toolCallCount:3}},
+        browserEvidence:{toolCallCount:3,categories:{navigate:1,interact:2}}};}});
+  t.after(()=>runner.stop());f.store.setSetting('runnerEnabled',true);
+  const task=f.create();approveWithCompletedStep(f.store,task);
+  await runner.tick();
+
+  const browserPrompt=prompts.find(p=>p.includes('Browser Preview URL'));
+  assert.ok(browserPrompt,'需要 Browser Validation 的任務應該拿到 Preview URL');
+  assert.match(browserPrompt,/username=taskflow-preview/);
+  assert.ok(browserPrompt.includes(`password=${acceptance.password}`),'交給 Browser 的必須是同一組一次性帳密，不是另外產生的');
+  assert.match(browserPrompt,/禁止嘗試讀取 data\/first-login.txt、猜測或使用任何正式使用者帳密/);
+});

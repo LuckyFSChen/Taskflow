@@ -35,6 +35,27 @@ export function completionValidationPublic(task) {
     pid: report.pid ?? null,
     previewStopped: report.previewStopped === true,
     checks: (report.checks || []).slice(0, MAX_LISTED_CHECKS),
+    // 失敗在哪一層、是哪一種失敗、該算在誰頭上。這三件事以前只能從一句中文猜。
+    // 這裡送出的欄位都是結論與代碼，沒有 password／token／cookie。
+    state: report.state || null,
+    authentication: report.authentication ? {
+      required: report.authentication.required === true,
+      attempted: report.authentication.attempted === true,
+      passed: report.authentication.passed === true,
+      mode: report.authentication.mode || null,
+      endpoint: report.authentication.endpoint || null,
+      status: report.authentication.status ?? null,
+      sessionType: report.authentication.sessionType || null,
+      failureCode: report.authentication.failureCode || null,
+      failureCategory: report.authentication.failureCategory || null,
+      diagnostic: report.authentication.diagnostic || null,
+    } : null,
+    apiState: report.apiState ? {
+      attempted: report.apiState.attempted === true,
+      passed: report.apiState.passed === true,
+      status: report.apiState.status ?? null,
+      skippedReason: report.apiState.skippedReason || null,
+    } : null,
     startedAt: report.startedAt || null,
     finishedAt: report.finishedAt || null,
     error: report.error || null,
@@ -71,7 +92,9 @@ export function createCompletionValidations({ previews, validate = validateDeplo
     const checks = [];
     let report = null;
     try {
-      report = await validate({ url: info.url, credentials: info.credentials || null });
+      // 同一個 AcceptanceContext：Preview 注入的那一組身份，就是 validator 登入用的那一組。
+      // credentials 只是舊呼叫端的相容形狀，值同樣來自這個 context，不是另外產生的第二組。
+      report = await validate({ url: info.url, acceptance: info.acceptance || null, credentials: info.credentials || null });
       checks.push(...report.checks);
     } finally {
       // 不論驗收結果如何都要把 Preview 停掉，否則它會一直佔著連接埠與暫存資料庫。
@@ -90,7 +113,18 @@ export function createCompletionValidations({ previews, validate = validateDeplo
       detail: stopped ? '' : '停止指令已送出，但這個 PID 仍然存在；在確認它消失之前，本次驗收不得判定通過。',
     });
 
-    return { url: info.url, pid: info.pid ?? null, previewStopped: stopped, checks, passed: !!report?.passed && stopped };
+    // 結構化結果：UI 與 AI 不必再去解析自然語言，才知道失敗在哪一層、該算在誰頭上。
+    return {
+      url: info.url,
+      pid: info.pid ?? null,
+      previewStopped: stopped,
+      checks,
+      passed: !!report?.passed && stopped,
+      state: !stopped && report?.passed ? 'PREVIEW_NOT_STOPPED' : report?.state || null,
+      health: report?.health || null,
+      authentication: report?.authentication || null,
+      apiState: report?.apiState || null,
+    };
   }
 
   function finish(store, taskId, validationId, patch) {
@@ -126,9 +160,15 @@ export function createCompletionValidations({ previews, validate = validateDeplo
           const updated = finish(store, taskId, validationId, { status: 'completed', ...outcome });
           if (!updated) return;
           const failed = outcome.checks.filter(item => !item.passed);
+          // 認證失敗時要分得出「專案真的壞了」與「TaskFlow 沒把驗收身份準備好」：
+          // 後者不是專案驗收失敗，不該讓使用者去改自己的程式。
+          const auth = outcome.authentication;
+          const infrastructure = auth && auth.passed === false && auth.failureCategory === 'taskflow_infrastructure';
           const summary = outcome.passed
             ? `部署驗收通過：${outcome.checks.length} 項全部通過，Preview 程序已確認結束。`
-            : `部署驗收未通過：${failed.map(item => `${item.name}（${item.actual}）`).join('、')}`;
+            : infrastructure
+              ? `TaskFlow 驗收基礎設施問題（不是專案驗收失敗）：${auth.failureCode}。失敗停在 ${outcome.state || 'AUTH_FAILED'}，${failed.map(item => `${item.name}（${item.actual}）`).join('、')}`
+              : `部署驗收未通過：${failed.map(item => `${item.name}（${item.actual}）`).join('、')}${auth?.failureCode ? `，failureCode=${auth.failureCode}` : ''}`;
           store.event(taskId, 'completion_validation_result', summary);
           if (!outcome.passed) store.notify(updated, summary);
         })

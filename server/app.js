@@ -106,7 +106,9 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   }
   // Preview credentials (fullstack Preview 的一次性測試帳密) 只給 runner.js 內部組 prompt 用，
   // 一般前端 UI 一律拿不到，避免外洩到瀏覽器或被其他使用者看見。
-  const withoutCredentials=info=>info?{...info,credentials:undefined}:info;
+  // acceptance（AcceptanceContext）裡有完整的 password 與 token，和 credentials 一樣不得離開伺服器；
+  // 前端要的只是 url 與 kind，連「驗收身份存在」這件事都不需要知道。
+  const withoutCredentials=info=>info?{...info,credentials:undefined,acceptance:undefined,previewDbPath:undefined}:info;
   app.get('/api/projects/:id/targets',(req,res)=>{
     const p=store.project(req.params.id);if(!p||!store.hasProject(req.user,p.id))throw new HttpError(404,'找不到專案');
     const targets=[{taskId:null,label:'原始專案',web:detectWebProject(p.path),preview:withoutCredentials(previews.status(p.id))},...store.tasks(req.user).filter(t=>t.projectId===p.id&&t.workspace).map(t=>({taskId:t.id,label:`${t.title} · v${t.planVersion} 工作副本`,web:detectWebProject(t.workspace),preview:withoutCredentials(previews.status(`${p.id}:${t.id}:${t.planVersion}`))}))];
