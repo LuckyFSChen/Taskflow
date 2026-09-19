@@ -32,6 +32,7 @@ const TABS=[
 ];
 const tab=ref('general');
 const index=computed(()=>Math.max(0,TABS.findIndex(item=>item.id===tab.value)));
+const tabColumns=computed(()=>TABS.map(()=>'1fr').join(' '));
 const HINTS:Record<string,string>={
   general:'工作空間、專案存放位置與首次設定。',
   ai:'AI 執行服務、同時執行上限與各角色使用的模型。',
@@ -44,7 +45,7 @@ const hint=computed(()=>HINTS[tab.value]||'');
 
 <template>
   <div class="settings-shell">
-    <div class="segmented" role="tablist" aria-label="設定分頁" :style="{'--count':TABS.length,'--index':index}">
+    <div class="segmented" role="tablist" aria-label="設定分頁" :style="{'--count':TABS.length,'--index':index,'gridTemplateColumns':tabColumns}">
       <i class="segmented-thumb" aria-hidden="true"/>
       <button
         v-for="item in TABS"
