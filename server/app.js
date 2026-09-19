@@ -16,8 +16,6 @@ import {manualActionRequest,decideManualAction} from './manual-action.js';
 import { prepareProjectDirectory } from './project-directory.js';
 import {browseDirectory,createDirectory,availableDrives} from './directory-browser.js';
 import {createTaskWithProject} from './task-project.js';
-// 方案群組：任務佇列的分組依據。只認明確的 planGroupId，不做任何字串推測。
-import {createPlanGroup,renamePlanGroup,assignTaskPlanGroup,planGroupsPublic} from './plan-group.js';
 import {changeTaskStatus,taskDisplayStatus} from './task-status.js';
 import {gitIssueRequest,decideGitIssue,gitIssuePending,closePendingRequestsOnCancel} from './git-issue.js';
 import {createProjectPreview,detectWebProject,openFolder} from './project-preview.js';
@@ -25,9 +23,15 @@ import {checkClaudeBrowserCapability} from './browser-capability.js';
 import {createSystemHealth} from './system-health.js';
 import {onboardingStatus,completeOnboarding} from './onboarding.js';
 import {recoverTaskOutput,taskOriginalOutput,outputIssueRecoverable} from './output-issue.js';
-import {taskGitReview,decideGitReview,rollbackTaskMerge} from './git-review.js';
+import {taskGitReview,decideGitReview,rollbackTaskMerge,applyCleanup} from './git-review.js';
+// 一次核准就依序跑完的部署流程；它自己不執行任何操作，只推進下面這幾個既有子系統。
+import {createCompletion,createCompletionPipeline,completionPublic} from './completion-pipeline.js';
 // 測試基準比對：在 main 與任務分支各跑一次完整測試，用結構化比對取代「AI 說那 3 個是既有失敗」。
 import {createCompletionTests,completionTestPublic} from './completion-test.js';
+// 部署重啟：主 server 不自己殺自己，只把請求寫進共用資料庫，由獨立的守護程式執行。
+import {guardianAlive,initControlRequests,isSelfProject,latestRestart,recoverStuckRestarts,requestRestart,restartBlockReason,restartView} from './control-requests.js';
+// 合併後的部署驗收：開一個 Preview 驗 API，停掉它，並確認 PID 真的消失。
+import {createCompletionValidations,completionValidationPublic} from './completion-validation.js';
 import {legacyWorkspaceStatus,migrateLegacyWorkspace} from './git-migration.js';
 import {createGitWorkspace} from './git-workspace.js';
 
@@ -43,8 +47,32 @@ export function allowedOrigins(publicOrigin=process.env.PUBLIC_ORIGIN) {
   return [...allowed];
 }
 
-export function createApp(store,runner,{dist=resolve('dist'),previews=createProjectPreview(),folderOpener=openFolder,health=createSystemHealth(store),gitWorkspace=createGitWorkspace(),completionTests=createCompletionTests({gitWorkspace})}={}) {
+export function createApp(store,runner,{dist=resolve('dist'),previews=createProjectPreview(),folderOpener=openFolder,health=createSystemHealth(store),gitWorkspace=createGitWorkspace(),completionTests=createCompletionTests({gitWorkspace}),completionValidations=createCompletionValidations({previews}),taskflowRoot=resolve('.')}={}) {
   const app=express(),attempts=new Map();app.disable('x-powered-by');
+  initControlRequests(store.db);
+  const selfProjectFor=t=>isSelfProject(store.project(t.projectId)?.path,taskflowRoot);
+  // Pipeline 的每一個階段都對應到既有的模組：沒有第二套 merge、沒有第二套重啟。
+  const completionPipeline=createCompletionPipeline(store,{
+    tests:completionTests,
+    validations:completionValidations,
+    merge:(s,user,task)=>decideGitReview(s,user,task.id,{decision:'merge',artifactVersion:task.completion.artifactVersion,cleanup:false},{gitWorkspace}),
+    restart:(s,user,task)=>{
+      recoverStuckRestarts(s);
+      const blocked=restartBlockReason(s,task,{taskflowRoot,projectPath:s.project(task.projectId)?.path});
+      // 「已經有一個請求在進行中」是等待，其餘（不是自己的專案、守護程式沒在跑）是真的做不到。
+      if(blocked)return {retryable:blocked.code==='already_requested',message:blocked.message};
+      requestRestart(s,{taskId:task.id,userId:user.id,expectedCommit:task.gitMerge.commit});
+      return null;
+    },
+    restartStatus:(s,task)=>restartView(latestRestart(s,task.id)),
+    cleanup:(s,task)=>{
+      applyCleanup(s,s.task(task.id),{gitWorkspace,deleteUnmerged:false});
+      const latest=s.task(task.id);
+      return {removed:!!latest.git?.cleanedUp,branchDeleted:!!latest.git?.branchDeleted};
+    },
+    onError:(error,taskId)=>store.event(taskId,'completion_error',`部署流程發生未預期錯誤：${String(error?.message||error).slice(0,300)}`),
+  });
+  app.locals.completionPipeline=completionPipeline;
   app.use((req,res,next)=>{res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','same-origin');res.setHeader('X-Frame-Options','DENY');res.setHeader('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");next();});
   app.use('/api',express.json({limit:'100kb'}));
   app.use('/api',(req,res,next)=>{res.setHeader('Cache-Control','no-store');if(!['GET','HEAD','OPTIONS'].includes(req.method)){const origin=req.get('origin');const allowed=allowedOrigins(store.setting('publicOrigin',process.env.PUBLIC_ORIGIN));if(origin&&!allowed.includes(origin))return res.status(403).json({error:'不允許的來源'});if(!req.is('application/json'))return res.status(415).json({error:'需使用 JSON 請求'});}const cookie=(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('tf_session='))?.slice(11);if(cookie){const session=store.db.prepare('SELECT user_id FROM sessions WHERE token=? AND expires>?').get(hash(cookie),Date.now());if(session){req.user=store.user(session.user_id);req.sessionHash=hash(cookie);}}next();});
@@ -85,7 +113,11 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/projects/:id/preview',async(req,res)=>{const target=projectTarget(req);res.json(withoutCredentials(await previews.start(target.key,target.path)));});
   app.post('/api/projects/:id/preview/stop',async(req,res)=>{const target=projectTarget(req);await previews.stop(target.key);res.json({ok:true});});
   const visibleProjects=user=>{const projects=store.db.prepare('SELECT * FROM projects').all().filter(p=>store.hasProject(user,p.id));return projects.map(p=>user.role==='admin'?p:{id:p.id,name:p.name,code:p.code});};
-  function decorated(t){const threads=store.threads(t.id).filter(th=>th.version===t.planVersion).map(th=>({...th,...threadPresentation(th)}));return {...t,validationSkipRequest:validationSkipRequest(store,t),executionApproval:executionApproval(store,t),manualAction:manualActionRequest(store,t),
+  function decorated(t){const threads=store.threads(t.id).filter(th=>th.version===t.planVersion).map(th=>({...th,...threadPresentation(th)}));
+    // 重新啟動「正式 TaskFlow」只對 TaskFlow 自己這個專案有意義；其他專案不該看到那個按鈕，
+    // 也不該為了它每次輪詢都多查一次資料庫。
+    const selfProject=isSelfProject(store.project(t.projectId)?.path,taskflowRoot),deployable=selfProject&&!!t.gitMerge;
+    return {...t,validationSkipRequest:validationSkipRequest(store,t),executionApproval:executionApproval(store,t),manualAction:manualActionRequest(store,t),
     // Git 守門的待確認請求（未提交修改、受保護分支…）。原始的 t.gitIssue 仍隨 spread 送出，
     // 讓 UI 也能顯示「已確認／已處理」的歷程；gitRequest 只在真的還要使用者處理時才存在。
     gitRequest:gitIssueRequest(store,t),
@@ -97,16 +129,19 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     // 測試比對的紀錄裡有伺服器磁碟上的 log 路徑，和 workspace 一樣不送到瀏覽器；
     // 只送結論、數量與失敗項目名稱。
     completionTest:completionTestPublic(t),
+    completionValidation:completionValidationPublic(t),
+    completion:completionPublic(t),
+    selfProject,
+    // 守護程式每五秒寫一次心跳；沒有它就沒有人能安全地重新啟動正式服務，UI 必須照實說。
+    guardianOnline:deployable?guardianAlive(store):false,
+    completionRestart:deployable?restartView(latestRestart(store,t.id)):null,
     // repositoryPath／workingDirectory 是伺服器磁碟路徑，和 workspace 一樣不送到瀏覽器；
     // 只送使用者真正需要判讀的 Git 座標：從哪個分支開出、目前在哪個分支、哪兩個 commit。
     git:t.git?{mode:t.git.mode,baseBranch:t.git.baseBranch,workingBranch:t.git.workingBranch,baseCommit:t.git.baseCommit,headCommit:t.git.headCommit}:t.git,
-    // 方案群組只送 id 與名稱；群組的完成度／狀態一律由前端依真實 task state 聚合，
-    // 後端不預先算任何進度數字，也不會在這裡幫沒有 planGroupId 的舊任務「猜」一個群組。
-    planGroupId:t.planGroupId||null,planGroupName:t.planGroupId?store.planGroup(t.planGroupId)?.name||null:null,
     workspace:undefined,threads,ownerName:store.user(t.ownerId)?.name,projectName:store.project(t.projectId)?.name,completedSteps:threads.filter(th=>th.phase==='execute'&&th.status==='completed'&&th.result?.passed&&!th.result.questions?.length).length,totalSteps:t.plan?.steps.length||0};}
   app.get('/api/state',async(req,res)=>{
     const browser=await checkClaudeBrowserCapability().catch(error=>({available:false,provider:null,cli:'claude',error:error.message}));
-    res.json({user:req.user,onboarding:onboardingStatus(store,req.user),defaultProjectRoot:req.user.role==='admin'?store.setting('defaultProjectRoot',''):undefined,projects:visibleProjects(req.user),planGroups:planGroupsPublic(store,req.user),tasks:store.tasks(req.user).map(decorated),runner:{enabled:store.setting('runnerEnabled',false),...runner.status,maxConcurrent:runnerLimit(store),activeTaskIds:(runner.status.activeTaskIds||[]).filter(id=>store.tasks(req.user).some(t=>t.id===id)),activeTaskId:store.tasks(req.user).some(t=>t.id===runner.status.activeTaskId)?runner.status.activeTaskId:null},integrations:{lineConfigured:!!(process.env.INBOX_URL&&process.env.INBOX_TOKEN),lastSync:store.setting('inboxLastSuccess'),error:store.setting('inboxError'),notificationError:store.db.prepare("SELECT error FROM outbox WHERE sent=0 AND cancelled_at IS NULL AND error IS NOT NULL ORDER BY rowid DESC LIMIT 1").get()?.error||null,pendingNotifications:store.db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent=0 AND cancelled_at IS NULL').get().n,browser:{configured:!!browser.available,provider:browser.provider,available:browser.available,error:browser.error}}});
+    res.json({user:req.user,onboarding:onboardingStatus(store,req.user),defaultProjectRoot:req.user.role==='admin'?store.setting('defaultProjectRoot',''):undefined,projects:visibleProjects(req.user),tasks:store.tasks(req.user).map(decorated),runner:{enabled:store.setting('runnerEnabled',false),...runner.status,maxConcurrent:runnerLimit(store),activeTaskIds:(runner.status.activeTaskIds||[]).filter(id=>store.tasks(req.user).some(t=>t.id===id)),activeTaskId:store.tasks(req.user).some(t=>t.id===runner.status.activeTaskId)?runner.status.activeTaskId:null},integrations:{lineConfigured:!!(process.env.INBOX_URL&&process.env.INBOX_TOKEN),lastSync:store.setting('inboxLastSuccess'),error:store.setting('inboxError'),notificationError:store.db.prepare("SELECT error FROM outbox WHERE sent=0 AND cancelled_at IS NULL AND error IS NOT NULL ORDER BY rowid DESC LIMIT 1").get()?.error||null,pendingNotifications:store.db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent=0 AND cancelled_at IS NULL').get().n,browser:{configured:!!browser.available,provider:browser.provider,available:browser.available,error:browser.error}}});
   });
   // Read-only environment report every signed-in member can see: the dashboard warning
   // and 平台設定 both read it. ?refresh=1 is a manual re-check, still rate limited inside
@@ -119,12 +154,6 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     res.json(completeOnboarding(store,req.user));
   });
   app.post('/api/tasks',(req,res)=>res.status(201).json(decorated(store.transaction(()=>createTaskWithProject(store,req.user,req.body)))));
-  // 方案群組。三條路徑都只改分組座標，不碰任務的執行狀態、計畫版本或任何核准紀錄。
-  app.post('/api/plan-groups',(req,res)=>res.status(201).json(store.transaction(()=>createPlanGroup(store,req.user,req.body))));
-  app.post('/api/plan-groups/:id/rename',(req,res)=>res.json(renamePlanGroup(store,req.user,req.params.id,req.body)));
-  // 把既有任務（含沒有方案的舊任務）歸入方案，或移出成為獨立任務。
-  // 這是使用者明確按下的動作：TaskFlow 不會自己依標題或專案把舊任務合併進任何方案。
-  app.post('/api/tasks/:id/plan-group',(req,res)=>res.json(decorated(store.transaction(()=>assignTaskPlanGroup(store,req.user,req.params.id,req.body)))));
   app.get('/api/tasks/:id',(req,res)=>{const t=requireTask(store,req.user,req.params.id);res.json({...decorated(t),events:store.events(t.id)});});
   app.post('/api/tasks/:id/preflight/retry',(req,res)=>{const t=requireTask(store,req.user,req.params.id);if(!t.environmentIssue||t.environmentIssue.id!==req.body.issueId||t.environmentIssue.planVersion!==t.planVersion||t.status!=='waiting_input')throw new HttpError(409,'環境問題已變更，請重新查看');t.environmentIssue=null;t.dependencyPreflight=null;t.error=null;t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'awaiting_approval';t.controlVersion=(t.controlVersion||0)+1;store.saveTask(t);store.event(t.id,'preflight_approved',`${req.user.name} 核准重新檢查套件環境；通過前不執行工作`);res.json(decorated(t));});
   // Git 安全守門（未提交修改、受保護分支、巢狀版本庫…）的三個人工出路。沿用既有的
@@ -158,6 +187,60 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/tasks/:id/completion/test',(req,res)=>{
     z.object({}).strict().parse(req.body||{});
     res.json(decorated(completionTests.start(store,req.user,req.params.id)));
+  });
+  // Level B：使用者核准後才會重新啟動正式 TaskFlow。這條路徑只寫一筆固定 action 的請求，
+  // 不執行任何指令、也不接受任何指令字串；真正動手的是獨立的守護程式。
+  app.post('/api/tasks/:id/completion/restart',(req,res)=>{
+    z.object({}).strict().parse(req.body||{});
+    const t=requireTask(store,req.user,req.params.id);
+    // 先收掉守護程式掛掉時留下的孤兒請求，否則會被誤判成「已經有一個請求在進行中」。
+    recoverStuckRestarts(store);
+    const blocked=restartBlockReason(store,t,{taskflowRoot,projectPath:store.project(t.projectId)?.path});
+    if(blocked)throw new HttpError(409,blocked.message);
+    requestRestart(store,{taskId:t.id,userId:req.user.id,expectedCommit:t.gitMerge.commit});
+    store.event(t.id,'restart_requested',`${req.user.name} 核准重新啟動正式 TaskFlow（預期版本 ${String(t.gitMerge.commit).slice(0,8)}）；由守護程式先建置再重啟。`);
+    res.json(decorated(store.task(t.id)));
+  });
+  // 一次核准，依序跑完。approve 只建立狀態機並記錄核准，實際推進由固定間隔的 tick 負責；
+  // 重啟階段會殺掉這個行程，狀態因此存在任務資料裡，新的行程開機後自己接著跑。
+  app.post('/api/tasks/:id/completion/approve',(req,res)=>{
+    const input=z.object({artifactVersion:z.string().max(200),options:z.object({restart:z.boolean().optional(),validate:z.boolean().optional(),cleanup:z.boolean().optional()}).strict().optional()}).strict().parse(req.body||{});
+    const t=requireTask(store,req.user,req.params.id);
+    if(t.git?.mode!=='worktree')throw new HttpError(409,'此任務不是以 Git 模式執行，沒有可部署的分支。');
+    if(t.status!=='completed'||t.manualCompletion)throw new HttpError(409,'只有通過獨立驗證而完成的任務才能部署；手動標記完成不代表驗收通過。');
+    if(!t.artifactVersion||input.artifactVersion!==t.artifactVersion)throw new HttpError(409,'成果版本不符，請重新查看最新成果後再核准。');
+    if(t.completion?.status==='running')throw new HttpError(409,'此任務的部署流程正在進行中。');
+    t.completion=createCompletion({task:t,user:req.user,selfProject:selfProjectFor(t),options:input.options||{}});
+    store.saveTask(t);
+    store.event(t.id,'completion_approved',`${req.user.name} 核准部署流程：${t.completion.stages.join(' → ')}`);
+    res.json(decorated(store.task(t.id)));
+  });
+  app.post('/api/tasks/:id/completion/retry',(req,res)=>{
+    const input=z.object({completionId:z.string().max(200)}).strict().parse(req.body||{});
+    const t=requireTask(store,req.user,req.params.id);
+    if(!t.completion||t.completion.id!==input.completionId)throw new HttpError(409,'部署流程已變更，請重新查看。');
+    if(t.completion.status!=='failed')throw new HttpError(409,'只有停在失敗階段的部署流程可以重試。');
+    // 已完成的階段留著：重試一律從失敗的那一階段開始，不會重新合併、也不會重新重啟。
+    t.completion={...t.completion,status:'running',failure:null,finishedAt:null,approvedAt:new Date().toISOString()};
+    store.saveTask(t);
+    store.event(t.id,'completion_retry',`${req.user.name} 要求從「${t.completion.stage}」重新開始；已完成的階段不會重跑。`);
+    res.json(decorated(store.task(t.id)));
+  });
+  app.post('/api/tasks/:id/completion/cancel',(req,res)=>{
+    const input=z.object({completionId:z.string().max(200)}).strict().parse(req.body||{});
+    const t=requireTask(store,req.user,req.params.id);
+    if(!t.completion||t.completion.id!==input.completionId)throw new HttpError(409,'部署流程已變更，請重新查看。');
+    if(!['running','failed'].includes(t.completion.status))throw new HttpError(409,'此部署流程已經結束。');
+    t.completion={...t.completion,status:'cancelled',finishedAt:new Date().toISOString()};
+    store.saveTask(t);
+    store.event(t.id,'completion_cancelled',`${req.user.name} 停止部署流程；已完成的階段保留不變（已合併的內容不會被還原）。`);
+    res.json(decorated(store.task(t.id)));
+  });
+  // 部署驗收：同樣只「開始」，不等結果。它會建立 Preview、驗證 API、停止 Preview，
+  // 並確認那個 PID 真的消失；PID 還在就不得判定通過。
+  app.post('/api/tasks/:id/completion/validate',(req,res)=>{
+    z.object({}).strict().parse(req.body||{});
+    res.json(decorated(completionValidations.start(store,req.user,req.params.id)));
   });
   app.post('/api/tasks/:id/git/rollback',(req,res)=>{
     const input=z.object({mergeCommit:z.string().min(7).max(64)}).strict().parse(req.body||{});

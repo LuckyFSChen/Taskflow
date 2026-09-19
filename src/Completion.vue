@@ -5,7 +5,15 @@
 import {computed,ref} from 'vue';
 import {completionView} from './completion-view.js';
 const props=defineProps<{task?:any;review?:any;busy:boolean;loading?:boolean}>();
-const emit=defineEmits<{refresh:[];test:[];restart:[];validate:[];merge:[options:{cleanup:boolean}];rollback:[mergeCommit:string]}>();
+const emit=defineEmits<{
+  refresh:[];test:[];restart:[];validate:[];
+  approve:[options:{restart:boolean;validate:boolean;cleanup:boolean}];
+  retry:[completionId:string];cancelPipeline:[completionId:string];
+  merge:[options:{cleanup:boolean}];rollback:[mergeCommit:string];
+}>();
+// 一次核准要跑哪些階段。重啟與部署驗收只有 TaskFlow 自己這個專案才有意義，
+// 所以那兩個勾選框只在 selfProject 時出現（勾了也不會排進其他專案的流程）。
+const runRestart=ref(true),runValidate=ref(true);
 const view=computed(()=>completionView(props.task,props.review));
 // 預設勾選＝沿用後端既有預設（合併成功後移除 worktree 並刪除已合併分支）。
 // 取消勾選時分支與工作副本原樣保留，之後仍可手動處理。
@@ -33,6 +41,59 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
       </dd></div>
       <div v-if="view.merge"><dt>Merge commit</dt><dd><code>{{view.merge.short}}</code> <small>{{time(view.merge.at)}}</small></dd></div>
     </dl>
+
+    <!-- 一次核准，依序跑完。狀態機在後端（server/completion-pipeline.js）：
+         這裡只顯示它算出來的階段與結果，不做第二套判斷。 -->
+    <div v-if="view.pipeline" class="completion-pipeline">
+      <div class="setting-row">
+        <strong>部署流程</strong>
+        <span class="badge" :class="view.pipeline.toneClass">{{view.pipeline.label}}</span>
+        <small v-if="view.pipeline.approvedByName">由 {{view.pipeline.approvedByName}} 核准</small>
+      </div>
+      <ol class="progress-steps">
+        <li v-for="item in view.pipeline.stages" :key="item.key" :class="item.state">
+          <span class="progress-mark" aria-hidden="true">{{item.mark}}</span>
+          <div class="grow"><strong>{{item.label}}</strong><small v-if="item.note">{{item.note}}</small></div>
+        </li>
+      </ol>
+      <p v-if="view.pipeline.running&&view.pipeline.note" class="subtle">{{view.pipeline.note}}</p>
+      <template v-if="view.pipeline.failure">
+        <p class="error-text">在「{{view.pipeline.failure.stage}}」停住：{{view.pipeline.failure.message}}</p>
+        <p class="subtle">已完成的階段會保留，重試只會從停住的這一階段開始；已經合併的內容不會被還原。</p>
+      </template>
+      <div class="actions">
+        <button v-if="view.pipeline.failed" type="button" class="primary" :disabled="busy"
+                @click="emit('retry',view.pipeline.id)">從失敗階段重試</button>
+        <button v-if="view.pipeline.running||view.pipeline.failed" type="button" class="secondary" :disabled="busy"
+                @click="emit('cancelPipeline',view.pipeline.id)">停止流程</button>
+      </div>
+    </div>
+
+    <!-- 一次核准就跑完全部：這是「只按一次」的入口，下面每個區塊仍可單獨執行。 -->
+    <div v-if="view.canApprovePipeline" class="completion-approve">
+      <h4>一次核准，依序完成</h4>
+      <ol class="completion-plan">
+        <li>測試比對：在 <code>{{view.branch.base}}</code> 取基準，再跑任務分支，有新增失敗就停住</li>
+        <li>以 <code>git merge --no-ff</code> 併入 <code>{{view.branch.base}}</code></li>
+        <li v-if="view.restart&&runRestart">重新啟動正式 TaskFlow（先建置，建置失敗不會停掉現在的服務）</li>
+        <li v-if="view.restart&&runValidate">部署驗收：驗 API 並確認 Preview 程序結束</li>
+        <li v-if="cleanup">清理 worktree 與已合併分支</li>
+      </ol>
+      <div class="completion-options">
+        <label v-if="view.restart" class="completion-option">
+          <input v-model="runRestart" type="checkbox" :disabled="busy"> 完成後重新啟動正式 TaskFlow
+        </label>
+        <label v-if="view.restart" class="completion-option">
+          <input v-model="runValidate" type="checkbox" :disabled="busy"> 重啟後執行部署驗收
+        </label>
+        <label class="completion-option">
+          <input v-model="cleanup" type="checkbox" :disabled="busy"> 全部完成後清理工作副本與分支
+        </label>
+      </div>
+      <button type="button" class="primary" :disabled="busy"
+              @click="emit('approve',{restart:runRestart,validate:runValidate,cleanup})">核准並完成</button>
+      <p class="subtle">任一階段失敗都會停在那裡等你，不會繼續往下跑；已完成的階段不會重做。</p>
+    </div>
 
     <ol class="progress-steps completion-stages">
       <li v-for="item in view.stages" :key="item.key" :class="item.state">
@@ -219,6 +280,10 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
 .completion-blockers li{padding:6px 0}
 .completion-blockers strong{display:block}
 .completion-blockers small{display:block;opacity:.8}
+.completion-pipeline{margin:10px 0;padding:10px 12px;border:1px solid var(--line,rgba(127,127,127,.25));border-radius:8px}
+.completion-pipeline .setting-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.completion-approve{margin:10px 0;padding:10px 12px;border:1px solid var(--line,rgba(127,127,127,.25));border-radius:8px}
+.completion-options{display:flex;flex-direction:column;gap:2px;margin:8px 0}
 .completion-test{margin:10px 0;padding:10px 12px;border:1px solid var(--line,rgba(127,127,127,.25));border-radius:8px}
 .completion-restart{margin:10px 0;padding:10px 12px;border:1px solid var(--line,rgba(127,127,127,.25));border-radius:8px}
 .completion-validation{margin:10px 0;padding:10px 12px;border:1px solid var(--line,rgba(127,127,127,.25));border-radius:8px}

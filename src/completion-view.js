@@ -238,6 +238,51 @@ export function validationStatusView(task) {
 }
 
 /**
+ * 一次核准就依序跑完的部署流程。沒有核准過就回傳 null。
+ *
+ * 這裡只呈現後端狀態機的結果，不自己推導進度：哪一個階段在跑、哪一個失敗，
+ * 由 server/completion-pipeline.js 決定，畫面不做第二套判斷。
+ * @param {any} task
+ */
+export function pipelineView(task) {
+  const pipeline = task?.completion;
+  if (!pipeline) return null;
+  const status = text(pipeline.status);
+  return {
+    id: text(pipeline.id),
+    status,
+    running: status === 'running',
+    failed: status === 'failed',
+    finished: status === 'completed',
+    cancelled: status === 'cancelled',
+    stage: text(pipeline.stage) || null,
+    stages: list(pipeline.stages).map(item => ({
+      key: text(item.key),
+      label: text(item.label),
+      ok: item.ok === true,
+      current: item.current === true,
+      failed: item.failed === true,
+      note: text(item.note) || null,
+      mark: item.ok ? STAGE_MARKS.done : item.failed ? STAGE_MARKS.failed : item.current ? STAGE_MARKS.active : STAGE_MARKS.pending,
+      state: item.ok ? 'done' : item.failed ? 'failed' : item.current ? 'active' : 'pending',
+    })),
+    label: {
+      running: '部署流程進行中',
+      failed: '部署流程停在失敗階段',
+      completed: '部署流程已完成',
+      cancelled: '部署流程已停止',
+    }[status] || status,
+    toneClass: { running: 'queued', failed: 'failed', completed: 'completed', cancelled: 'cancelled' }[status] || 'queued',
+    failure: pipeline.failure ? { stage: text(pipeline.failure.stage), message: text(pipeline.failure.message) } : null,
+    note: text(pipeline.note) || null,
+    approvedByName: text(pipeline.approvedByName) || null,
+    approvedAt: text(pipeline.approvedAt) || null,
+    finishedAt: text(pipeline.finishedAt) || null,
+    artifactVersion: text(pipeline.artifactVersion) || null,
+  };
+}
+
+/**
  * 合併被擋住的所有原因。回傳空陣列＝後端目前的狀態允許合併。
  * 每一條都對應 server 端一個真實的守門，不是 UI 自己發明的規則。
  * @param {any} task
@@ -429,6 +474,7 @@ export function completionView(task, review = null) {
   const loaded = !!review && review.available !== false;
   // 還沒讀到 review 就不能說「可以合併」：正式分支乾不乾淨只有那支 API 知道。
   const canMerge = loaded && !merged && !blockers.length;
+  const pipeline = pipelineView(task);
 
   const state = merged ? (rolledBack ? 'rolled_back' : 'merged')
     : conflicted ? 'conflict'
@@ -483,16 +529,22 @@ export function completionView(task, review = null) {
     cleanedUp: !!(review?.cleanedUp || git.cleanedUp),
     // 合併要帶著成果版本送出，後端會比對，不符就拒絕（避免核准的是舊版成果）。
     artifactVersion: text(task.artifactVersion) || null,
+    pipeline: pipelineView(task),
     test: testComparisonView(task),
     restart: restartStatusView(task),
     validation: validationStatusView(task),
     // 驗的是合併後的正式分支，所以合併之前不提供；執行中不能重複觸發。
-    canValidate: merged && !validationStatusView(task)?.running,
+    canValidate: merged && !validationStatusView(task)?.running && !pipelineView(task)?.running,
     // 只有「合併完成、守護程式活著、目前沒有重啟在進行」時才給按鈕。
-    canRestart: !!task.selfProject && merged && task.guardianOnline !== false && !restartStatusView(task)?.active,
+    canRestart: !!task.selfProject && merged && task.guardianOnline !== false && !restartStatusView(task)?.active && !pipelineView(task)?.running,
+    // 一次核准就依序跑完；出現的時機與「可以合併」完全一致。
+    // 停在失敗階段時不再提供「核准並完成」：該做的是重試或停止，不是再開一條。
+    canApprovePipeline: canMerge && !pipeline?.running && !pipeline?.failed,
+    // 流程進行中時，單顆按鈕一律停用：兩條路徑同時對同一個任務動作只會互相打架。
     // 工作副本被清掉或已經合併之後再跑測試沒有意義；執行中也不能重複觸發。
-    canRunTest: !merged && !(review?.cleanedUp || git.cleanedUp) && !testComparisonView(task)?.running,
-    canMerge,
+    canRunTest: !merged && !(review?.cleanedUp || git.cleanedUp) && !testComparisonView(task)?.running && !pipelineView(task)?.running,
+    // 流程進行中時單獨合併會與流程互搶，一律停用。
+    canMerge: canMerge && !pipeline?.running,
     canRollback: merged && !rolledBack && !!text(task.gitMerge?.commit),
     // 一律是字串（沒有就是空字串）：撤銷按鈕的事件型別才不會變成 string|null。
     mergeCommit: text(task.gitMerge?.commit),

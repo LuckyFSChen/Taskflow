@@ -27,6 +27,12 @@ void reconcilePreviewRegistry(resolve('data/preview/registry.json'),{stop:entry=
   .catch(error=>console.error('Preview 程序對帳失敗',error.message));
 const previews=createProjectPreview();
 const runner=createRunner(store,{previews}),bridge=createBridge(store,{runner}),app=createApp(store,runner,{previews});
+// Pipeline 的計時器由這裡持有，不由 createApp 持有：app 會在測試裡被建立很多次，
+// 計時器留在那裡會在資料庫關閉後繼續跳。
+const completionTimer=setInterval(()=>{
+  try{app.locals.completionPipeline.tick();}
+  catch(error){console.error(new Date().toISOString(),'Completion pipeline tick failed',String(error?.message||error).slice(0,300));}
+},3000);
 const server=app.listen(Number(process.env.PORT||4310),process.env.HOST||'127.0.0.1',()=>console.log(`TaskFlow: http://${process.env.HOST||'127.0.0.1'}:${process.env.PORT||4310}`));
-function stop(){runner.stop();bridge.stop();void app.locals.previews.close();server.close(()=>process.exit(0));setTimeout(()=>process.exit(0),3000).unref();}
+function stop(){runner.stop();bridge.stop();clearInterval(completionTimer);app.locals.completionPipeline?.stop();void app.locals.previews.close();server.close(()=>process.exit(0));setTimeout(()=>process.exit(0),3000).unref();}
 process.on('SIGINT',stop);process.on('SIGTERM',stop);

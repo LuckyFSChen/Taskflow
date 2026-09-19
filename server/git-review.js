@@ -107,7 +107,7 @@ function mergeDecision(store, user, t, input, gitWorkspace) {
 
 // 清理只在合併成功、或使用者明確選擇刪除被拒絕的分支時執行；失敗一律照實回報，
 // 不加 --force，也不動工作目錄裡沒提交的東西。
-function applyCleanup(store, t, { gitWorkspace, deleteUnmerged }) {
+export function applyCleanup(store, t, { gitWorkspace, deleteUnmerged }) {
   try {
     const outcome = gitWorkspace.cleanup({
       repositoryPath: t.git.repositoryPath,

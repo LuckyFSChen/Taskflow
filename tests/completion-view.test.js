@@ -433,6 +433,68 @@ test('驗收執行中不能重複觸發；被服務重啟打斷時顯示已中�
   assert.equal(interrupted.stages.find(s => s.key === 'validate').state, 'blocked');
 });
 
+// --- 一次核准的部署流程 --------------------------------------------------------
+
+const pipeline = (extra = {}) => ({
+  id: 'pipe-1', status: 'running', stage: 'merge',
+  stages: [
+    { key: 'test', label: '測試比對', ok: true, current: false, failed: false },
+    { key: 'merge', label: '合併到正式分支', ok: false, current: true, failed: false },
+    { key: 'cleanup', label: '清理工作副本與分支', ok: false, current: false, failed: false },
+  ],
+  approvedByName: 'Lucky', approvedAt: '2026-09-19T05:00:00.000Z', failure: null,
+  ...extra,
+});
+
+test('沒有流程在跑時提供「一次核准」，時機與可以合併一致', () => {
+  const ready = completionView(baseTask(), baseReview());
+  assert.equal(ready.canApprovePipeline, true);
+  assert.equal(ready.pipeline, null);
+
+  // 被任何原因擋住合併時，也不該提供一次核准
+  const blocked = completionView(baseTask({ status: 'running' }), baseReview());
+  assert.equal(blocked.canApprovePipeline, false);
+});
+
+test('流程進行中時，單顆按鈕一律停用，避免兩條路徑同時動同一個任務', () => {
+  const view = completionView(baseTask({ completion: pipeline() }), baseReview());
+  assert.equal(view.pipeline.running, true);
+  assert.equal(view.canApprovePipeline, false);
+  assert.equal(view.canMerge, false);
+  assert.equal(view.canRunTest, false);
+  assert.equal(view.canValidate, false);
+});
+
+test('階段標記由後端狀態機決定，畫面不做第二套判斷', () => {
+  const view = completionView(baseTask({ completion: pipeline() }), baseReview());
+  assert.deepEqual(view.pipeline.stages.map(s => s.state), ['done', 'active', 'pending']);
+  assert.deepEqual(view.pipeline.stages.map(s => s.mark), ['✓', '→', '○']);
+  assert.equal(view.pipeline.approvedByName, 'Lucky');
+});
+
+test('停在失敗階段時改為提供重試與停止，不再提供重新核准', () => {
+  const view = completionView(baseTask({
+    completion: pipeline({
+      status: 'failed', stage: 'test',
+      stages: [{ key: 'test', label: '測試比對', ok: false, current: false, failed: true }],
+      failure: { stage: '測試比對', message: '測試比對發現 2 項新的失敗。' },
+    }),
+  }), baseReview());
+
+  assert.equal(view.pipeline.failed, true);
+  assert.equal(view.canApprovePipeline, false);
+  assert.match(view.pipeline.failure.message, /2 項新的失敗/);
+  assert.equal(view.pipeline.stages[0].state, 'failed');
+});
+
+test('流程結束或停止之後不再擋住單顆按鈕', () => {
+  for (const status of ['completed', 'cancelled']) {
+    const view = completionView(baseTask({ completion: pipeline({ status, stage: null }) }), baseReview());
+    assert.equal(view.pipeline.running, false, status);
+    assert.equal(view.canRunTest, true, status);
+  }
+});
+
 test('明講目前尚未涵蓋 Browser Validation，不把未實作畫成尚未開始', () => {
   const view = completionView(baseTask(), baseReview());
   assert.match(view.scopeNote, /尚未納入/);
