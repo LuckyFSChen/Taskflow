@@ -63,6 +63,15 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
         <p class="error-text">在「{{view.pipeline.failure.stage}}」停住：{{view.pipeline.failure.message}}</p>
         <p class="subtle">已完成的階段會保留，重試只會從停住的這一階段開始；已經合併的內容不會被還原。</p>
       </template>
+      <!-- reconcileCompletionState 的權威判定：completed 之外的任何一項阻擋都要照實列出，
+           不能只看 pipeline.status 自己覺得完成了。 -->
+      <ul v-if="view.pipeline.blockingReasons.length">
+        <li v-for="(reason,i) in view.pipeline.blockingReasons" :key="i" class="error-text">{{reason}}</li>
+      </ul>
+      <ul v-if="view.pipeline.warnings.length">
+        <li v-for="(warning,i) in view.pipeline.warnings" :key="i" class="subtle">{{warning}}</li>
+      </ul>
+      <p v-if="view.pipeline.nextAction" class="subtle">下一步：{{view.pipeline.nextAction}}</p>
       <div class="actions">
         <button v-if="view.pipeline.failed" type="button" class="primary" :disabled="busy"
                 @click="emit('retry',view.pipeline.id)">從失敗階段重試</button>

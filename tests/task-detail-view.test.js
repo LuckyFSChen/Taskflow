@@ -11,6 +11,7 @@ import {
   progressSummary,
   browserValidations,
   validationEvidence,
+  validationFailureView,
   publishState,
   technicalFacts,
   threadTechnical,
@@ -270,6 +271,37 @@ test('驗證證據依角色集中，沒有證據的角色不會列出空白區�
   assert.deepEqual(evidence[0].evidence, ['npm test：19 passed', 'npm run build：成功']);
 });
 
+// --- G2. reconcileCompletionState 的權威判定（server/completion-state.js）--------
+
+test('沒有驗證失敗紀錄時不顯示任何東西', () => {
+  assert.equal(validationFailureView(baseTask()), null);
+  assert.equal(validationFailureView(null), null);
+});
+
+test('驗證未通過：把 blockingReasons／warnings／nextAction 攤成純文字給畫面用', () => {
+  const task = baseTask({
+    validationFailure: {
+      summary: '驗收未通過',
+      evidence: ['npm test：2 failed'],
+      questions: [],
+      blockingReasons: ['測試比對發現 2 項新的失敗：tests/a.test.js、tests/b.test.js'],
+      warnings: ['沒有部署驗收（preview/runtime）結果（不適用或尚未執行）。'],
+      nextAction: '有 deterministic 證據（測試 regression、部署階段失敗、驗收未通過等）證明未成功，需要修正後重新執行失敗的檢查。',
+    },
+  });
+  const view = validationFailureView(task);
+  assert.deepEqual(view.blockingReasons, ['測試比對發現 2 項新的失敗：tests/a.test.js、tests/b.test.js']);
+  assert.deepEqual(view.warnings, ['沒有部署驗收（preview/runtime）結果（不適用或尚未執行）。']);
+  assert.match(view.nextAction, /需要修正後重新執行失敗的檢查/);
+});
+
+test('舊任務資料沒有 blockingReasons／warnings／nextAction 時回傳空陣列，不丟例外', () => {
+  const view = validationFailureView(baseTask({ validationFailure: { summary: '舊資料', evidence: [], questions: [] } }));
+  assert.deepEqual(view.blockingReasons, []);
+  assert.deepEqual(view.warnings, []);
+  assert.equal(view.nextAction, null);
+});
+
 // --- H. browser validation ---------------------------------------------------
 
 test('沒有任務要求 Browser 驗證時，進度不會憑空長出那一列', () => {
@@ -338,6 +370,7 @@ test('缺資料時不會丟例外', () => {
   assert.deepEqual(threadTechnical(null), []);
   assert.deepEqual(browserValidations({}), []);
   assert.deepEqual(validationEvidence({}), []);
+  assert.equal(validationFailureView({}), null);
   assert.deepEqual(threadEvents({}, 'x'), []);
   assert.equal(publishState(null), null);
   const empty = progressSteps({ planVersion: 1, status: 'planning' });

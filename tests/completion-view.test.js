@@ -487,6 +487,38 @@ test('停在失敗階段時改為提供重試與停止，不再提供重新核�
   assert.equal(view.pipeline.stages[0].state, 'failed');
 });
 
+// --- reconcileCompletionState 的權威判定（server/completion-state.js）附加在 pipeline 上 ---
+
+test('後端附加的 blockingReasons／warnings／evidence／nextAction 攤成純文字給畫面用', () => {
+  const view = completionView(baseTask({
+    completion: pipeline({
+      blockingReasons: ['Git 合併會產生衝突：server/app.js'],
+      warnings: ['沒有部署驗收（preview/runtime）結果（不適用或尚未執行）。'],
+      evidence: ['executor／reviewer 回報 passed=true'],
+      nextAction: '需要先解決 Git 合併衝突，衝突未解決前不得合併或視為完成。',
+    }),
+  }), baseReview());
+  assert.deepEqual(view.pipeline.blockingReasons, ['Git 合併會產生衝突：server/app.js']);
+  assert.deepEqual(view.pipeline.warnings, ['沒有部署驗收（preview/runtime）結果（不適用或尚未執行）。']);
+  assert.deepEqual(view.pipeline.evidence, ['executor／reviewer 回報 passed=true']);
+  assert.match(view.pipeline.nextAction, /需要先解決 Git 合併衝突/);
+});
+
+test('沒有阻擋原因時是空陣列，不是 undefined', () => {
+  const view = completionView(baseTask({ completion: pipeline({ status: 'completed', stage: null, blockingReasons: [], warnings: [], evidence: ['部署流程（測試比對／合併／重測／重啟／驗收／推送／清理）已全部完成。'], nextAction: '所有必要的 deterministic 檢查皆已通過或不適用，且沒有待處理事項，可視為完成。' }) }), baseReview());
+  assert.deepEqual(view.pipeline.blockingReasons, []);
+  assert.deepEqual(view.pipeline.warnings, []);
+  assert.match(view.pipeline.nextAction, /可視為完成/);
+});
+
+test('後端沒有附加這些欄位（舊資料）時回傳空陣列與 null，不丟例外', () => {
+  const view = completionView(baseTask({ completion: pipeline() }), baseReview());
+  assert.deepEqual(view.pipeline.blockingReasons, []);
+  assert.deepEqual(view.pipeline.warnings, []);
+  assert.deepEqual(view.pipeline.evidence, []);
+  assert.equal(view.pipeline.nextAction, null);
+});
+
 test('流程結束或停止之後不再擋住單顆按鈕', () => {
   for (const status of ['completed', 'cancelled']) {
     const view = completionView(baseTask({ completion: pipeline({ status, stage: null }) }), baseReview());
