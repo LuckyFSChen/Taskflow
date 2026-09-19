@@ -243,8 +243,11 @@ input,select,textarea{border-radius:var(--radius-control);border-color:#dcdce0;t
 .settings-shell{display:grid;gap:18px}
 .settings-stack{display:grid;gap:18px}
 .settings-hint{margin:0;font-size:.8125rem;color:var(--muted)}
-.segmented{position:relative;display:grid;grid-template-columns:repeat(var(--count),1fr);gap:0;padding:4px;background:#ececef;border-radius:13px;width:fit-content;max-width:100%}
-.segmented button{position:relative;z-index:1;border:0;background:none;padding:9px 20px;border-radius:10px;font-size:.875rem;font-weight:500;color:#5b5b60;white-space:nowrap;transition:color .18s var(--ease-soft)}
+/* repeat(var(--count),1fr) 不是合法的 CSS（repeat() 的次數不吃 custom property），
+   整條 grid-template-columns 會被當成無效值丟掉，分頁就散成好幾列。改用 flex：
+   每個按鈕 flex:1 1 0 等寬，滑塊寬度用 calc() 取 var()——這是合法的。 */
+.segmented{position:relative;display:flex;padding:4px;background:#ececef;border-radius:13px;width:fit-content;max-width:100%}
+.segmented button{position:relative;z-index:1;flex:1 1 0;border:0;background:none;padding:9px 20px;border-radius:10px;font-size:.875rem;font-weight:500;color:#5b5b60;white-space:nowrap;transition:color .18s var(--ease-soft)}
 .segmented button.selected{color:var(--ink);font-weight:600}
 .segmented-thumb{position:absolute;z-index:0;top:4px;bottom:4px;left:4px;width:calc((100% - 8px)/var(--count));transform:translateX(calc(var(--index)*100%));background:var(--surface);border-radius:10px;box-shadow:0 1px 3px #00000014;transition:transform .26s var(--ease-soft)}
 .surface-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-card);box-shadow:var(--shadow-card);padding:8px 24px 20px}
@@ -298,7 +301,7 @@ input,select,textarea{border-radius:var(--radius-control);border-color:#dcdce0;t
   .editor-grid{grid-template-columns:1fr}
 }
 @media(max-width:600px){
-  .segmented{width:100%;overflow-x:auto;grid-auto-flow:column}
+  .segmented{width:100%;overflow-x:auto}
   .segmented button{padding:9px 12px;font-size:.8125rem}
   .surface-card{padding:6px 18px 16px}
   .card-head{flex-wrap:wrap}

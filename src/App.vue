@@ -121,7 +121,7 @@ const statusLabel=(t:any)=>t.status==='completed'&&t.manualCompletion?'手動完
 let interval:ReturnType<typeof setInterval>,toastTimer:ReturnType<typeof setTimeout>;
 function notify(message:string){toast.value=message;clearTimeout(toastTimer);toastTimer=setTimeout(()=>toast.value='',6000);}
 async function run(fn:()=>Promise<any>){if(busy.value)return;busy.value=true;try{await fn();await store.refresh();if(selected.value)await loadTask(selected.value.id);}catch(e:any){notify(e.message);}finally{busy.value=false;}}
-async function projectRemoved(projectId:string,pendingCleanup:string[]=[]){removalCleanup.value=pendingCleanup;if(selected.value?.projectId===projectId)selected.value=null;if(newTask.projectId===projectId)newTask.projectId='__new__';memberForm.projectIds=memberForm.projectIds.filter(id=>id!==projectId);users.value=await api('/admin/users');notify(pendingCleanup.length?'專案已移除，部分磁碟檔案尚待清理':'專案及磁碟檔案已移除');}
+async function projectRemoved(projectId:string,pendingCleanup:string[]=[]){removalCleanup.value=pendingCleanup;if(selected.value?.projectId===projectId)selected.value=null;if(newTask.projectId===projectId)newTask.projectId='__new__';users.value=await api('/admin/users');notify(pendingCleanup.length?'專案已移除，部分磁碟檔案尚待清理':'專案及磁碟檔案已移除');}
 async function signIn(){loginError.value='';try{await api('/login',login);login.password='';await store.refresh();void store.loadHealth();}catch(e:any){loginError.value=e.message;}}
 async function loadTask(id:string){selected.value=await api('/tasks/'+id);}
 // 成果報告不完整的三個操作。recoverOutput 只呼叫 deterministic recovery 的 endpoint，
