@@ -134,6 +134,12 @@ test('一次核准就依序跑完，順序不會亂', t => {
     assert.equal(task.completion.results[stage].ok, true, stage);
   }
   assert.ok(f.store.events(f.taskId).some(e => e.kind === 'completion_finished'));
+
+  // reconcileCompletionState 彙整整條 pipeline 的 results，沒有任何 blockingReasons，
+  // nextAction 說明已經可以視為完成。
+  const view = completionPublic(task);
+  assert.deepEqual(view.blockingReasons, []);
+  assert.match(view.nextAction, /已通過或不適用/);
 });
 
 test('測試出現新的失敗時，整條流程在那裡停住，絕不繼續合併', t => {
@@ -154,6 +160,11 @@ test('測試出現新的失敗時，整條流程在那裡停住，絕不繼續�
   assert.match(task.completion.failure.message, /2 項新的失敗/);
   assert.equal(task.gitMerge, undefined);
   assert.equal(d.calls.includes('merge'), false);
+
+  // reconcileCompletionState 的 blockingReasons 同樣點出是測試比對發現新的失敗，
+  // 而不是只給一個籠統的「失敗」。
+  const view = completionPublic(task);
+  assert.ok(view.blockingReasons.some(reason => reason.includes('2 項新的失敗')));
 });
 
 test('基準不可用時通過但留下警告，不假裝證明了沒有 regression', t => {
@@ -239,6 +250,11 @@ test('合併會產生衝突時停下來，並指名衝突的檔案', t => {
   assert.equal(task.completion.status, 'failed');
   assert.equal(task.completion.failure.stage, 'merge');
   assert.match(task.completion.failure.message, /server\/app\.js/);
+
+  // reconcileCompletionState 把 Git 合併衝突同時列進 blockingReasons，
+  // 這是給 API／前端顯示用的統一格式，不是 pipeline 自己另一套判斷。
+  const view = completionPublic(task);
+  assert.ok(view.blockingReasons.some(reason => reason.includes('server/app.js')));
 });
 
 test('別的任務正在跑測試不是失敗，是等待，下一個 tick 再試', t => {
@@ -460,6 +476,14 @@ test('送到瀏覽器的形狀：每個階段的標籤、完成與否、目前�
   assert.equal(view.stages[0].ok, true);
   assert.equal(view.approvedByName, 'Lucky');
   assert.equal(completionPublic({}), null);
+
+  // reconcileCompletionState 彙整目前的 pipeline 狀態：合併階段還在跑，
+  // blockingReasons/warnings/evidence/nextAction 都要有可顯示的內容，
+  // 而不是只有 completion.status='running' 這個內部欄位。
+  assert.ok(Array.isArray(view.blockingReasons) && view.blockingReasons.length > 0);
+  assert.ok(Array.isArray(view.warnings));
+  assert.ok(Array.isArray(view.evidence));
+  assert.equal(view.nextAction, '等待合併到正式分支完成。');
 });
 
 // 這條是回歸測試，不是假設性的：計時器原本放在 createApp() 裡，而那個函式在測試中

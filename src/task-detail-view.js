@@ -360,6 +360,24 @@ export function validationEvidence(task) {
 }
 
 /**
+ * 最近一次驗證未通過的權威判定結果（reconcileCompletionState 的輸出）。
+ * task.validationFailure 是後端 review 階段呼叫 reconcileCompletionState 之後
+ * 寫回的結果：blockingReasons／warnings／nextAction 只有純文字說明，沒有伺服器磁碟路徑。
+ * 沒有驗證失敗紀錄就回傳 null，不假裝有內容。
+ * @param {any} task
+ * @returns {{blockingReasons:string[],warnings:string[],nextAction:string|null}|null}
+ */
+export function validationFailureView(task) {
+  const failure = task?.validationFailure;
+  if (!failure) return null;
+  return {
+    blockingReasons: list(failure.blockingReasons).map(text).filter(Boolean),
+    warnings: list(failure.warnings).map(text).filter(Boolean),
+    nextAction: text(failure.nextAction) || null,
+  };
+}
+
+/**
  * 發布核准區塊要不要出現、現在是哪一種狀態。
  * 沒有成果版本就沒有東西可以核准，回傳 null。
  * @param {any} task

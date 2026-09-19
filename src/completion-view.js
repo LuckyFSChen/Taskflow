@@ -331,6 +331,12 @@ export function pipelineView(task) {
     approvedAt: text(pipeline.approvedAt) || null,
     finishedAt: text(pipeline.finishedAt) || null,
     artifactVersion: text(pipeline.artifactVersion) || null,
+    // reconcileCompletionState 的權威判定（server/completion-state.js）：只有純文字說明，
+    // 沒有伺服器磁碟路徑。畫面用它取代「自己再猜一次為什麼卡住」。
+    blockingReasons: list(pipeline.blockingReasons).map(text).filter(Boolean),
+    warnings: list(pipeline.warnings).map(text).filter(Boolean),
+    evidence: list(pipeline.evidence).map(text).filter(Boolean),
+    nextAction: text(pipeline.nextAction) || null,
   };
 }
 

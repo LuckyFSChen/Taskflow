@@ -8,7 +8,7 @@ import {healthAlert} from './system-health-view.js';
 import {AI_MODES,AUTO,CUSTOM,autoModeSummary,resolveEngines,taskEngineDefaults} from './task-defaults.js';
 // Task Detail 的資訊分層集中在 src/task-detail-view.js：分頁、待處理清單與
 // 進度推導都在那裡，Template 只負責畫出來。沒有任何既有能力被移除。
-import {DETAIL_TABS,DEFAULT_TAB,pendingActions,pendingBanner,progressSteps,progressSummary,browserValidations,validationEvidence,publishState,technicalFacts,threadTechnical,threadEvents} from './task-detail-view.js';
+import {DETAIL_TABS,DEFAULT_TAB,pendingActions,pendingBanner,progressSteps,progressSummary,browserValidations,validationEvidence,validationFailureView,publishState,technicalFacts,threadTechnical,threadEvents} from './task-detail-view.js';
 // 任務佇列：方案群組化。分組依據只有 task.planGroupId，聚合邏輯全部集中在
 // src/plan-group.js（與 attention.js 同一個模式），Template 只負責畫出來。
 import {buildPlanGroups} from './plan-group.js';
@@ -54,6 +54,7 @@ const detailBanner=computed(()=>pendingBanner(selected.value));
 const detailProgress=computed(()=>progressSteps(selected.value));
 const detailProgressSummary=computed(()=>progressSummary(selected.value));
 const detailEvidence=computed(()=>validationEvidence(selected.value));
+const detailValidationFailure=computed(()=>validationFailureView(selected.value));
 const detailBrowser=computed(()=>browserValidations(selected.value));
 const detailPublish=computed(()=>publishState(selected.value));
 const detailFacts=computed(()=>technicalFacts(selected.value));
@@ -364,7 +365,15 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
         <ExecutionApproval v-if="selected.executionApproval" :request="selected.executionApproval" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/execution/decision`,{requestId:selected.executionApproval.id,decision}))"/>
         <!-- 部署與驗收：核准合併、清理與撤銷都在這裡完成，不需要再開 PowerShell。 -->
         <Completion :task="selected" :review="gitReview" :busy="busy" :loading="reviewLoading" @refresh="loadReview" @test="completionTest" @test-main="completionTestMain" @push="completionPush" @restart="completionRestart" @validate="completionValidate" @approve="completionApprove" @retry="completionRetry" @cancel-pipeline="completionCancel" @merge="completionMerge" @rollback="completionRollback"/>
-        <section v-if="selected.validationFailure" class="questions"><h3>最近未通過的驗證：第 {{selected.round}} 輪修正</h3><p class="prewrap">{{selected.validationFailure.summary}}</p><ul><li v-for="(e,i) in selected.validationFailure.evidence" :key="i">{{e}}</li></ul><p v-if="!selected.validationFailure.evidence.length">驗證缺少可確認的證據。</p><p v-for="(q,i) in selected.validationFailure.questions" :key="i">待確認：{{q}}</p><p v-if="selected.status==='repair_planning'">正在唯讀分析原因與解法，尚未執行修正。</p><template v-if="selected.repairPlan"><h3>問題原因與修正方案</h3><p class="prewrap">{{selected.repairPlan.summary}}</p><div v-for="(step,i) in selected.repairPlan.steps" :key="i" class="plan-step"><span class="step-number">{{Number(i)+1}}</span><div><strong>{{step.title}}</strong><p>{{step.instructions}}</p></div></div><h3>重新驗證標準</h3><ul><li v-for="(item,i) in selected.repairPlan.acceptance" :key="i">{{item}}</li></ul><p v-for="(q,i) in selected.repairPlan.questions" :key="i">待確認：{{q}}</p><template v-if="selected.status==='awaiting_repair_approval'&&!selected.validationSkipRequest"><button class="primary full" :disabled="busy||selected.repairPlan.questions.length>0" @click="run(()=>api(`/tasks/${selected.id}/repair/approve`,{proposalId:selected.repairPlan.id}))">核准此修正方案並執行</button><form @submit.prevent="run(async()=>{await api(`/tasks/${selected.id}/repair/revise`,{proposalId:selected.repairPlan.id,answer});answer='';})"><label>補充或修改修正方案<textarea v-model="answer" rows="3" minlength="2" maxlength="8000" required/></label><button class="secondary" :disabled="busy">重新提出方案，待我審核</button></form></template></template></section>
+        <section v-if="selected.validationFailure" class="questions"><h3>最近未通過的驗證：第 {{selected.round}} 輪修正</h3><p class="prewrap">{{selected.validationFailure.summary}}</p><ul><li v-for="(e,i) in selected.validationFailure.evidence" :key="i">{{e}}</li></ul><p v-if="!selected.validationFailure.evidence.length">驗證缺少可確認的證據。</p><p v-for="(q,i) in selected.validationFailure.questions" :key="i">待確認：{{q}}</p>
+        <!-- reconcileCompletionState 的權威判定（server/completion-state.js）：AI 自己回報的
+             passed/evidence 只是 claim，這裡列出的才是實際擋住完成的 deterministic 原因。 -->
+        <template v-if="detailValidationFailure">
+          <ul v-if="detailValidationFailure.blockingReasons.length"><li v-for="(reason,i) in detailValidationFailure.blockingReasons" :key="i" class="error-text">{{reason}}</li></ul>
+          <ul v-if="detailValidationFailure.warnings.length"><li v-for="(warning,i) in detailValidationFailure.warnings" :key="i" class="subtle">{{warning}}</li></ul>
+          <p v-if="detailValidationFailure.nextAction" class="subtle">下一步：{{detailValidationFailure.nextAction}}</p>
+        </template>
+        <p v-if="selected.status==='repair_planning'">正在唯讀分析原因與解法，尚未執行修正。</p><template v-if="selected.repairPlan"><h3>問題原因與修正方案</h3><p class="prewrap">{{selected.repairPlan.summary}}</p><div v-for="(step,i) in selected.repairPlan.steps" :key="i" class="plan-step"><span class="step-number">{{Number(i)+1}}</span><div><strong>{{step.title}}</strong><p>{{step.instructions}}</p></div></div><h3>重新驗證標準</h3><ul><li v-for="(item,i) in selected.repairPlan.acceptance" :key="i">{{item}}</li></ul><p v-for="(q,i) in selected.repairPlan.questions" :key="i">待確認：{{q}}</p><template v-if="selected.status==='awaiting_repair_approval'&&!selected.validationSkipRequest"><button class="primary full" :disabled="busy||selected.repairPlan.questions.length>0" @click="run(()=>api(`/tasks/${selected.id}/repair/approve`,{proposalId:selected.repairPlan.id}))">核准此修正方案並執行</button><form @submit.prevent="run(async()=>{await api(`/tasks/${selected.id}/repair/revise`,{proposalId:selected.repairPlan.id,answer});answer='';})"><label>補充或修改修正方案<textarea v-model="answer" rows="3" minlength="2" maxlength="8000" required/></label><button class="secondary" :disabled="busy">重新提出方案，待我審核</button></form></template></template></section>
         <div v-if="selected.questions.length&&!selected.executionApproval&&!selected.validationSkipRequest&&!selected.manualAction" class="questions"><h3>需要你確認</h3><p v-for="(q,i) in selected.questions" :key="i">{{Number(i)+1}}. {{q}}</p></div>
 
         <section class="detail-block"><h3>任務狀態</h3>

@@ -14,6 +14,8 @@
 //   5. 「還不能做」與「做失敗了」是兩件事。前者（別的任務正在跑測試、守護程式還沒接手）
 //      是等待，下一個 tick 再試；只有後者才讓 pipeline 停下來等人。
 import {id, now} from './db.js';
+import {gitIssuePending} from './git-issue.js';
+import {reconcileCompletionState} from './completion-state.js';
 
 export const PIPELINE_STAGES = ['test', 'merge', 'test_main', 'restart', 'validate', 'push', 'cleanup'];
 
@@ -260,6 +262,42 @@ export function tickCompletions(store, deps) {
   return advanced;
 }
 
+// advanceCompletion 本身的階段推進邏輯（HANDLERS、nextStage、completion.status 的
+// running/completed/failed）不重寫：這裡只是把 pipeline 已經算出的 results/failure，
+// 連同進這條 pipeline 前就已經確認過的 Git／測試比對／部署驗收證據，一起交給
+// reconcileCompletionState 重新核算，取得統一的 blockingReasons/warnings/evidence/
+// nextAction，附加在 completionPublic() 的輸出上——不影響 completion.status 本身，
+// 那仍是既有合併前置條件（git-review.js mergeDecision）與階段推進機制依賴的欄位。
+//
+// executorResult 這一項 claim，沿用「核准進入這條 pipeline 前 task.status 必須已經
+// 是 'completed'」這個既有前置條件（見 app.js completion/approve、git-review.js
+// mergeDecision）：那正是 review 階段呼叫 reconcileCompletionState 判定通過之後
+// 留下的結論，這裡不是重新採信一次 AI 的宣稱，只是把已經成立的前提交代清楚。
+function pipelineReconcileContext(task) {
+  const completion = task.completion;
+  return {
+    executorResult: {
+      passed: task.status === 'completed',
+      questions: [],
+      evidence: task.status === 'completed' ? ['審核已通過（task.status=completed）才能核准進入部署流程。'] : [],
+      summary: null,
+    },
+    git: { headCommit: task.git?.headCommit || null, gitMerge: task.gitMerge || null, gitConflict: task.gitConflict || null },
+    tests: { completionTest: task.completionTest || null, completionMainTest: task.completionMainTest || null },
+    deployment: completion ? { status: completion.status, stage: completion.stage, results: completion.results, failure: completion.failure } : null,
+    runtime: { completionValidation: task.completionValidation || null },
+    // Browser Validation 屬於 review 階段的證據（result.browserValidation），已經在
+    // task.status 變成 'completed' 之前核算過；部署管線本身不重跑瀏覽器驗證，這裡不重複判定。
+    browserValidation: null,
+    pendingActions: {
+      gitIssue: gitIssuePending(task),
+      userActionRequired: task.userActionRequired?.status === 'pending',
+      outputIssue: !!task.outputIssue,
+      questions: !!(task.questions && task.questions.length),
+    },
+  };
+}
+
 /**
  * 服務重新啟動之後：pipeline 的狀態存在任務資料裡，所以它會自己接著跑。
  * 唯一要處理的是「重啟階段以外的地方被打斷」——那些子系統自己會標成 interrupted，
@@ -268,6 +306,7 @@ export function tickCompletions(store, deps) {
 export function completionPublic(task) {
   const completion = task?.completion;
   if (!completion) return null;
+  const reconciled = reconcileCompletionState(pipelineReconcileContext(task));
   return {
     id: completion.id,
     status: completion.status,
@@ -287,6 +326,10 @@ export function completionPublic(task) {
     failure: completion.failure,
     note: completion.notes?.at(-1) || null,
     artifactVersion: completion.artifactVersion,
+    blockingReasons: reconciled.blockingReasons,
+    warnings: reconciled.warnings,
+    evidence: reconciled.evidence,
+    nextAction: reconciled.nextAction,
   };
 }
 
