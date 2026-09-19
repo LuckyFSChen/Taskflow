@@ -138,6 +138,33 @@ export function dirtyFingerprint(dirty) {
   return normalized ? createHash('sha256').update(normalized).digest('hex') : null;
 }
 
+// 可重用的 Git repository state inspector：專供 merge 流程判斷「是否真的乾淨、真的合併完成」，
+// 不依賴任何 git command 的 exit code 或 AI 回報的文字。四個判斷全部直接讀 Git 本身的狀態：
+//   1. git status --porcelain：一般 dirty 檔案（沿用 inspectRepository 的讀法）。
+//   2. git diff --name-only --diff-filter=U：目前有哪些檔案處於「未解決衝突」狀態。
+//   3. git rev-parse -q --verify MERGE_HEAD：repository 是否正處於一個進行中的 merge。
+//      衝突解決後、commit 之前，unresolvedFiles 會清空但 MERGE_HEAD 仍在，這正是
+//      「衝突已解決但尚未 commit」的訊號，必須和一般 dirty_working_tree 分開判斷。
+//   4. 目前 branch 與 HEAD：沿用 inspectRepository 既有的 firstLine 讀法，供呼叫端核對
+//      HEAD 是否真的包含任務分支，不是只看 merge command 有沒有回報成功。
+export function inspectMergeState({ repositoryPath, git }) {
+  const state = inspectRepository(repositoryPath, { git });
+  if (!state.isRepository) {
+    throw new GitSafetyError('not_a_repository', '專案已不是 Git repository，無法檢查合併狀態。', { repositoryPath });
+  }
+  const unresolvedFiles = git(repositoryPath, ['diff', '--name-only', '--diff-filter=U'], { allowFailure: true })
+    .stdout.split('\n').map(line => line.trim()).filter(Boolean);
+  const mergeInProgress = git(repositoryPath, ['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { allowFailure: true }).ok;
+  return {
+    branch: state.branch,
+    head: state.head,
+    mergeInProgress,
+    unresolvedFiles,
+    dirty: state.dirty,
+    clean: !state.dirty.length && !mergeInProgress && !unresolvedFiles.length,
+  };
+}
+
 export function inspectRepository(projectPath, { git }) {
   if (!existsSync(projectPath)) throw new GitSafetyError('project_missing', `專案資料夾不存在：${projectPath}`);
   const inside = git(projectPath, ['rev-parse', '--is-inside-work-tree'], { allowFailure: true });
