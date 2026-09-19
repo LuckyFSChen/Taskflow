@@ -181,6 +181,12 @@ function changedPaths(git, cwd) {
   return [...new Set(paths.filter(Boolean))];
 }
 
+// 供 Output Recovery 使用：讀取工作目錄「目前」尚未提交的真實變更檔案清單，作為
+// 還原 artifacts 欄位時可信的 Git 證據來源，而不是重新推導一套判斷邏輯。
+export function currentChangedFiles({ workingDirectory, git }) {
+  return changedPaths(git, workingDirectory);
+}
+
 // 用 pathspec 檔案而不是命令列參數：專案可能有上萬個檔案，Windows 的命令列長度會爆掉。
 function addPaths(git, cwd, paths) {
   const listFile = join(tmpdir(), `taskflow-add-${process.pid}-${Date.now()}.paths`);
@@ -594,5 +600,6 @@ export function createGitWorkspace({ git = createGitRunner() } = {}) {
     revert: (options) => revertMergeCommit({ ...options, git }),
     remoteStatus: (options) => remoteStatus({ ...options, git }),
     push: (options) => pushBaseBranch({ ...options, git }),
+    currentChangedFiles: (options) => currentChangedFiles({ ...options, git }),
   };
 }
