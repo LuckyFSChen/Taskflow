@@ -100,6 +100,26 @@ test('Case 2b：明確的空陣列被視為原始輸出的事實，不會再從�
   assert.deepEqual(recovery.result.evidence,[]);
 });
 
+// --- Case 2c：缺 artifacts 時改由 Git 證據重建 ------------------------------------------
+test('Case 2c：原始輸出完全沒提到任何檔案，但有 Git 證據時改由 Git 實際變更的檔案清單重建 artifacts',()=>{
+  const recovery=deterministicResultRecovery({summary:'已完成本次工作。npm run build 通過。',evidence:['npm run build 通過']},{gitFiles:['server/app.js','src/App.vue']});
+  assert.equal(recovery.ok,true);
+  assert.deepEqual(recovery.result.artifacts,['server/app.js','src/App.vue']);
+  assert.ok(recovery.notes.some(n=>n.includes('Git 實際變更')),'notes 必須說明這是改由 Git 證據重建，區分於文字擷取');
+});
+
+test('Case 2d：原始輸出明確給空陣列 artifacts 時，Git 證據不得覆蓋這個既有陳述',()=>{
+  const recovery=deterministicResultRecovery({summary:'修改 src/App.vue。npm run build 通過。',questions:[],artifacts:[],evidence:[],passed:false},{gitFiles:['server/other.js']});
+  assert.deepEqual(recovery.result.artifacts,[],'明確的空陣列是原始輸出自己的陳述，不得被 Git 證據覆蓋');
+});
+
+test('Case 2e：沒有 Git 證據時，缺少 artifacts 仍退回既有的文字擷取規則',()=>{
+  const recovery=deterministicResultRecovery({summary:'修改 src/App.vue。npm run build 通過。',evidence:['npm run build 通過']},{gitFiles:[]});
+  assert.deepEqual(recovery.result.artifacts,['src/App.vue']);
+  const withoutContext=deterministicResultRecovery({summary:'修改 src/App.vue。npm run build 通過。',evidence:['npm run build 通過']});
+  assert.deepEqual(withoutContext.result.artifacts,['src/App.vue'],'不帶 context 參數時行為必須與修改前一致');
+});
+
 // --- Case 3：純文字輸出可還原 artifact／evidence／passed -------------------------------
 test('Case 3：純文字輸出能還原 artifact 與 evidence，passed 仍為 false',()=>{
   const recovery=deterministicResultRecovery('修改 src/App.vue。npm run build 通過。');
@@ -226,6 +246,41 @@ test('Case 6：格式失敗後由 Recovery 接手，Executor 只被呼叫一次�
   assert.equal(executed.result.passed,false,'還原的結果一律 passed=false');
   assert.deepEqual(executed.result.evidence,['npm run build 通過']);
   assert.ok(s.events(task.id).some(e=>e.kind==='output_recovered'),'還原必須留下可追查的事件');
+  await runner.tick();
+  assert.equal(executions,1,'後續 tick 也不得重跑已經還原的步驟');
+  assert.equal(plans,1);
+});
+
+// --- Case 6b：摘要沒提到檔案，但 Git 已記錄真實變更，Recovery 改以 Git 證據重建 ----------
+test('Case 6b：Executor 摘要完全沒提到檔案路徑，但真實 Git worktree 已記錄本輪變更的檔案，Recovery 能以此重建 artifacts，且 Executor 不被重跑',async t=>{
+  const dir=fixture(t,false),s=createStore(join(dir,'db.sqlite'));t.after(()=>{s.close();rmSync(dir,{recursive:true,force:true});});
+  const u=s.addUser('Owner','owner','test-password'),pid=id(),source=join(dir,'source');mkdirSync(source);
+  s.db.prepare('INSERT INTO projects VALUES (?,?,?,?)').run(pid,'demo','Demo',source);
+  s.db.prepare('INSERT INTO memberships VALUES (?,?)').run(u.id,pid);
+  let plans=0,executions=0;
+  // 沒有注入假的 gitWorkspace：這裡刻意用預設的真實 createGitWorkspace()，讓 source 被
+  // 自動初始化成真正的 git repository，任務在真正的 worktree 內執行，才能驗證
+  // runner.js 讀到的是「這一輪工作目錄實際變更」而不是憑空捏造的清單。
+  const runner=createRunner(s,{recover:false,dataDir:join(dir,'runtime'),adapter:async o=>{
+    if(o.readOnly){plans++;return {result:{...plan,steps:[{title:'建立文件',role:'作者',instructions:'寫入文件'}]}};}
+    executions++;
+    writeFileSync(join(o.cwd,'result.md'),'Delivered');
+    // summary／evidence 刻意不含任何檔案路徑，且 artifacts 明確為 null（不是遺漏欄位，
+    // 是「非法值」）：既有的三次無損修復都救不回來，必須落到 Result Recovery。
+    return {result:{summary:'已完成本次工作，npm run build 通過。',artifacts:null,evidence:['npm run build 通過']}};
+  }});
+  t.after(()=>runner.stop());s.setSetting('runnerEnabled',true);
+  const task=createTask(s,u,{title:'文件工作',description:'完成文件並驗證',projectId:pid,type:'research'});
+  await runner.tick();approveTask(s,u,task.id,1);await runner.tick();
+  const after=s.task(task.id);
+  assert.equal(after.git?.mode,'worktree','此案例需要真實 git worktree 才能驗證 Git 證據路徑');
+  assert.equal(executions,1,'Recovery 絕不能重新呼叫 Executor');
+  assert.equal(after.outputIssue,undefined,'能以 Git 證據還原時不應留下 Output Issue');
+  const executed=s.threads(task.id).find(th=>th.phase==='execute');
+  assert.equal(executed.status,'completed');
+  assert.deepEqual(executed.result.artifacts,['result.md'],'摘要沒提到任何檔案，改由本輪 Git 實際變更的檔案清單重建');
+  assert.equal(executed.result.passed,false,'還原的結果一律 passed=false');
+  assert.deepEqual(executed.result.evidence,['npm run build 通過']);
   await runner.tick();
   assert.equal(executions,1,'後續 tick 也不得重跑已經還原的步驟');
   assert.equal(plans,1);
