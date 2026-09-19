@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { createStore, id } from '../server/db.js';
 import { createTask, approveTask } from '../server/domain.js';
 import { createRunner } from '../server/runner.js';
-import { taskGitReview, decideGitReview, rollbackTaskMerge } from '../server/git-review.js';
+import { taskGitReview, decideGitReview, rollbackTaskMerge, closeTask } from '../server/git-review.js';
 import { legacyWorkspaceStatus, migrateLegacyWorkspace } from '../server/git-migration.js';
 
 const plan = { summary: '建立文件', acceptance: ['有文件'], questions: [], steps: [{ title: '撰寫文件', role: '作者', instructions: '完成文件' }] };
@@ -62,7 +62,11 @@ test('審核資訊：分支、commit、各階段驗收結果與正式分支狀�
   assert.equal(review.merge, null);
 });
 
-test('核准並 Merge：--no-ff 合併後預設清理分支與工作目錄', async t => {
+// 行為調整說明：合併不再「順便」清理 worktree／分支。這裡原本斷言合併後預設會
+// 立刻清乾淨，現在整條生命週期把「開發完成」（completed）與「任務正式結束」（closed）
+// 拆開了：合併只證明成果進了正式分支，worktree／分支要留到使用者按下「關閉任務」
+// （closeTask）才會消失。這個測試改成驗證新的分工，並沿用同一段流程往下測 closeTask。
+test('核准並 Merge：--no-ff 合併後進入 ready_to_close，worktree 與分支留到 Close 才清理', async t => {
   const f = await completedTask(t);
   const merged = decideGitReview(f.store, f.owner, f.task.id, { decision: 'merge', artifactVersion: f.task.artifactVersion });
 
@@ -73,30 +77,160 @@ test('核准並 Merge：--no-ff 合併後預設清理分支與工作目錄', asy
   assert.equal(run(f.source, 'log', '-1', '--format=%P').split(' ').length, 2);
   assert.match(run(f.source, 'log', '-1', '--format=%b'), /成果版本/);
 
-  // 預設清理：worktree 移除、分支刪除，任務不再指向已不存在的目錄。
-  assert.equal(merged.workspace, null);
-  assert.equal(merged.git.cleanedUp, true);
-  assert.equal(merged.git.branchDeleted, true);
-  assert.equal(existsSync(f.task.workspace), false);
-  assert.equal(run(f.source, 'branch', '--list', f.task.git.workingBranch), '');
+  // 合併驗證通過後直接進入 ready_to_close，不再停在 completed，但也還不是 closed。
+  assert.equal(merged.status, 'ready_to_close');
+  assert.ok(merged.readyToCloseAt);
+  assert.equal(merged.workspace, f.task.workspace, 'worktree 要留到 Close 才移除');
+  assert.ok(existsSync(f.task.workspace));
+  assert.ok(run(f.source, 'branch', '--list', f.task.git.workingBranch), '分支要留到 Close 才刪除');
   assert.ok(f.store.events(f.task.id).some(e => e.kind === 'git_merged'));
 
-  // 清理後的審核畫面仍然看得到合併結果，不會壞掉。
   const review = taskGitReview(f.store, f.owner, f.task.id);
   assert.equal(review.status, 'merged');
-  assert.equal(review.cleanedUp, true);
+  assert.equal(review.cleanedUp, false);
+  assert.equal(review.merged, true);
   assert.equal(review.merge.commit, merged.gitMerge.commit);
+  assert.equal(review.commits.length, 1, 'worktree 還在，仍照原本方式讀 commit');
 
   assert.throws(() => decideGitReview(f.store, f.owner, f.task.id, { decision: 'merge', artifactVersion: f.task.artifactVersion }), /已經合併過/);
+
+  const closed = await closeTask(f.store, f.owner, f.task.id, {}, {});
+  assert.equal(closed.status, 'closed');
+  assert.equal(closed.closedBy, f.owner.id);
+  assert.ok(closed.closedAt);
+  assert.equal(closed.workspace, null);
+  assert.equal(closed.git.cleanedUp, true);
+  assert.equal(closed.git.branchDeleted, true);
+  assert.equal(existsSync(f.task.workspace), false);
+  assert.equal(run(f.source, 'branch', '--list', f.task.git.workingBranch), '');
+  assert.ok(f.store.events(f.task.id).some(e => e.kind === 'task_closed'));
+
+  // 清理後的審核畫面仍然看得到合併結果與變更清單，不會因為 worktree 消失就壞掉或變成空的。
+  const afterClose = taskGitReview(f.store, f.owner, f.task.id);
+  assert.equal(afterClose.cleanedUp, true);
+  assert.equal(afterClose.commits.length, 1, 'worktree 清理後改用 baseCommit..gitMerge.commit 讀，不應該變成空清單');
 });
 
-test('cleanup:false 時保留分支與工作目錄', async t => {
+// cleanup 這個輸入參數過去會讓合併「順便」立刻清理；行為調整後合併本身不再清理，
+// 這個參數不再有作用，這裡驗證即使明確傳 cleanup:false 也一樣（避免有人以為還能靠它做別的事）。
+test('merge 的 cleanup 參數不再影響清理時機：一律留給 Close', async t => {
   const f = await completedTask(t);
   const merged = decideGitReview(f.store, f.owner, f.task.id, { decision: 'merge', artifactVersion: f.task.artifactVersion, cleanup: false });
 
+  assert.equal(merged.status, 'ready_to_close');
   assert.equal(merged.workspace, f.task.workspace);
   assert.ok(existsSync(f.task.workspace));
   assert.ok(run(f.source, 'branch', '--list', f.task.git.workingBranch));
+});
+
+test('completed 不能直接呼叫 close：必須先合併驗證通過', async t => {
+  const f = await completedTask(t);
+  await assert.rejects(closeTask(f.store, f.owner, f.task.id, {}, {}), /尚未合併至正式分支/);
+  assert.equal(f.store.task(f.task.id).status, 'completed');
+
+  const other = await completedTask(t);
+  const cancelled = other.store.task(other.task.id);
+  cancelled.status = 'cancelled';
+  other.store.saveTask(cancelled);
+  await assert.rejects(closeTask(other.store, other.owner, other.task.id, {}, {}), /還不能關閉/);
+});
+
+test('合併會產生衝突時擋下合併，task 維持 completed 並列出衝突檔案', async t => {
+  const f = await completedTask(t, { file: 'README.md', content: '# 任務的版本\n' });
+  writeFileSync(join(f.source, 'README.md'), '# 使用者的版本\n');
+  run(f.source, '-c', 'user.email=dev@example.test', '-c', 'user.name=Dev', 'commit', '-am', 'user edit');
+
+  const blocked = decideGitReview(f.store, f.owner, f.task.id, { decision: 'merge', artifactVersion: f.task.artifactVersion });
+  assert.equal(blocked.status, 'completed');
+  assert.deepEqual(blocked.gitConflict.files, ['README.md']);
+
+  const review = taskGitReview(f.store, f.owner, f.task.id);
+  assert.equal(review.hasConflict, true);
+  assert.equal(review.status, 'conflict');
+});
+
+test('main 在任務期間前進：Git Delivery 即時反映，不沿用舊的 mergeability', async t => {
+  const f = await completedTask(t);
+  writeFileSync(join(f.source, 'unrelated.md'), '不影響合併的其他變更\n');
+  run(f.source, 'add', 'unrelated.md');
+  run(f.source, '-c', 'user.email=dev@example.test', '-c', 'user.name=Dev', 'commit', '-m', 'main 自己往前走');
+
+  const review = taskGitReview(f.store, f.owner, f.task.id);
+  assert.equal(review.mainAdvanced, true);
+  assert.equal(review.mergeable, true, 'main 前進但沒有衝突時仍然可以合併');
+
+  const merged = decideGitReview(f.store, f.owner, f.task.id, { decision: 'merge', artifactVersion: f.task.artifactVersion });
+  assert.equal(merged.status, 'ready_to_close');
+});
+
+test('手動在外部完成 git merge：重新讀取會偵測到，close 不需要再合併一次', async t => {
+  const f = await completedTask(t);
+  // 使用者自己在終端機做完 merge，TaskFlow 完全不知情（沒有 t.gitMerge）。
+  run(f.source, 'merge', '--no-ff', '--no-edit', f.task.git.workingBranch);
+  assert.equal(f.store.task(f.task.id).status, 'completed');
+  assert.equal(f.store.task(f.task.id).gitMerge, undefined);
+
+  const review = taskGitReview(f.store, f.owner, f.task.id);
+  assert.equal(review.externallyMerged, true);
+  assert.equal(review.merged, false);
+
+  const closed = await closeTask(f.store, f.owner, f.task.id, {}, {});
+  assert.equal(closed.status, 'closed');
+  assert.equal(closed.gitMerge.external, true, '即使是外部合併，也要留下 merge metadata');
+});
+
+test('worktree 有未提交變更時 close 會被擋下，不會強制刪除', async t => {
+  const f = await completedTask(t);
+  decideGitReview(f.store, f.owner, f.task.id, { decision: 'merge', artifactVersion: f.task.artifactVersion });
+  writeFileSync(join(f.task.workspace, 'unstaged.md'), '還沒 commit 的東西\n');
+
+  const result = await closeTask(f.store, f.owner, f.task.id, {}, {});
+  assert.match(result.cleanupWarning, /工作副本仍有未提交變更/);
+  assert.equal(f.store.task(f.task.id).status, 'ready_to_close', '清不掉就不能變成 closed');
+  assert.ok(existsSync(f.task.workspace), '不得強制刪除');
+});
+
+test('已合併但尚未清理的任務維持 ready_to_close，close 時才真正清理', async t => {
+  const f = await completedTask(t);
+  const merged = decideGitReview(f.store, f.owner, f.task.id, { decision: 'merge', artifactVersion: f.task.artifactVersion });
+  assert.equal(merged.status, 'ready_to_close');
+  assert.ok(existsSync(f.task.workspace));
+
+  const closed = await closeTask(f.store, f.owner, f.task.id, {}, {});
+  assert.equal(closed.status, 'closed');
+  assert.equal(existsSync(f.task.workspace), false);
+});
+
+test('closed 任務保留完整歷史：原始需求、commits、merge metadata 仍可查詢', async t => {
+  const f = await completedTask(t);
+  decideGitReview(f.store, f.owner, f.task.id, { decision: 'merge', artifactVersion: f.task.artifactVersion });
+  const closed = await closeTask(f.store, f.owner, f.task.id, {}, {});
+
+  assert.equal(closed.title, 'Document task');
+  assert.equal(closed.description, 'Create a document and validate it.');
+  assert.ok(closed.plan);
+  assert.ok(closed.gitMerge);
+  const review = taskGitReview(f.store, f.owner, f.task.id);
+  assert.equal(review.commits.length, 1);
+});
+
+// 相容舊資料（計畫書第三十一章）：這次改造上線之前就合併過的任務，status 從沒被
+// 推進過，一直停在 completed，而且照舊行為早就在合併當下清掉了 worktree 與分支。
+test('相容舊任務：合併發生在這次改造之前，close 時重新驗證後直接視為 ready_to_close', async t => {
+  const f = await completedTask(t);
+  const merged = decideGitReview(f.store, f.owner, f.task.id, { decision: 'merge', artifactVersion: f.task.artifactVersion });
+  // 模擬舊行為：合併後 status 沒被推進，且立刻清理過 worktree 與分支。
+  const legacy = f.store.task(f.task.id);
+  legacy.status = 'completed';
+  legacy.readyToCloseAt = null;
+  f.store.saveTask(legacy);
+  run(f.source, 'worktree', 'prune');
+  assert.equal(f.store.task(f.task.id).status, 'completed');
+  assert.ok(f.store.task(f.task.id).gitMerge, '舊資料仍然留著 merge metadata');
+
+  const closed = await closeTask(f.store, f.owner, f.task.id, {}, {});
+  assert.equal(closed.status, 'closed');
+  assert.equal(closed.gitMerge.commit, merged.gitMerge.commit, '沿用舊的 merge metadata，不會重新造一份');
 });
 
 test('只有真的通過驗證、且成果版本相符才能合併', async t => {

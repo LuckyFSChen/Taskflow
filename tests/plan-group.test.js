@@ -52,6 +52,10 @@ test('任務狀態分類：失敗與「需要你處理」是兩個互斥的數�
   assert.equal(taskQueueState(task({status:'completed',outputIssue:{id:'o1'}})),'completed');
   assert.equal(taskQueueState(task({status:'paused'})),'other');
   assert.equal(taskQueueState(null),'other');
+  // 生命週期改造新增的兩個狀態：completed 之後還有 ready_to_close、closed 兩段，
+  // 都要各自獨立分類，不能被併回 completed。
+  assert.equal(taskQueueState(task({status:'ready_to_close'})),'ready_to_close');
+  assert.equal(taskQueueState(task({status:'closed'})),'closed');
 });
 
 test('群組狀態優先序：4 completed + 1 running + 1 待核准 → 顯示「需要你處理」',()=>{
@@ -71,13 +75,14 @@ test('群組狀態優先序：4 completed + 1 running + 1 待核准 → 顯示�
   assert.equal(summary.stateLabel,'需要你處理');
 });
 
-test('群組狀態優先序：Needs Attention > Failed > Running > Queued > Completed',()=>{
+test('群組狀態優先序：Needs Attention > Failed > Running > Queued > Completed > Ready to Close',()=>{
   const sample={
     attention:task({status:'awaiting_approval',plan:{summary:'計畫'}}),
     failed:task({status:'failed',error:'中斷'}),
     running:task({status:'running'}),
     queued:task({status:'queued'}),
     completed:task({status:'completed'}),
+    ready_to_close:task({status:'ready_to_close'}),
   };
   // 由高到低逐一拿掉最高優先的那一個，剩下的就應該晉升為群組狀態。
   for(let i=0;i<GROUP_STATE_PRIORITY.length;i+=1){
@@ -86,6 +91,8 @@ test('群組狀態優先序：Needs Attention > Failed > Running > Queued > Comp
   }
   assert.equal(groupSummary([]).state,'idle');
   assert.equal(groupSummary([task({status:'cancelled'})]).state,'idle');
+  // closed 刻意不在優先序裡：全部關閉的群組視同沒有進行中的任務，不會把 header 標成「等待關閉」。
+  assert.equal(groupSummary([task({status:'closed'})]).state,'idle');
 });
 
 test('群組的 Git branch 只在整組一致時才顯示，否則寧可不顯示',()=>{
@@ -159,11 +166,16 @@ test('taskMatchesFilter 與 filterCounts 回報真實數量',()=>{
     task({status:'failed',error:'中斷'}),
     task({status:'awaiting_approval',plan:{summary:'計畫'}}),
     task({status:'paused'}),
+    task({status:'ready_to_close'}),
+    task({status:'closed'}),
   ];
-  assert.deepEqual(filterCounts(tasks),{all:6,running:1,attention:2,queued:1,completed:1});
+  assert.deepEqual(filterCounts(tasks),{all:7,running:1,attention:2,queued:1,completed:1,ready_to_close:1,closed:1});
   assert.equal(taskMatchesFilter(tasks[0],'all'),true);
   assert.equal(taskMatchesFilter(tasks[5],'queued'),false);
-  assert.deepEqual(filterCounts([]),{all:0,running:0,attention:0,queued:0,completed:0});
+  // 已關閉的任務不算進「全部」，只算進「已關閉」分頁自己的數字。
+  assert.equal(taskMatchesFilter(tasks[7],'all'),false);
+  assert.equal(taskMatchesFilter(tasks[7],'closed'),true);
+  assert.deepEqual(filterCounts([]),{all:0,running:0,attention:0,queued:0,completed:0,ready_to_close:0,closed:0});
 });
 
 test('搜尋命中群組內的任務：群組顯示、只留命中的任務，並標記 autoExpand',()=>{

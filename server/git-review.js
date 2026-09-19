@@ -7,15 +7,30 @@
 import { HttpError, requireTask, reviseTask } from './domain.js';
 import { createGitWorkspace, GitSafetyError } from './git-workspace.js';
 import { now, id } from './db.js';
+import { assertTaskTransition, isTaskReadyToClose } from './task-status.js';
 
 const shared = createGitWorkspace();
 
 const summarize = text => String(text || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+const firstLine = text => String(text || '').split('\n')[0].trim();
 
 function gitTask(store, user, tid) {
   const t = requireTask(store, user, tid);
   if (t.git?.mode !== 'worktree') throw new HttpError(409, '此任務不是以 Git 模式執行，沒有可審核的分支。');
   return t;
+}
+
+// 唯一的「main 是否真的包含這個 commit」入口：一律對目前的 baseBranch 即時重新檢查，
+// 不吃合併當下或上一次檢查時的快取。commit 可以是 gitMerge 記下的 merge commit，
+// 也可以是還沒被 TaskFlow 自己合併過、但已經在外部被合併進去的任務分支 HEAD。
+function mainContainsCommit(gitWorkspace, repositoryPath, baseBranch, commit) {
+  if (!commit) return false;
+  return gitWorkspace.git(repositoryPath, ['merge-base', '--is-ancestor', commit, baseBranch], { allowFailure: true }).ok;
+}
+
+function branchHeadOf(gitWorkspace, repositoryPath, branch) {
+  const result = gitWorkspace.git(repositoryPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { allowFailure: true });
+  return result.ok ? firstLine(result.stdout) : null;
 }
 
 // 審核畫面要的一切：分支、這條分支上的 commit、每個階段的驗收結果，以及正式分支現在的狀態。
@@ -50,11 +65,25 @@ export function taskGitReview(store, user, tid, { gitWorkspace = shared } = {}) 
     rollback: t.gitRollback || null,
     push: t.gitPush || null,
     cleanedUp: !!t.git.cleanedUp,
+    // 下面這些欄位一律是「現在重新問一次 Git」的結果，不是任務完成或上次合併當下的快取
+    // （計畫書第八、九章）：main 有沒有前進、現在合不合併得起來，隨時可能已經和快取的結論不同。
+    mainAdvanced: false,
+    mainHead: null,
+    hasConflict: !!t.gitConflict,
+    merged: !!t.gitMerge,
+    mergeable: false,
+    externallyMerged: false,
   };
 
   try {
     if (!t.git.cleanedUp && t.workspace) {
       review.commits = gitWorkspace.commits({ workingDirectory: t.workspace, baseCommit: t.git.baseCommit });
+    } else if (t.gitMerge) {
+      // worktree 已經清理掉了，沒有目錄可以讀 HEAD；改用 repositoryPath 讀
+      // baseCommit..分支自己的那個 parent（merge commit 的第二個 parent，因為合併一律
+      // 用 --no-ff）這個固定範圍，才會跟 worktree 還在時看到的清單一致——不多算進
+      // merge commit 本身，Ready to Close 畫面仍能「查看變更」。
+      review.commits = gitWorkspace.commits({ workingDirectory: t.git.repositoryPath, baseCommit: t.git.baseCommit, head: `${t.gitMerge.commit}^2` });
     }
     // fetch:false —— 開啟審核畫面不該觸發網路操作；這裡顯示的是上次 fetch 之後的狀態，
     // 真正要推送時 pushBaseBranch() 會自己先 fetch 一次。
@@ -65,6 +94,28 @@ export function taskGitReview(store, user, tid, { gitWorkspace = shared } = {}) 
       onBaseBranch: state.branch === t.git.baseBranch,
       dirty: state.dirty.slice(0, 30),
     };
+
+    const mainHead = branchHeadOf(gitWorkspace, t.git.repositoryPath, t.git.baseBranch);
+    review.mainHead = mainHead;
+    review.mainAdvanced = !!(mainHead && t.git.baseCommit && mainHead !== t.git.baseCommit);
+
+    if (!t.gitMerge) {
+      // 還沒被 TaskFlow 自己合併過：先確認分支是不是已經在外部被手動合併進 main，
+      // 這種情況不需要使用者再按一次「Merge 到 main」（計畫書第十章 Case D）。
+      const branchHead = branchHeadOf(gitWorkspace, t.git.repositoryPath, t.git.workingBranch);
+      if (branchHead && mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.git.baseBranch, branchHead)) {
+        review.externallyMerged = true;
+        review.mergeable = false;
+      } else if (branchHead) {
+        // 即時重新試算一次合不合併得起來；不沿用任務完成當下的舊結論。
+        const preview = gitWorkspace.previewMerge({ repositoryPath: t.git.repositoryPath, baseBranch: t.git.baseBranch, workingBranch: t.git.workingBranch });
+        if (preview.available && preview.conflicted) {
+          review.hasConflict = true;
+          review.conflict = review.conflict || { files: preview.files, hint: 'TaskFlow 不會自行決定 ours／theirs。請在專案目錄手動處理衝突後再回來，或改為要求 AI 修改。', baseBranch: t.git.baseBranch, workingBranch: t.git.workingBranch };
+        }
+        review.mergeable = preview.available && !preview.conflicted && !preview.alreadyMerged;
+      }
+    }
   } catch (e) {
     review.repositoryError = e.message;
   }
@@ -72,9 +123,11 @@ export function taskGitReview(store, user, tid, { gitWorkspace = shared } = {}) 
 }
 
 function mergeDecision(store, user, t, input, gitWorkspace) {
+  // 已經合併過就直接說清楚，不要被「合併成功後 status 已經不是 completed 了」蓋掉——
+  // 那會讓使用者以為成果失效了，而不是「不需要再按一次」。
+  if (t.gitMerge) throw new HttpError(409, '此任務已經合併過了。');
   if (t.status !== 'completed' || t.manualCompletion) throw new HttpError(409, '只有通過獨立驗證而完成的任務才能合併；手動標記完成不代表驗收通過。');
   if (!t.artifactVersion || input.artifactVersion !== t.artifactVersion) throw new HttpError(409, '成果版本不符，請重新查看最新成果後再核准。');
-  if (t.gitMerge) throw new HttpError(409, '此任務已經合併過了。');
 
   const outcome = gitWorkspace.merge({
     repositoryPath: t.git.repositoryPath,
@@ -101,16 +154,28 @@ function mergeDecision(store, user, t, input, gitWorkspace) {
   t.gitConflict = null;
   t.gitMerge = { commit: outcome.commit, baseBranch: outcome.baseBranch, workingBranch: outcome.workingBranch, artifactVersion: t.artifactVersion, by: user.id, at: now() };
   t.publishApproval = { by: user.id, at: now(), artifactVersion: t.artifactVersion };
+
+  // mergeTaskBranch() 合併後已經自己用 merge-base --is-ancestor 驗證過一次
+  // （不通過會直接丟 GitSafetyError，不會走到這裡），isTaskReadyToClose() 在這裡
+  // 只是把「這個當下確實剛驗證過」這件事講清楚，而不是隨口假設剛合併完就一定成立。
+  if (isTaskReadyToClose(t, { mainContainsTaskCommit: true })) {
+    assertTaskTransition(t, 'ready_to_close');
+    t.status = 'ready_to_close';
+    t.readyToCloseAt = now();
+  }
   store.saveTask(t);
   store.event(t.id, 'git_merged', `${user.name} 核准並合併 ${outcome.workingBranch} 至 ${outcome.baseBranch}（${outcome.commit.slice(0, 8)}）`);
+  if (t.status === 'ready_to_close') store.event(t.id, 'ready_to_close', '合併已通過驗證，任務進入等待關閉；worktree 與分支的清理留到使用者按下「關閉任務」才執行。');
 
-  if (input.cleanup !== false) applyCleanup(store, t, { gitWorkspace, deleteUnmerged: false });
+  // 清理不再是合併的一部分：合併只回答「成果進了正式分支了嗎」，
+  // worktree／分支什麼時候消失是使用者按下「關閉任務」才決定的事（計畫書第十九、二十一章）。
   store.notify(t, `成果已合併至 ${outcome.baseBranch}（${outcome.commit.slice(0, 8)}）。`);
   return store.task(t.id);
 }
 
 // 清理只在合併成功、或使用者明確選擇刪除被拒絕的分支時執行；失敗一律照實回報，
-// 不加 --force，也不動工作目錄裡沒提交的東西。
+// 不加 --force，也不動工作目錄裡沒提交的東西。回傳 gitWorkspace.cleanup() 的原始結果，
+// 讓呼叫端（例如 closeTask）能分辨「清乾淨了」與「工作副本還有東西，保留不動」。
 export function applyCleanup(store, t, { gitWorkspace, deleteUnmerged }) {
   try {
     const outcome = gitWorkspace.cleanup({
@@ -126,9 +191,81 @@ export function applyCleanup(store, t, { gitWorkspace, deleteUnmerged }) {
     Object.assign(t, latest);
     store.event(t.id, outcome.branchDeleted || outcome.removed ? 'git_cleanup' : 'git_cleanup_skipped',
       outcome.message || (outcome.notes || []).join(' ') || '沒有需要清理的項目。');
+    return outcome;
   } catch (e) {
     store.event(t.id, 'git_cleanup_skipped', `清理任務分支時停止：${e.message}。分支與工作目錄保持原狀。`);
+    return { removed: false, branchDeleted: false, reason: 'cleanup_error', message: e.message };
   }
+}
+
+/**
+ * 使用者主動關閉任務：唯一會把 ready_to_close 推進到 closed 的入口（計畫書第十七、十八章）。
+ *
+ * 兩個前提缺一不可，且都是即時重新檢查，不吃合併當下的舊快取：
+ *   1. 任務已經是 ready_to_close——或者雖然還停在 completed，但分支已經在外部被手動合併，
+ *      這裡先把它記成 ready_to_close，不要求使用者再按一次「Merge 到 main」（Case D）。
+ *   2. 目前的正式分支真的包含這個任務的合併結果（merge-base --is-ancestor）。
+ *
+ * 任一項不成立就丟 409，不執行任何清理，也不改狀態。
+ */
+export async function closeTask(store, user, tid, input = {}, { gitWorkspace = shared, previews = null } = {}) {
+  const t = gitTask(store, user, tid);
+  if (t.status === 'closed') throw new HttpError(409, '此任務已經關閉。');
+  const forceCleanup = input.forceCleanup === true;
+
+  if (t.status !== 'ready_to_close') {
+    if (t.status !== 'completed') throw new HttpError(409, `任務目前是 ${t.status}，還不能關閉。`);
+    if (t.gitMerge) {
+      // 相容舊資料（計畫書第三十一章）：這個任務是在本次改造之前合併的，status 從此
+      // 停在 completed，從來沒有被推進過。舊的 merge commit 還在，重新驗證一次仍在
+      // 正式分支上就直接視為 ready_to_close，不要求 workingBranch 還存在——舊行為本來
+      // 就會在合併當下立刻清掉 worktree 與分支。
+      if (!mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.gitMerge.baseBranch, t.gitMerge.commit)) {
+        throw new HttpError(409, `${t.gitMerge.baseBranch} 目前不包含此任務先前的合併結果，無法關閉；請重新確認 Git 狀態。`);
+      }
+    } else {
+      const branchHead = branchHeadOf(gitWorkspace, t.git.repositoryPath, t.git.workingBranch);
+      if (!branchHead || !mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.git.baseBranch, branchHead)) {
+        throw new HttpError(409, '尚未合併至正式分支，無法關閉；請先在「部署與驗收」核准合併，或確認 Git 狀態後再試一次。');
+      }
+      // 分支已經在外部被合併：把目前查得到的事實記成 merge metadata，即使不是 TaskFlow
+      // 自己執行的合併，也不能讓這個任務從此沒有任何 merge 紀錄（計畫書第十四章）。
+      t.gitMerge = { commit: branchHead, baseBranch: t.git.baseBranch, workingBranch: t.git.workingBranch, artifactVersion: t.artifactVersion, by: null, at: now(), external: true };
+    }
+    assertTaskTransition(t, 'ready_to_close');
+    t.status = 'ready_to_close';
+    t.readyToCloseAt = now();
+    store.saveTask(t);
+    store.event(t.id, 'ready_to_close', t.gitMerge.external
+      ? '偵測到此任務已在外部手動合併，直接視為等待關閉，不需要再次核准合併。'
+      : '這是本次改造之前已合併的任務，重新確認合併結果仍在正式分支上後，直接視為等待關閉。');
+  }
+
+  const mainContainsTaskCommit = mainContainsCommit(gitWorkspace, t.git.repositoryPath, t.gitMerge.baseBranch, t.gitMerge.commit);
+  if (!mainContainsTaskCommit) {
+    throw new HttpError(409, `${t.gitMerge.baseBranch} 目前不包含此任務的合併結果，無法關閉；請重新整理 Git 狀態後再試一次。`);
+  }
+
+  // Close 是這個任務生命週期的最後一步：任何還綁著它的 Preview／執行期程序都要先停掉，
+  // 避免任務關閉後背景還留著程序（計畫書第二十二章）。找不到 previews 依賴就跳過，
+  // 不阻擋關閉本身。
+  if (previews) { try { await previews.stop(`${t.projectId}:${t.id}:${t.planVersion}`); } catch { /* 沒有在跑就是沒有在跑 */ } }
+
+  const cleanupOutcome = applyCleanup(store, t, { gitWorkspace, deleteUnmerged: forceCleanup });
+  const latest = store.task(t.id);
+  if (cleanupOutcome?.reason === 'worktree_not_removable') {
+    // 工作副本仍有未提交變更：不刪、不強制，任務維持 ready_to_close，讓使用者自己處理後
+    // 或明確選擇「強制清理」再回來關閉（計畫書第二十一、三十章）。
+    return { ...latest, cleanupWarning: `工作副本仍有未提交變更，已保留不動，尚未關閉：${(cleanupOutcome.files || []).slice(0, 10).join('、')}` };
+  }
+
+  latest.status = 'closed';
+  latest.closedAt = now();
+  latest.closedBy = user.id;
+  store.saveTask(latest);
+  store.event(t.id, 'task_closed', `${user.name} 關閉任務${cleanupOutcome?.reason === 'branch_not_deleted' ? '（分支尚未刪除，可能尚未完全合併，已保留）' : ''}`);
+  store.notify(latest, '任務已關閉。');
+  return store.task(t.id);
 }
 
 function rejectDecision(store, user, t, input, gitWorkspace) {

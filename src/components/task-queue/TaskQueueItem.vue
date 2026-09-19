@@ -44,9 +44,11 @@ const retryAt=computed(()=>props.task.retryAt?new Intl.DateTimeFormat('zh-TW',{m
       @change="$emit('status',$event)"
     >
       <option :value="task.status">{{statusLabel}}</option>
-      <option v-if="task.status!=='completed'" value="completed">標記完成</option>
-      <option v-if="task.status!=='paused'" value="paused">暫停任務</option>
-      <option v-if="task.status!=='cancelled'" value="cancelled">取消任務</option>
+      <!-- ready_to_close／closed 是 Git 交付與關閉流程的結果，只能透過「部署與驗收」畫面的
+           核准合併／關閉任務推進，這裡的手動狀態選單不提供會繞過那條狀態機的選項。 -->
+      <option v-if="!['completed','ready_to_close','closed'].includes(task.status)" value="completed">標記完成</option>
+      <option v-if="!['paused','ready_to_close','closed'].includes(task.status)" value="paused">暫停任務</option>
+      <option v-if="!['cancelled','ready_to_close','closed'].includes(task.status)" value="cancelled">取消任務</option>
       <option v-if="['completed','cancelled','paused','failed','waiting_input'].includes(task.status)" value="reopen">恢復處理</option>
     </select>
     <div class="progress-cell">

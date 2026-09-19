@@ -456,8 +456,12 @@ export function readHead({ workingDirectory, git }) {
 }
 
 // 一個任務分支上，從 base 之後由 TaskFlow 產生的 commit。Phase 3 的 Review 會用到。
-export function taskCommits({ workingDirectory, baseCommit, git, limit = 100 }) {
-  const log = git(workingDirectory, ['log', '--format=%H%x1f%s%x1f%aI', `${baseCommit}..HEAD`], { allowFailure: true });
+//
+// head 預設是 HEAD（worktree 還在時，那就是任務分支自己的最新 commit）；worktree 清理後
+// 已經沒有「這個目錄的 HEAD」可讀，Ready to Close 畫面改傳 gitMerge.commit 進來，
+// 在 repositoryPath 上讀 baseCommit..gitMerge.commit 這個固定範圍，仍能列出這條分支的 commit。
+export function taskCommits({ workingDirectory, baseCommit, head = 'HEAD', git, limit = 100 }) {
+  const log = git(workingDirectory, ['log', '--format=%H%x1f%s%x1f%aI', `${baseCommit}..${head}`], { allowFailure: true });
   if (!log.ok) return [];
   return log.stdout.split('\n').map(line => line.trim()).filter(Boolean).slice(0, limit)
     .map(line => { const [commit, subject, at] = line.split('\x1f'); return { commit, subject, at }; });
@@ -518,6 +522,20 @@ function detectMergeConflicts({ repositoryPath, baseBranch, workingBranch, git }
       { baseBranch, workingBranch });
   }
   return { conflicted: true, files };
+}
+
+// 唯讀預覽：只算「合併會不會衝突」，完全不碰工作樹、不建立 commit。
+// Git Delivery 畫面每次開啟都要重新問一次「現在合不合併得起來」，不能沿用任務完成
+// 當下或上一次合併時的舊結論（main 可能在這之間前進了）。
+export function previewMerge({ repositoryPath, baseBranch, workingBranch, git }) {
+  if (!git(repositoryPath, ['rev-parse', '--verify', '--quiet', `refs/heads/${workingBranch}`], { allowFailure: true }).ok) {
+    return { available: false, reason: 'branch_missing' };
+  }
+  if (git(repositoryPath, ['merge-base', '--is-ancestor', workingBranch, baseBranch], { allowFailure: true }).ok) {
+    return { available: true, alreadyMerged: true, conflicted: false, files: [] };
+  }
+  const conflicts = detectMergeConflicts({ repositoryPath, baseBranch, workingBranch, git });
+  return { available: true, alreadyMerged: false, conflicted: conflicts.conflicted, files: conflicts.files };
 }
 
 export function mergeTaskBranch({ repositoryPath, baseBranch, workingBranch, subject, body = '', git }) {
@@ -665,6 +683,7 @@ export function createGitWorkspace({ git = createGitRunner() } = {}) {
     head: (options) => readHead({ ...options, git }),
     commits: (options) => taskCommits({ ...options, git }),
     merge: (options) => mergeTaskBranch({ ...options, git }),
+    previewMerge: (options) => previewMerge({ ...options, git }),
     cleanup: (options) => cleanupTaskBranch({ ...options, git }),
     revert: (options) => revertMergeCommit({ ...options, git }),
     remoteStatus: (options) => remoteStatus({ ...options, git }),

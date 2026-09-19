@@ -178,6 +178,32 @@ test('合併完成後改為顯示已合併，並可撤銷', () => {
   assert.equal(view.stages.find(s => s.key === 'cleanup').state, 'done');
 });
 
+// 生命週期改造：合併驗證通過後 task.status 會被後端推進到 ready_to_close，
+// 這裡不再只看 gitMerge 存不存在——task.status 是唯一的權威來源（計畫書第二十八章）。
+test('合併驗證通過後 status=ready_to_close：隱藏 Merge 按鈕，改顯示關閉任務', () => {
+  const task = baseTask({ status: 'ready_to_close', readyToCloseAt: '2026-09-19T01:31:00.000Z', gitMerge: { commit: 'ab3e585333333333333333333333333333333333', baseBranch: 'main', workingBranch: 'taskflow/20415e0f-login', at: '2026-09-19T01:30:00.000Z' } });
+  const view = completionView(task, baseReview({ cleanedUp: false }));
+  assert.equal(view.state, 'ready_to_close');
+  assert.equal(view.badgeClass, 'queued');
+  assert.equal(view.canMerge, false);
+  assert.equal(view.canClose, true);
+  assert.equal(view.canRollback, true);
+  assert.match(view.message, /按下「關閉任務」/);
+});
+
+test('使用者關閉任務後 status=closed：不再提供撤銷或關閉按鈕', () => {
+  const task = baseTask({ status: 'closed', closedAt: '2026-09-19T02:00:00.000Z', closedBy: 'user-1', gitMerge: { commit: 'ab3e585333333333333333333333333333333333', baseBranch: 'main', workingBranch: 'taskflow/20415e0f-login', at: '2026-09-19T01:30:00.000Z' } });
+  const view = completionView(task, baseReview({ cleanedUp: true }));
+  assert.equal(view.state, 'closed');
+  assert.equal(view.badgeClass, 'completed');
+  assert.equal(view.canMerge, false);
+  assert.equal(view.canClose, false);
+  assert.equal(view.canRollback, false, 'closed 是 archive，不再提供撤銷');
+  // 關閉後歷史仍然完整可查：commits／merge metadata 都還在畫面資料裡。
+  assert.ok(view.merge);
+  assert.equal(view.commits.length, 1);
+});
+
 test('每個狀態都對應得到既有的 badge 樣式（template 不再自帶對照表）', () => {
   const merged = { commit: 'ab3e585333333333333333333333333333333333', baseBranch: 'main', at: '2026-09-19T01:30:00.000Z' };
   const cases = [
@@ -187,6 +213,8 @@ test('每個狀態都對應得到既有的 badge 樣式（template 不再自帶�
     [completionView(baseTask(), baseReview({ conflict: { files: ['a.js'] } })), 'conflict', 'failed'],
     [completionView(baseTask({ gitMerge: merged }), baseReview()), 'merged', 'completed'],
     [completionView(baseTask({ gitMerge: merged, gitRollback: { commit: 'dd11aa22' } }), baseReview()), 'rolled_back', 'cancelled'],
+    [completionView(baseTask({ status: 'ready_to_close', gitMerge: merged }), baseReview()), 'ready_to_close', 'queued'],
+    [completionView(baseTask({ status: 'closed', gitMerge: merged }), baseReview()), 'closed', 'completed'],
   ];
   for (const [view, state, badge] of cases) {
     assert.equal(view.state, state);

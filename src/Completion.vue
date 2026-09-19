@@ -9,7 +9,8 @@ const emit=defineEmits<{
   refresh:[];test:[];testMain:[];restart:[];validate:[];push:[];
   approve:[options:{testMain:boolean;restart:boolean;validate:boolean;push:boolean;cleanup:boolean}];
   retry:[completionId:string];cancelPipeline:[completionId:string];
-  merge:[options:{cleanup:boolean}];rollback:[mergeCommit:string];
+  merge:[];rollback:[mergeCommit:string];
+  close:[options:{forceCleanup:boolean}];
 }>();
 // 一次核准要跑哪些階段。重啟與部署驗收只有 TaskFlow 自己這個專案才有意義，
 // 所以那兩個勾選框只在 selfProject 時出現（勾了也不會排進其他專案的流程）。
@@ -21,6 +22,10 @@ const view=computed(()=>completionView(props.task,props.review));
 // 取消勾選時分支與工作副本原樣保留，之後仍可手動處理。
 const cleanup=ref(true);
 const confirmingRollback=ref(false);
+const confirmingClose=ref(false);
+// 預設不強制刪除：worktree 有未提交變更時，關閉會被擋下並保留原狀（計畫書第二十、二十一章）。
+// 只有使用者自己勾選才會改用 git branch -D／--force 通道。
+const forceCleanup=ref(false);
 const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:false}):'';
 </script>
 <template>
@@ -325,20 +330,38 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
       <h4>核准後 TaskFlow 會：</h4>
       <ul class="completion-plan">
         <li>以 <code>git merge --no-ff</code> 將 <code>{{view.branch.working}}</code> 併入 <code>{{view.branch.base}}</code>，保留 merge commit</li>
-        <li v-if="cleanup">合併成功後移除此任務的 git worktree，並刪除已合併的任務分支</li>
-        <li v-else>保留此任務的 git worktree 與分支，不做任何清理</li>
+        <li>驗證通過後任務進入「等待關閉」；worktree 與任務分支會保留，直到你按下「關閉任務」才清理</li>
       </ul>
-      <label class="completion-option">
-        <input v-model="cleanup" type="checkbox" :disabled="busy">
-        合併成功後清理工作副本與已合併分支
-      </label>
       <h4>TaskFlow 不會：</h4>
       <ul class="guarantees"><li v-for="item in view.guarantees" :key="item">✗ {{item}}</li></ul>
     </template>
 
+    <!-- Ready to Close：技術交付已完成，只等使用者確認。這裡不再顯示「Merge 到 main」，
+         除非偵測到合併結果異常（canMerge 重新變成 true）。 -->
+    <template v-if="view.state==='ready_to_close'">
+      <h4>關閉任務後 TaskFlow 會：</h4>
+      <ul class="completion-plan">
+        <li>停止綁定此任務的 Preview／執行期程序</li>
+        <li v-if="forceCleanup">強制移除 worktree（<code>-D</code>／<code>--force</code>），即使尚有未提交變更也會清除</li>
+        <li v-else>移除此任務的 git worktree；若仍有未提交變更則保留不動，並回報原因</li>
+        <li>優先以 <code>git branch -d</code> 刪除已合併的任務分支</li>
+      </ul>
+      <label class="completion-option">
+        <input v-model="forceCleanup" type="checkbox" :disabled="busy">
+        強制清理（worktree 仍有未提交變更時才需要，會直接捨棄那些變更）
+      </label>
+    </template>
+
     <div class="actions">
       <button v-if="view.canMerge" type="button" class="primary" :disabled="busy"
-              @click="emit('merge',{cleanup})">核准並合併至 {{view.branch.base}}</button>
+              @click="emit('merge')">核准並合併至 {{view.branch.base}}</button>
+      <button v-if="view.canClose&&!confirmingClose" type="button" class="primary" :disabled="busy"
+              @click="confirmingClose=true">關閉任務</button>
+      <template v-if="confirmingClose">
+        <button type="button" class="primary" :disabled="busy"
+                @click="emit('close',{forceCleanup});confirmingClose=false">確定關閉任務</button>
+        <button type="button" class="secondary" :disabled="busy" @click="confirmingClose=false">取消</button>
+      </template>
       <button v-if="view.canRollback&&!confirmingRollback" type="button" class="secondary" :disabled="busy"
               @click="confirmingRollback=true">撤銷這次合併</button>
       <template v-if="confirmingRollback">
@@ -351,6 +374,7 @@ const time=(value:string)=>value?new Date(value).toLocaleString('zh-TW',{hour12:
       </button>
     </div>
 
+    <p v-if="view.state==='closed'" class="subtle">Closed 是封存，不是刪除：需求、計畫、執行紀錄、commits 與合併紀錄仍在上方與其他分頁中完整保留。</p>
     <p v-if="view.repositoryError" class="error-text">{{view.repositoryError}}</p>
     <p class="subtle">{{view.scopeNote}}</p>
   </section>
