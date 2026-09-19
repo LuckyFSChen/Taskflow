@@ -8,7 +8,7 @@ import {healthAlert} from './system-health-view.js';
 import {AI_MODES,AUTO,CUSTOM,autoModeSummary,resolveEngines,taskEngineDefaults} from './task-defaults.js';
 // Task Detail 的資訊分層集中在 src/task-detail-view.js：分頁、待處理清單與
 // 進度推導都在那裡，Template 只負責畫出來。沒有任何既有能力被移除。
-import {DETAIL_TABS,DEFAULT_TAB,pendingActions,pendingBanner,progressSteps,progressSummary,browserValidations,validationEvidence,publishState,technicalFacts,threadTechnical,threadEvents} from './task-detail-view.js';
+import {DETAIL_TABS,DEFAULT_TAB,pendingActions,pendingBanner,progressSteps,progressSummary,browserValidations,validationEvidence,publishState,technicalFacts,threadTechnical,threadEvents,taskRuns,runTitle,attemptLabel} from './task-detail-view.js';
 // 任務佇列：方案群組化。分組依據只有 task.planGroupId，聚合邏輯全部集中在
 // src/plan-group.js（與 attention.js 同一個模式），Template 只負責畫出來。
 import {buildPlanGroups} from './plan-group.js';
@@ -57,6 +57,9 @@ const detailEvidence=computed(()=>validationEvidence(selected.value));
 const detailBrowser=computed(()=>browserValidations(selected.value));
 const detailPublish=computed(()=>publishState(selected.value));
 const detailFacts=computed(()=>technicalFacts(selected.value));
+// Run／Attempt：由 server/run-attempt.js 純運算算好，這裡只挑要顯示的欄位，
+// 不重新定義狀態機（見 task-detail-view.js）。
+const detailRuns=computed(()=>taskRuns(selected.value));
 // 建立任務表單：預設走「自動選擇」，使用者不必理解 Planner／Executor／Reviewer。
 // 三個引擎欄位仍然存在（送出的仍是既有 API 欄位），只是自動模式時由任務類型決定。
 // planGroupChoice 只是表單狀態：''＝獨立任務、'__new__'＝建立新方案、其餘是既有方案的 id。
@@ -385,9 +388,16 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
         <div class="progress-summary"><strong>{{detailProgressSummary.label}}</strong><small v-if="detailProgressSummary.note">{{detailProgressSummary.note}}</small><small v-else>只顯示目前已知的狀態，不預估尚未發生的進度。</small></div>
         <ol class="progress-steps"><li v-for="step in detailProgress" :key="step.key" :class="step.state"><span class="progress-mark" aria-hidden="true">{{step.mark}}</span><div class="grow"><strong>{{step.label}}</strong><small v-if="step.detail">{{step.detail}}</small><small v-if="step.note" class="error-text">{{step.note}}</small></div><span class="progress-state">{{step.stateLabel}}</span></li></ol>
         <template v-if="selected.plan"><h3>每一步要做什麼</h3><div v-for="(step,i) in selected.plan.steps" :key="i" class="plan-step"><span class="step-number">{{Number(i)+1}}</span><div><strong>{{step.title}}</strong><small>{{step.role}} · {{selected.executor}}</small><p>{{step.instructions}}</p></div></div><div class="plan-step"><span class="step-number"><Check :size="16"/></span><div><strong>獨立驗證</strong><small>{{selected.reviewer}} · 檢查所有驗收條件</small></div></div></template>
-        <h3>角色工作狀態</h3>
-        <div v-if="!selected.threads.length" class="empty"><GitBranch/><p>尚未開始工作。</p></div>
-        <div v-for="th in selected.threads" :key="th.id" class="role-row"><span class="engine-mark">{{th.engine==='codex'?'C':'A'}}</span><div class="grow"><strong>{{th.role}}</strong><small>{{th.title||th.engine}} · {{duration(th)}}</small><small class="prewrap">{{th.summary||th.error||'執行中，尚未回傳結果。'}}</small></div><span class="badge" :class="th.displayStatus||th.status">{{th.statusLabel||statuses[th.status]}}</span></div>
+        <h3>執行紀錄（Run / Attempt）</h3>
+        <div v-if="!detailRuns.length" class="empty"><GitBranch/><p>尚未開始工作。</p></div>
+        <template v-for="run in detailRuns" :key="run.id">
+          <!-- 只重試過一次以上的 Run 才需要獨立的 Run 標頭；沒重試過就跟以前一樣是單一列。 -->
+          <div v-if="run.attempts.length>1" class="run-group">
+            <div class="run-header"><strong>{{runTitle(run)}}</strong><span class="count">{{run.attempts.length}} 次嘗試</span><span class="badge" :class="run.displayStatus||run.status">{{run.statusLabel||statuses[run.status]}}</span></div>
+            <div v-for="(th,i) in run.attempts" :key="th.id" class="role-row"><span class="engine-mark">{{th.engine==='codex'?'C':'A'}}</span><div class="grow"><strong>{{attemptLabel(run,i)}}</strong><small>{{th.role}} · {{duration(th)}}</small><small class="prewrap">{{th.summary||th.error||'執行中，尚未回傳結果。'}}</small></div><span class="badge" :class="th.displayStatus||th.status">{{th.statusLabel||statuses[th.status]}}</span></div>
+          </div>
+          <div v-else class="role-row"><span class="engine-mark">{{run.attempts[0].engine==='codex'?'C':'A'}}</span><div class="grow"><strong>{{run.attempts[0].role}}</strong><small>{{runTitle(run)}} · {{duration(run.attempts[0])}}</small><small class="prewrap">{{run.attempts[0].summary||run.attempts[0].error||'執行中，尚未回傳結果。'}}</small></div><span class="badge" :class="run.displayStatus||run.status">{{run.statusLabel||statuses[run.status]}}</span></div>
+        </template>
         <p class="subtle">完整的工作階段、Session ID 與原始回傳在「技術資訊」分頁。</p>
       </template>
 

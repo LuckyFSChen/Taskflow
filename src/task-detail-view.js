@@ -264,6 +264,54 @@ function repairSteps(task) {
   return steps;
 }
 
+// --- Run / Attempt ------------------------------------------------------------
+//
+// Run＝task.runs（server/run-attempt.js 依 threads 純運算分組，見
+// docs/DOMAIN-MODEL-RUN-ATTEMPT.md）；Attempt＝Run 裡的每一筆 thread。
+// 這裡只負責把 phase 換成中文標籤，狀態沿用 thread-presentation.js 既有的
+// displayStatus／statusLabel，不重新定義新的狀態機，也不外露 Session ID、
+// Engine 原始欄位或 Raw Result（那些留在技術資訊分頁）。
+
+const RUN_PHASE_LABELS = {
+  plan: '整理需求與計畫',
+  review: '最終驗證',
+  execute: '執行步驟',
+  repair_plan: '修正方案分析',
+  repair: '問題修正',
+};
+
+/**
+ * 這個任務目前的 Run 清單（依發生順序），每個 Run 帶 attempts。
+ * 沒有 thread 的任務回傳空陣列，不是 undefined。
+ * @param {any} task
+ * @returns {any[]}
+ */
+export function taskRuns(task) {
+  return list(task?.runs);
+}
+
+/**
+ * Run 的顯示標題：沿用 server 端已經算好的中文 title（見 runner.js），
+ * 只在缺漏時才用 phase 對照表補一個通用標籤。
+ * @param {any} run
+ * @returns {string}
+ */
+export function runTitle(run) {
+  if (!run) return '';
+  return text(run.title) || RUN_PHASE_LABELS[run.phase] || '執行步驟';
+}
+
+/**
+ * Run 底下第幾次嘗試／共幾次，只有重試過（attempts.length>1）才需要顯示。
+ * @param {any} run
+ * @param {number} index
+ * @returns {string}
+ */
+export function attemptLabel(run, index) {
+  const total = list(run?.attempts).length;
+  return total > 1 ? `嘗試 ${index + 1} / ${total}` : '';
+}
+
 /**
  * 這個任務所有 thread 回報過的 Browser 驗證紀錄（只取 required 的）。
  * @param {any} task

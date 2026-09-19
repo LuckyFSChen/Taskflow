@@ -119,6 +119,12 @@
 .role-row{display:flex;align-items:flex-start;gap:12px;border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:12px}
 .role-row strong{display:block;font-size:.875rem}
 .role-row small{display:block;margin-top:5px;font-size:.75rem;line-height:1.7;color:#8b93a1;overflow-wrap:anywhere}
+/* Run／Attempt：同一個 Run 重試過一次以上才會出現這個群組外框，只重試過一次的
+   Run 維持原本的單一列外觀（見 App.vue「執行紀錄」）。 */
+.run-group{border:1px solid var(--line);border-radius:10px;padding:14px 16px 4px;margin-bottom:12px;background:#fafbfc}
+.run-header{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.run-header strong{font-size:.875rem;flex:1}
+.run-group .role-row{background:#fff}
 /* 成果：驗證證據依角色分組，沒有證據就直接說沒有，不留空白區塊。 */
 .evidence-block{border:1px solid var(--line);border-radius:10px;padding:15px 17px;margin-bottom:12px}
 .evidence-block strong{font-size:.875rem}
