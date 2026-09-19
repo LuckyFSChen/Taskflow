@@ -9,10 +9,16 @@ import {AI_MODES,AUTO,CUSTOM,autoModeSummary,resolveEngines,taskEngineDefaults} 
 // Task Detail 的資訊分層集中在 src/task-detail-view.js：分頁、待處理清單與
 // 進度推導都在那裡，Template 只負責畫出來。沒有任何既有能力被移除。
 import {DETAIL_TABS,DEFAULT_TAB,pendingActions,pendingBanner,progressSteps,progressSummary,browserValidations,validationEvidence,publishState,technicalFacts,threadTechnical,threadEvents} from './task-detail-view.js';
-import ProjectActions from './ProjectActions.vue';
-import ProjectRemoval from './ProjectRemoval.vue';
-import DirectoryPicker from './DirectoryPicker.vue';
-import LineLinks from './LineLinks.vue';
+// 任務佇列：方案群組化。分組依據只有 task.planGroupId，聚合邏輯全部集中在
+// src/plan-group.js（與 attention.js 同一個模式），Template 只負責畫出來。
+import {buildPlanGroups} from './plan-group.js';
+import TaskPlanGroup from './components/task-queue/TaskPlanGroup.vue';
+import TaskQueueItem from './components/task-queue/TaskQueueItem.vue';
+import TaskQueueToolbar from './components/task-queue/TaskQueueToolbar.vue';
+// 平台設定改成五個分頁；內容在 components/settings/ 底下。原本掛在這裡的
+// DirectoryPicker／LineLinks／NotificationManager／SystemHealth／ProjectActions／
+// ProjectRemoval 全部都還在，只是移到對應分頁裡，沒有任何設定被拿掉。
+import SettingsPage from './components/settings/SettingsPage.vue';
 import ExecutionApproval from './ExecutionApproval.vue';
 import ValidationSkip from './ValidationSkip.vue';
 import ManualAction from './ManualAction.vue';
@@ -23,20 +29,13 @@ import GitIssue from './GitIssue.vue';
 // 但前端從來沒有呼叫過，使用者因此每次都要自己開 PowerShell 下 git merge。
 import Completion from './Completion.vue';
 import {shouldLoadReview} from './completion-view.js';
-import NotificationManager from './NotificationManager.vue';
-import SystemHealth from './SystemHealth.vue';
 import OutputIssue from './OutputIssue.vue';
 // 首次設定精靈：要不要出現由後端算出的設定狀態決定（server/onboarding.js），
 // 不用「第一次登入」推測；四個步驟全部沿用既有功能。
 import OnboardingWizard from './OnboardingWizard.vue';
 import {shouldShowOnboarding} from './onboarding-view.js';
-const directoryPickerTarget=ref<'project'|'root'|null>(null);
-function selectDirectory(path:string){if(directoryPickerTarget.value==='root')projectRootInput.value=path;else if(directoryPickerTarget.value==='project')projectForm.path=path;directoryPickerTarget.value=null;}
 const removalCleanup=ref<string[]>([]);
 const store=useTaskStore(),route=useRoute();
-const concurrencyDraft=ref<number|null>(null);
-const concurrencyInput=computed({get:()=>concurrencyDraft.value??store.runner.maxConcurrent,set:(value:number)=>{concurrencyDraft.value=value;}});
-const validConcurrency=computed(()=>Number.isInteger(concurrencyInput.value)&&concurrencyInput.value>=1&&concurrencyInput.value<=32);
 // 精靈只在後端說「還沒設定過」時自動開啟；使用者按過「稍後設定」之後，
 // 只會由平台設定裡的按鈕手動開啟，不會再自己跳出來。
 const wizardOpen=ref(false);
@@ -46,8 +45,6 @@ function wizardCreateTask(mode:string){
   newTask.projectId=store.user.role==='admin'?'__new__':store.projects[0]?.id||'';
   showNew.value=true;
 }
-const projectRootDraft=ref<string|null>(null);
-const projectRootInput=computed({get:()=>projectRootDraft.value??store.defaultProjectRoot,set:(value:string)=>{projectRootDraft.value=value;}});
 const login=reactive({username:'admin',password:''});const loginError=ref(''),initializing=ref(true),busy=ref(false),toast=ref(''),query=ref(''),filter=ref('all');
 const showNew=ref(false),selected=ref<any>(null),tab=ref(DEFAULT_TAB),answer=ref(''),files=ref<any[]>([]),users=ref<any[]>([]);
 const detailTabs=DETAIL_TABS;
@@ -62,20 +59,51 @@ const detailPublish=computed(()=>publishState(selected.value));
 const detailFacts=computed(()=>technicalFacts(selected.value));
 // 建立任務表單：預設走「自動選擇」，使用者不必理解 Planner／Executor／Reviewer。
 // 三個引擎欄位仍然存在（送出的仍是既有 API 欄位），只是自動模式時由任務類型決定。
-const newTask=reactive({title:'',description:'',projectId:'',type:'code',priority:1,aiMode:AUTO,planner:'claude',executor:'codex',reviewer:'claude'});
+// planGroupChoice 只是表單狀態：''＝獨立任務、'__new__'＝建立新方案、其餘是既有方案的 id。
+// 送出時才轉成後端真正認得的 planGroupId／planGroupName。
+const newTask=reactive({title:'',description:'',projectId:'',type:'code',priority:1,aiMode:AUTO,planner:'claude',executor:'codex',reviewer:'claude',planGroupChoice:'',planGroupName:''});
 const showAdvanced=ref(false);
+// 方案屬於單一專案，所以只列出目前選到的專案底下的方案；換專案就把選擇清掉，
+// 避免把任務送進別的專案的方案（後端也會擋，但不該讓使用者按了才發現）。
+const projectPlanGroups=computed(()=>(store.planGroups||[]).filter((g:any)=>g.projectId===newTask.projectId));
+watch(()=>newTask.projectId,()=>{newTask.planGroupChoice='';newTask.planGroupName='';});
 const suggestedEngines=computed(()=>autoModeSummary(newTask.type));
 function applyAutoEngines(){const engines=taskEngineDefaults(newTask.type);newTask.planner=engines.planner;newTask.executor=engines.executor;newTask.reviewer=engines.reviewer;}
 // 自動模式跟著任務類型走；自訂模式不覆蓋使用者自己挑的引擎，改用建議文字提示。
 watch(()=>newTask.type,()=>{if(newTask.aiMode===AUTO)applyAutoEngines();});
 watch(()=>newTask.aiMode,mode=>{if(mode===AUTO)applyAutoEngines();else showAdvanced.value=true;});
-const projectForm=reactive({name:'',code:'',path:'',createIfMissing:true}),memberForm=reactive({name:'',username:'',password:'',projectIds:[] as string[]}),passwordForm=reactive({current:'',password:''});
 const statuses:Record<string,string>={planning:'等待規劃',awaiting_approval:'待審核',queued:'排隊中',running:'執行中',waiting_input:'等待回答',waiting_user_action:'需要你的協助',waiting_git_confirmation:'需要確認 Git 修改',paused:'已暫停',completed:'已完成',repair_planning:'分析修正方案',awaiting_repair_approval:'待審核修正方案',rate_limited:'等待額度恢復',failed:'需要處理',cancelled:'已取消'};
 const browserStatuses:Record<string,string>={not_required:'不需要',pending:'待執行',running:'執行中',passed:'通過',failed:'未通過',blocked:'受阻（未驗證）'};
 const priorities=['低','一般','高','緊急'];
 const nav=[{path:'/',label:'工作總覽',icon:LayoutDashboard},{path:'/attention',label:'待我處理',icon:Inbox},{path:'/tasks',label:'任務佇列',icon:ListTodo},{path:'/threads',label:'角色工作階段',icon:GitBranch},{path:'/settings',label:'平台設定',icon:Settings2}];
 const currentNav=computed(()=>nav.find(n=>n.path===route.path)||nav[0]);
-const visibleTasks=computed(()=>store.tasks.filter(t=>(filter.value==='all'||t.status===filter.value)&&(!query.value||`${t.title} ${t.projectName} ${t.ownerName}`.toLowerCase().includes(query.value.toLowerCase()))));
+// 任務佇列：先用 filter 篩 task，再決定哪些方案群組要顯示；搜尋命中群組內的任務時
+// 該群組會自動展開。群組 header 上的數字一律以「群組內所有任務」為母體，不受篩選影響。
+const queueView=computed(()=>buildPlanGroups(store.tasks,store.planGroups,{filter:filter.value,query:query.value}));
+// 預設全部展開：升級後既有任務都沒有 planGroupId，全部落在「其他任務」，
+// 若預設收合，使用者打開佇列會看到一片空白。收合狀態只記在前端，不寫進任何設定。
+const collapsedGroups=ref<Set<string>>(new Set());
+const groupExpanded=(group:any)=>!collapsedGroups.value.has(group.id);
+function toggleGroup(group:any){
+  const next=new Set(collapsedGroups.value);
+  if(groupExpanded(group))next.add(group.id);else next.delete(group.id);
+  collapsedGroups.value=next;
+}
+// 搜尋命中群組內的任務時（buildPlanGroups 會把該群組標成 autoExpand），
+// 就算使用者先前把它收起來也要自動展開，否則會看到一個「有結果但空的」群組。
+// 展開之後仍然可以再點 header 收起來——這不是強制展開。
+// 只在搜尋字串本身改變時處理，不跟著三秒輪詢跑：否則使用者在搜尋結果裡手動收起的
+// 群組會在下一次輪詢被強制打開。
+watch(query,value=>{
+  if(!value||!collapsedGroups.value.size)return;
+  const next=new Set(collapsedGroups.value);
+  for(const group of queueView.value.groups)if(group.autoExpand)next.delete(group.id);
+  collapsedGroups.value=next;
+});
+const allExpanded=computed(()=>queueView.value.groups.every(group=>groupExpanded(group)));
+function toggleAllGroups(){
+  collapsedGroups.value=allExpanded.value?new Set(queueView.value.groups.map(group=>group.id)):new Set();
+}
 const recentTasks=computed(()=>[...store.tasks].sort((a,b)=>Date.parse(b.updated)-Date.parse(a.updated)).slice(0,6));
 // 待我處理：分類邏輯集中在 src/attention.js，頁面與側欄共用同一份結果。
 const attention=computed(()=>attentionItems(store.tasks));
@@ -93,7 +121,7 @@ const statusLabel=(t:any)=>t.status==='completed'&&t.manualCompletion?'手動完
 let interval:ReturnType<typeof setInterval>,toastTimer:ReturnType<typeof setTimeout>;
 function notify(message:string){toast.value=message;clearTimeout(toastTimer);toastTimer=setTimeout(()=>toast.value='',6000);}
 async function run(fn:()=>Promise<any>){if(busy.value)return;busy.value=true;try{await fn();await store.refresh();if(selected.value)await loadTask(selected.value.id);}catch(e:any){notify(e.message);}finally{busy.value=false;}}
-async function projectRemoved(projectId:string,pendingCleanup:string[]=[]){removalCleanup.value=pendingCleanup;if(selected.value?.projectId===projectId)selected.value=null;if(newTask.projectId===projectId)newTask.projectId='__new__';memberForm.projectIds=memberForm.projectIds.filter(id=>id!==projectId);users.value=await api('/admin/users');notify(pendingCleanup.length?'專案已移除，部分磁碟檔案尚待清理':'專案及磁碟檔案已移除');}
+async function projectRemoved(projectId:string,pendingCleanup:string[]=[]){removalCleanup.value=pendingCleanup;if(selected.value?.projectId===projectId)selected.value=null;if(newTask.projectId===projectId)newTask.projectId='__new__';users.value=await api('/admin/users');notify(pendingCleanup.length?'專案已移除，部分磁碟檔案尚待清理':'專案及磁碟檔案已移除');}
 async function signIn(){loginError.value='';try{await api('/login',login);login.password='';await store.refresh();void store.loadHealth();}catch(e:any){loginError.value=e.message;}}
 async function loadTask(id:string){selected.value=await api('/tasks/'+id);}
 // 成果報告不完整的三個操作。recoverOutput 只呼叫 deterministic recovery 的 endpoint，
@@ -201,7 +229,9 @@ async function loadOriginalOutput(){
 function focusRevise(){tab.value='overview';void nextTick(()=>{const field=document.querySelector<HTMLTextAreaElement>('.drawer .revise-input');field?.scrollIntoView({block:'center'});field?.focus();});}
 async function action(name:string){if(!selected.value)return;await run(async()=>{await api(`/tasks/${selected.value.id}/action`,{action:name,artifactVersion:selected.value.artifactVersion});notify(name==='publish-approve'?'此版成果已核准；尚未對外發布':'任務狀態已更新');});}
 // 明確列出送出的欄位：aiMode 只是表單狀態，不屬於 Task Schema，不送到後端。
-async function create(){await run(async()=>{const t=await api('/tasks',{title:newTask.title,description:newTask.description,type:newTask.type,priority:newTask.priority,...resolveEngines(newTask),projectId:newTask.projectId==='__new__'?undefined:newTask.projectId,createProject:newTask.projectId==='__new__'});showNew.value=false;newTask.title='';newTask.description='';selected.value=await api('/tasks/'+t.id);tab.value='overview';notify('任務已建立');});}
+async function create(){await run(async()=>{const newGroup=newTask.planGroupChoice==='__new__';const t=await api('/tasks',{title:newTask.title,description:newTask.description,type:newTask.type,priority:newTask.priority,...resolveEngines(newTask),projectId:newTask.projectId==='__new__'?undefined:newTask.projectId,createProject:newTask.projectId==='__new__',
+  // 方案：只送明確的 id（既有方案）或名稱（新方案）。兩者都沒有就是獨立任務。
+  planGroupId:newGroup||!newTask.planGroupChoice?undefined:newTask.planGroupChoice,planGroupName:newGroup?newTask.planGroupName.trim():undefined});showNew.value=false;newTask.title='';newTask.description='';newTask.planGroupChoice='';newTask.planGroupName='';selected.value=await api('/tasks/'+t.id);tab.value='overview';notify('任務已建立');});}
 async function setTaskStatus(t:any,event:Event){const select=event.target as HTMLSelectElement;const status=select.value;select.value=t.status;await run(async()=>{await api(`/tasks/${t.id}/status`,{status,expectedStatus:t.status});notify(status==='completed'?'任務已手動完成':'任務狀態已更新');});}
 async function setPriority(t:any,event:Event){await run(()=>api(`/tasks/${t.id}/priority`,{priority:Number((event.target as HTMLSelectElement).value)}));}
 async function reorder(t:any,direction:number){const list=store.tasks.filter(x=>x.priority===t.priority&&(store.user.role==='admin'||x.ownerId===store.user.id));const i=list.findIndex(x=>x.id===t.id),next=i+direction;if(next<0||next>=list.length)return;[list[i],list[next]]=[list[next],list[i]];await run(()=>api('/reorder',{ids:list.map(x=>x.id)}));}
@@ -223,7 +253,6 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
 
 <template>
   <div v-if="removalCleanup.length" class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-label="磁碟清理未完成"><h2>部分磁碟檔案尚未刪除</h2><p>專案紀錄已移除，但下列檔案仍被占用。請關閉占用程式後清理這些資料夾；不要視為磁碟清理已完成。</p><ul><li v-for="path in removalCleanup" :key="path" style="overflow-wrap:anywhere">{{path}}</li></ul><button class="secondary" @click="removalCleanup=[]">我知道了</button></section></div>
-  <DirectoryPicker v-if="directoryPickerTarget && store.user?.role==='admin'" :title="directoryPickerTarget==='root'?'選擇預設專案存放位置':'選擇專案資料夾'" :initial-path="directoryPickerTarget==='root'?projectRootInput:(projectForm.path||store.defaultProjectRoot)" :suggested-name="directoryPickerTarget==='project'?projectForm.name:''" @close="directoryPickerTarget=null" @select="selectDirectory"/>
   <OnboardingWizard v-if="wizardOpen && store.user?.role==='admin'" @close="wizardOpen=false" @create-task="wizardCreateTask"/>
   <div v-if="initializing" class="loading-screen"><LoaderCircle class="spin"/> 正在連接本地工作台</div>
   <main v-else-if="!store.user" class="login-screen">
@@ -248,24 +277,70 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
         <div v-else class="attention-list"><article v-for="item in attention" :key="item.task.id" class="panel attention-card" :class="item.category.type"><div class="attention-card-head"><span class="attention-project"><Folder :size="15"/>{{item.task.projectName}}</span><small>最後更新 {{time(item.task.updated)}}</small></div><h3>{{item.task.title}}</h3><p class="attention-kind"><AlertCircle :size="16"/>{{item.category.title}}</p><p class="attention-reason">{{item.category.reason||item.category.description}}</p><div class="attention-card-foot"><button class="primary compact" :disabled="busy" @click="openTask(item.task)">{{item.category.action}} <ArrowUpRight :size="16"/></button><small>{{item.task.ownerName}}</small></div></article></div>
       </template>
       <template v-else-if="route.path==='/tasks'">
-        <div class="toolbar"><div class="filter-tabs"><button :class="{selected:filter==='all'}" @click="filter='all'">全部 <span>{{store.tasks.length}}</span></button><button :class="{selected:filter==='running'}" @click="filter='running'">執行中</button><button :class="{selected:filter==='awaiting_approval'}" @click="filter='awaiting_approval'">待審核</button><button :class="{selected:filter==='completed'}" @click="filter='completed'">已完成</button></div><label class="search"><Search :size="17"/><input v-model="query" placeholder="搜尋任務、專案或成員" aria-label="搜尋任務"></label></div>
-        <div class="queue-note"><GripVertical :size="16"/>拖曳調整同優先級的派工順序；正在執行的工作不會被中斷。</div>
-        <section class="panel table-panel"><div class="task-table-head"><span>任務 / 專案</span><span>狀態</span><span>子任務進度</span><span>優先級</span><span>排序</span></div><div v-if="!visibleTasks.length" class="empty"><ListTodo :size="30"/><h3>{{store.tasks.length?'沒有符合條件的任務':'任務佇列還是空的'}}</h3><p>發布任務後，可以在這裡安排順序和追蹤進展。</p></div><div v-for="t in visibleTasks" :key="t.id" class="task-table-row" draggable="true" @dragstart="dragging=t.id" @dragover.prevent @drop.prevent="drop(t)"><button class="task-title" @click="openTask(t)"><GripVertical :size="15" class="muted"/><span><strong>{{t.title}}</strong><small>{{t.projectName}} · {{t.ownerName}}</small><small v-if="t.status==='rate_limited'">預計重試：{{time(t.retryAt)}}</small></span></button><select class="task-status-select" :value="t.status" :aria-label="'修改任務狀態：'+t.title" :disabled="busy" @change="setTaskStatus(t,$event)"><option :value="t.status">{{statusLabel(t)}}</option><option v-if="t.status!=='completed'" value="completed">標記完成</option><option v-if="t.status!=='paused'" value="paused">暫停任務</option><option v-if="t.status!=='cancelled'" value="cancelled">取消任務</option><option v-if="['completed','cancelled','paused','failed','waiting_input'].includes(t.status)" value="reopen">恢復處理</option></select><div class="progress-cell"><small>{{t.totalSteps?`${t.completedSteps} / ${t.totalSteps} 步驟`:'尚待規劃'}}</small><div class="progress-track"><i :style="{width:percent(t)+'%'}"/></div></div><select :value="t.priority" aria-label="任務優先級" @change="setPriority(t,$event)"><option v-for="(p,i) in priorities" :key="i" :value="i">{{p}}</option></select><div class="row-actions"><button class="icon-button" title="向前排序" @click="reorder(t,-1)"><ArrowUp :size="16"/></button><button class="icon-button" title="向後排序" @click="reorder(t,1)"><ArrowDown :size="16"/></button></div></div></section>
+        <TaskQueueToolbar
+          :filter="filter"
+          :query="query"
+          :tasks="store.tasks"
+          :all-expanded="allExpanded"
+          @update:filter="filter=$event"
+          @update:query="query=$event"
+          @toggle-all="toggleAllGroups"
+        />
+        <div class="queue-note"><GripVertical :size="16"/>任務依方案群組；拖曳可調整同優先級的派工順序，正在執行的工作不會被中斷。</div>
+        <section v-if="!queueView.groups.length" class="panel empty">
+          <div class="empty-icon"><ListTodo :size="30"/></div>
+          <h3>{{store.tasks.length?'沒有符合條件的任務':'任務佇列還是空的'}}</h3>
+          <p>{{store.tasks.length?'換個篩選條件或清除搜尋，就能看到其他方案。':'發布任務後，可以在這裡安排順序和追蹤進展。'}}</p>
+        </section>
+        <div v-else class="plan-group-list">
+          <TaskPlanGroup
+            v-for="group in queueView.groups"
+            :key="group.id"
+            :group="group"
+            :expanded="groupExpanded(group)"
+            @toggle="toggleGroup(group)"
+          >
+            <div class="task-table-head"><span>任務 / 專案</span><span>狀態</span><span>子任務進度</span><span>優先級</span><span>排序</span></div>
+            <TaskQueueItem
+              v-for="t in group.tasks"
+              :key="t.id"
+              :task="t"
+              :busy="busy"
+              :status-label="statusLabel(t)"
+              :priorities="priorities"
+              :dragging="dragging===t.id"
+              @open="openTask(t)"
+              @status="setTaskStatus(t,$event)"
+              @priority="setPriority(t,$event)"
+              @reorder="reorder(t,$event)"
+              @dragstart="dragging=t.id"
+              @drop="drop(t)"
+            />
+          </TaskPlanGroup>
+        </div>
       </template>
       <template v-else-if="route.path==='/threads'">
         <div class="notice"><GitBranch :size="18"/>各角色保有獨立的工作紀錄；第一版依任務優先序逐一執行，避免共用檔案互相覆寫。</div><section v-if="!activeThreads.length" class="panel empty"><GitBranch :size="32"/><h3>尚未建立工作階段</h3><p>啟用 AI 服務並發布任務後，角色會出現在這裡。</p></section><div class="thread-grid"><button v-for="th in [...activeThreads].reverse()" :key="th.id" class="thread-card" @click="openTask(th.task);tab='technical'"><div class="thread-card-top"><span class="engine-mark">{{th.engine==='codex'?'C':'A'}}</span><span class="badge" :class="th.displayStatus||th.status">{{th.statusLabel||statuses[th.status]||th.status}}</span></div><h3>{{th.role}}</h3><p>{{th.task.title}}</p><div class="thread-meta"><span>{{th.engine==='codex'?'Codex':'Claude Code'}}</span><span><Clock3 :size="14"/>{{duration(th)}}</span></div><div class="thread-summary">{{th.summary||th.error||'等待引擎回傳工作結果'}}</div></button></div>
       </template>
       <template v-else-if="route.path==='/settings'">
-        <div class="settings-grid"><SystemHealth/><section v-if="store.user.role==='admin'" class="panel settings-card"><h2><Workflow :size="20"/>首次設定精靈</h2><p>四個步驟帶你完成系統檢查、專案存放位置、AI 模式，並建立第一個任務。已經設定過也可以再看一次；重新開啟不會改動任何既有設定。</p><button class="secondary" @click="wizardOpen=true">開啟設定精靈 <ArrowUpRight :size="16"/></button><p class="subtle">{{store.onboarding?.completed?'這個工作空間已完成首次設定。':'尚未完成首次設定。'}}</p></section><section class="panel settings-card"><h2><Radio :size="20"/>執行服務</h2><p>開啟後，平台會使用本機 CLI 登入，依設定上限規劃並執行已核准的工作。首次使用前請確認兩個引擎已登入。</p><div class="setting-row"><span>AI 自動領取任務<small>同時執行上限：{{store.runner.maxConcurrent}}</small></span><button v-if="store.user.role==='admin'" class="toggle" :class="{on:store.runner.enabled}" :aria-pressed="store.runner.enabled" aria-label="AI 自動領取任務" @click="run(()=>api('/admin/runner',{enabled:!store.runner.enabled}))"><i/></button><span v-else>{{store.runner.enabled?'已啟用':'已暫停'}}</span></div><p class="subtle">關閉會停止後續派工；目前的工作仍會完成。</p><form v-if="store.user.role==='admin'" @submit.prevent="run(async()=>{await api('/admin/runner',{maxConcurrent:concurrencyInput});concurrencyDraft=null;notify('同時執行上限已儲存');})"><label for="runner-concurrency">同時執行上限（1–32 個任務）</label><div class="setting-row"><input id="runner-concurrency" v-model.number="concurrencyInput" type="number" min="1" max="32" step="1" required style="width:100px"/><button class="secondary" :disabled="busy||!validConcurrency||concurrencyInput===store.runner.maxConcurrent">儲存</button></div></form><p class="subtle">目前執行 {{store.runner.activeCount}} 個任務。調低上限不會中斷既有工作；不同任務可並行，同一任務的步驟依序執行。</p></section><LineLinks/><NotificationManager v-if="store.user.role==='admin'"/>
-        <section v-if="store.user.role==='admin'" class="panel settings-card wide"><h2><Folder :size="20"/>預設專案存放位置</h2><p>從 LINE 建立專案時，會以專案名稱在此位置建立資料夾。只有管理者可以建立；同名資料夾不會覆蓋。</p><form class="inline-form" @submit.prevent="run(async()=>{const result=await api('/admin/project-root',{path:projectRootInput});projectRootDraft=result.path;notify('預設專案存放位置已儲存');})"><label class="grow">本機存放位置<div class="project-directory-field"><input v-model="projectRootInput" placeholder="請選擇預設存放資料夾" readonly required @click="directoryPickerTarget='root'"><button type="button" class="secondary" @click="directoryPickerTarget='root'"><Folder :size="16"/>選擇資料夾</button></div></label><button class="secondary" :disabled="busy">儲存位置</button></form><p class="subtle">{{store.defaultProjectRoot?'目前位置：'+store.defaultProjectRoot:'尚未設定，設定後即可在 LINE 點選「建立專案」。'}} 可在選擇視窗內瀏覽或建立資料夾，選取後按「儲存位置」套用。電腦關機時，LINE 請求會在本機重新上線後處理。</p></section>
-        <section class="panel settings-card wide"><h2><Folder :size="20"/>可用專案</h2><p>只有管理者能指定或建立本機資料夾。AI 使用獨立工作副本，不直接修改原專案。</p><div v-for="p in store.projects" :key="p.id" class="project-row"><Folder :size="19"/><div class="grow"><strong>{{p.name}} <code>{{p.code}}</code></strong><small>{{p.path||'已授權使用'}}</small></div><ProjectRemoval v-if="store.user.role==='admin'" :project="p" @removed="projectRemoved"/><ProjectActions :project="p"/></div><p v-if="!store.projects.length" class="muted">尚無可用專案。</p><form v-if="store.user.role==='admin'" class="inline-form" @submit.prevent="run(async()=>{const result=await api('/admin/projects',projectForm);Object.assign(projectForm,{name:'',code:'',path:'',createIfMissing:true});notify(result.directoryCreated?'資料夾已建立，專案已新增':'專案已新增，使用既有資料夾');})"><label>專案名稱<input v-model="projectForm.name" placeholder="例如：產品官網" required></label><label>專案代號<input v-model="projectForm.code" placeholder="website" pattern="[a-zA-Z0-9_-]{2,32}" required></label><label class="grow">本機資料夾<div class="project-directory-field"><input v-model="projectForm.path" placeholder="請選擇專案資料夾" readonly required @click="directoryPickerTarget='project'"><button type="button" class="secondary" @click="directoryPickerTarget='project'"><Folder :size="16"/>選擇資料夾</button></div></label><button class="secondary" :disabled="busy">新增專案</button><div class="project-create-option"><small>從預設位置瀏覽，也可在選擇視窗內建立新資料夾。選取後按「新增專案」完成登錄。</small></div></form></section>
-        <section v-if="store.user.role==='admin'" class="panel settings-card wide"><h2><Users :size="20"/>成員與專案授權</h2><div v-for="u in users" :key="u.id" class="member-row"><span class="avatar">{{u.name.slice(0,1)}}</span><div><strong>{{u.name}}</strong><small>{{u.username}} · {{u.role==='admin'?'管理者':'成員'}}</small></div><div v-if="u.role!=='admin'" class="member-projects"><label v-for="p in store.projects" :key="p.id"><input v-model="u.projectIds" type="checkbox" :value="p.id" @change="run(()=>api(`/admin/users/${u.id}/projects`,{projectIds:u.projectIds}))">{{p.name}}</label></div></div><form class="inline-form" @submit.prevent="run(async()=>{await api('/admin/users',memberForm);users=await api('/admin/users');Object.assign(memberForm,{name:'',username:'',password:'',projectIds:[]});notify('成員已建立；請在上方分配專案');})"><label>姓名<input v-model="memberForm.name" required></label><label>帳號<input v-model="memberForm.username" pattern="[a-zA-Z0-9_-]{3,40}" required></label><label>初始密碼<input v-model="memberForm.password" type="password" minlength="12" autocomplete="new-password" placeholder="至少 12 字元" required></label><button class="secondary">新增成員</button></form></section>
-        <section class="panel settings-card"><h2><ShieldCheck :size="20"/>變更密碼</h2><form @submit.prevent="run(async()=>{await api('/account/password',passwordForm);passwordForm.current='';passwordForm.password='';notify('密碼已更新');})"><label>目前密碼<input v-model="passwordForm.current" type="password" autocomplete="current-password" required></label><label>新密碼<input v-model="passwordForm.password" type="password" autocomplete="new-password" minlength="12" placeholder="至少 12 字元" required></label><button class="secondary">更新密碼</button></form></section><section class="panel settings-card"><h2><ShieldCheck :size="20"/>執行邊界</h2><ul class="boundaries"><li>每份計畫需由任務擁有者或管理者核准。</li><li>修改需求後，舊版核准失效。</li><li>每輪修正需先審核方案，單次執行最多 30 分鐘。</li><li>發布核准會記錄成果版本，對外發布仍需人工執行。</li><li>此版本僅供可信任成員與專案使用；工作副本不等於作業系統沙箱。</li></ul></section></div>
+        <SettingsPage
+          :busy="busy"
+          :users="users"
+          :run="run"
+          :notify="notify"
+          @open-wizard="wizardOpen=true"
+          @project-removed="projectRemoved"
+          @reload-users="run(async()=>{users=await api('/admin/users');})"
+        />
       </template>
       <footer class="page-footer"><span>TaskFlow / 本地優先，進度透明</span><span>每 3 秒同步 · {{store.projects.length}} 個專案</span></footer>
     </main></div>
   </div>
-  <div v-if="showNew" class="modal-backdrop" @click.self="showNew=false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="create-title"><header><div><span class="eyebrow">NEW TASK</span><h2 id="create-title">你想完成什麼？</h2></div><button class="icon-button" title="關閉" @click="showNew=false"><X/></button></header><form @submit.prevent="create"><label>任務標題<input v-model="newTask.title" placeholder="用一句話描述預期成果" minlength="2" maxlength="140" required autofocus></label><div class="form-grid"><label>所屬專案<select v-model="newTask.projectId" required><option v-if="store.user.role==='admin'" value="__new__">依任務標題建立新專案（預設）</option><option disabled value="">選擇專案</option><option v-for="p in store.projects" :key="p.id" :value="p.id">{{p.name}}</option></select></label><label>任務類型<select v-model="newTask.type"><option value="code">程式開發</option><option value="research">研究與文件</option></select></label></div><p v-if="newTask.projectId==='__new__'" class="subtle">送出時在 {{store.defaultProjectRoot||'尚未設定的預設位置'}} 建立新專案。名稱使用任務標題；特殊字元會轉換，同名時加上編號。</p><label>需求與驗收期待<textarea v-model="newTask.description" rows="5" minlength="5" maxlength="16000" placeholder="描述背景、需要完成的事情、限制與如何確認成功。也可以貼上參考連結。" required/></label><div class="ai-mode"><span class="field-label">AI 模式</span><div class="choice-row"><label v-for="mode in AI_MODES" :key="mode.value" class="choice"><input v-model="newTask.aiMode" type="radio" name="ai-mode" :value="mode.value">{{mode.label}}</label></div><p class="subtle">{{newTask.aiMode===AUTO?`TaskFlow 會依任務類型自動安排規劃、執行與驗證模型：${suggestedEngines}`:`此類型的建議安排：${suggestedEngines}。可在下方進階設定調整。`}}</p></div>
+  <div v-if="showNew" class="modal-backdrop" @click.self="showNew=false"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="create-title"><header><div><span class="eyebrow">NEW TASK</span><h2 id="create-title">你想完成什麼？</h2></div><button class="icon-button" title="關閉" @click="showNew=false"><X/></button></header><form @submit.prevent="create"><label>任務標題<input v-model="newTask.title" placeholder="用一句話描述預期成果" minlength="2" maxlength="140" required autofocus></label><div class="form-grid"><label>所屬專案<select v-model="newTask.projectId" required><option v-if="store.user.role==='admin'" value="__new__">依任務標題建立新專案（預設）</option><option disabled value="">選擇專案</option><option v-for="p in store.projects" :key="p.id" :value="p.id">{{p.name}}</option></select></label><label>任務類型<select v-model="newTask.type"><option value="code">程式開發</option><option value="research">研究與文件</option></select></label></div><p v-if="newTask.projectId==='__new__'" class="subtle">送出時在 {{store.defaultProjectRoot||'尚未設定的預設位置'}} 建立新專案。名稱使用任務標題；特殊字元會轉換，同名時加上編號。</p>
+      <!-- 方案：任務佇列的分組依據。不填就是獨立任務，TaskFlow 不會依標題把它塞進任何方案。 -->
+      <label>方案（選填）<select v-model="newTask.planGroupChoice"><option value="">獨立任務，不歸入方案</option><option v-for="g in projectPlanGroups" :key="g.id" :value="g.id">{{g.name}}</option><option value="__new__">建立新方案…</option></select></label>
+      <label v-if="newTask.planGroupChoice==='__new__'">新方案名稱<input v-model="newTask.planGroupName" placeholder="例如：結帳流程改版" minlength="2" maxlength="80" required></label>
+      <p v-if="newTask.planGroupChoice" class="subtle">同一個方案的任務會在任務佇列裡收在一起，方案的完成度由這些任務的真實狀態算出來。</p><label>需求與驗收期待<textarea v-model="newTask.description" rows="5" minlength="5" maxlength="16000" placeholder="描述背景、需要完成的事情、限制與如何確認成功。也可以貼上參考連結。" required/></label><div class="ai-mode"><span class="field-label">AI 模式</span><div class="choice-row"><label v-for="mode in AI_MODES" :key="mode.value" class="choice"><input v-model="newTask.aiMode" type="radio" name="ai-mode" :value="mode.value">{{mode.label}}</label></div><p class="subtle">{{newTask.aiMode===AUTO?`TaskFlow 會依任務類型自動安排規劃、執行與驗證模型：${suggestedEngines}`:`此類型的建議安排：${suggestedEngines}。可在下方進階設定調整。`}}</p></div>
       <button type="button" class="advanced-toggle" :aria-expanded="showAdvanced" @click="showAdvanced=!showAdvanced"><ChevronRight :size="16" :class="{open:showAdvanced}"/>進階設定</button>
       <div v-if="showAdvanced" class="form-grid advanced-panel"><label>優先級<select v-model="newTask.priority"><option v-for="(p,i) in priorities" :key="i" :value="i">{{p}}</option></select></label><template v-if="newTask.aiMode===CUSTOM"><label>規劃<select v-model="newTask.planner"><option value="claude">Claude Code</option><option value="codex">Codex</option></select></label><label>執行<select v-model="newTask.executor"><option value="codex">Codex</option><option value="claude">Claude Code</option></select></label><label>驗證<select v-model="newTask.reviewer"><option value="claude">Claude Code</option><option value="codex">Codex</option></select></label></template></div><div class="notice"><ShieldCheck :size="18"/>AI 先整理計畫，經你核准後才執行。</div><div class="modal-actions"><button type="button" class="secondary" @click="showNew=false">取消</button><button class="primary" :disabled="busy||(!newTask.projectId)||(newTask.projectId==='__new__'&&!store.defaultProjectRoot)"><Plus :size="17"/>發布任務</button></div><p v-if="!store.projects.length&&store.user.role!=='admin'" class="error-text">請先在設定中新增或取得專案授權。</p></form></section></div>
   <!-- Task Detail：資訊分層為「概覽 / 執行進度 / 成果 / 技術資訊」。

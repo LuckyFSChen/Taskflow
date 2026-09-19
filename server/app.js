@@ -16,6 +16,8 @@ import {manualActionRequest,decideManualAction} from './manual-action.js';
 import { prepareProjectDirectory } from './project-directory.js';
 import {browseDirectory,createDirectory,availableDrives} from './directory-browser.js';
 import {createTaskWithProject} from './task-project.js';
+// 方案群組：任務佇列的分組依據。只認明確的 planGroupId，不做任何字串推測。
+import {createPlanGroup,renamePlanGroup,assignTaskPlanGroup,planGroupsPublic} from './plan-group.js';
 import {changeTaskStatus,taskDisplayStatus} from './task-status.js';
 import {gitIssueRequest,decideGitIssue,gitIssuePending,closePendingRequestsOnCancel} from './git-issue.js';
 import {createProjectPreview,detectWebProject,openFolder} from './project-preview.js';
@@ -140,10 +142,13 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     // repositoryPath／workingDirectory 是伺服器磁碟路徑，和 workspace 一樣不送到瀏覽器；
     // 只送使用者真正需要判讀的 Git 座標：從哪個分支開出、目前在哪個分支、哪兩個 commit。
     git:t.git?{mode:t.git.mode,baseBranch:t.git.baseBranch,workingBranch:t.git.workingBranch,baseCommit:t.git.baseCommit,headCommit:t.git.headCommit}:t.git,
+    // 方案群組只送 id 與名稱；群組的完成度／狀態一律由前端依真實 task state 聚合，
+    // 後端不預先算任何進度數字，也不會在這裡幫沒有 planGroupId 的舊任務「猜」一個群組。
+    planGroupId:t.planGroupId||null,planGroupName:t.planGroupId?store.planGroup(t.planGroupId)?.name||null:null,
     workspace:undefined,threads,ownerName:store.user(t.ownerId)?.name,projectName:store.project(t.projectId)?.name,completedSteps:threads.filter(th=>th.phase==='execute'&&th.status==='completed'&&th.result?.passed&&!th.result.questions?.length).length,totalSteps:t.plan?.steps.length||0};}
   app.get('/api/state',async(req,res)=>{
     const browser=await checkClaudeBrowserCapability().catch(error=>({available:false,provider:null,cli:'claude',error:error.message}));
-    res.json({user:req.user,onboarding:onboardingStatus(store,req.user),defaultProjectRoot:req.user.role==='admin'?store.setting('defaultProjectRoot',''):undefined,projects:visibleProjects(req.user),tasks:store.tasks(req.user).map(decorated),runner:{enabled:store.setting('runnerEnabled',false),...runner.status,maxConcurrent:runnerLimit(store),activeTaskIds:(runner.status.activeTaskIds||[]).filter(id=>store.tasks(req.user).some(t=>t.id===id)),activeTaskId:store.tasks(req.user).some(t=>t.id===runner.status.activeTaskId)?runner.status.activeTaskId:null},integrations:{lineConfigured:!!(process.env.INBOX_URL&&process.env.INBOX_TOKEN),lastSync:store.setting('inboxLastSuccess'),error:store.setting('inboxError'),notificationError:store.db.prepare("SELECT error FROM outbox WHERE sent=0 AND cancelled_at IS NULL AND error IS NOT NULL ORDER BY rowid DESC LIMIT 1").get()?.error||null,pendingNotifications:store.db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent=0 AND cancelled_at IS NULL').get().n,browser:{configured:!!browser.available,provider:browser.provider,available:browser.available,error:browser.error}}});
+    res.json({user:req.user,onboarding:onboardingStatus(store,req.user),defaultProjectRoot:req.user.role==='admin'?store.setting('defaultProjectRoot',''):undefined,projects:visibleProjects(req.user),planGroups:planGroupsPublic(store,req.user),tasks:store.tasks(req.user).map(decorated),runner:{enabled:store.setting('runnerEnabled',false),...runner.status,maxConcurrent:runnerLimit(store),activeTaskIds:(runner.status.activeTaskIds||[]).filter(id=>store.tasks(req.user).some(t=>t.id===id)),activeTaskId:store.tasks(req.user).some(t=>t.id===runner.status.activeTaskId)?runner.status.activeTaskId:null},integrations:{lineConfigured:!!(process.env.INBOX_URL&&process.env.INBOX_TOKEN),lastSync:store.setting('inboxLastSuccess'),error:store.setting('inboxError'),notificationError:store.db.prepare("SELECT error FROM outbox WHERE sent=0 AND cancelled_at IS NULL AND error IS NOT NULL ORDER BY rowid DESC LIMIT 1").get()?.error||null,pendingNotifications:store.db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE sent=0 AND cancelled_at IS NULL').get().n,browser:{configured:!!browser.available,provider:browser.provider,available:browser.available,error:browser.error}}});
   });
   // Read-only environment report every signed-in member can see: the dashboard warning
   // and 平台設定 both read it. ?refresh=1 is a manual re-check, still rate limited inside
@@ -156,6 +161,12 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
     res.json(completeOnboarding(store,req.user));
   });
   app.post('/api/tasks',(req,res)=>res.status(201).json(decorated(store.transaction(()=>createTaskWithProject(store,req.user,req.body)))));
+  // 方案群組。三條路徑都只改分組座標，不碰任務的執行狀態、計畫版本或任何核准紀錄。
+  app.post('/api/plan-groups',(req,res)=>res.status(201).json(store.transaction(()=>createPlanGroup(store,req.user,req.body))));
+  app.post('/api/plan-groups/:id/rename',(req,res)=>res.json(renamePlanGroup(store,req.user,req.params.id,req.body)));
+  // 把既有任務（含沒有方案的舊任務）歸入方案，或移出成為獨立任務。
+  // 這是使用者明確按下的動作：TaskFlow 不會自己依標題或專案把舊任務合併進任何方案。
+  app.post('/api/tasks/:id/plan-group',(req,res)=>res.json(decorated(store.transaction(()=>assignTaskPlanGroup(store,req.user,req.params.id,req.body)))));
   app.get('/api/tasks/:id',(req,res)=>{const t=requireTask(store,req.user,req.params.id);res.json({...decorated(t),events:store.events(t.id)});});
   app.post('/api/tasks/:id/preflight/retry',(req,res)=>{const t=requireTask(store,req.user,req.params.id);if(!t.environmentIssue||t.environmentIssue.id!==req.body.issueId||t.environmentIssue.planVersion!==t.planVersion||t.status!=='waiting_input')throw new HttpError(409,'環境問題已變更，請重新查看');t.environmentIssue=null;t.dependencyPreflight=null;t.error=null;t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'awaiting_approval';t.controlVersion=(t.controlVersion||0)+1;store.saveTask(t);store.event(t.id,'preflight_approved',`${req.user.name} 核准重新檢查套件環境；通過前不執行工作`);res.json(decorated(t));});
   // Git 安全守門（未提交修改、受保護分支、巢狀版本庫…）的三個人工出路。沿用既有的
