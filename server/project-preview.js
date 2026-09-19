@@ -1,7 +1,7 @@
 import express from 'express';
 import {spawn} from 'node:child_process';
 import {createServer as createNetProbe} from 'node:net';
-import {existsSync,readFileSync,realpathSync,statSync} from 'node:fs';
+import {existsSync,readdirSync,readFileSync,realpathSync,statSync} from 'node:fs';
 import {dirname,join,resolve,relative,isAbsolute,extname} from 'node:path';
 import {HttpError} from './domain.js';
 import {killTree} from './runner.js';
@@ -22,7 +22,7 @@ function resolveFullstackEntry(path,pkg) {
   if(serverFile&&!isAbsolute(serverFile)&&!serverFile.split('/').includes('..')&&existsSync(join(path,serverFile))&&KNOWN_SERVER_DEPS.some(dep=>deps[dep]))return serverFile;
   return null;
 }
-export function detectWebProject(path) {
+function detectWebProjectHere(path) {
   let pkg;
   try {pkg=JSON.parse(readFileSync(join(path,'package.json'),'utf8'));}
   catch {return existsSync(join(path,'index.html'))?'static':null;}
@@ -31,6 +31,38 @@ export function detectWebProject(path) {
   if(hasViteBuild&&resolveFullstackEntry(path,pkg))return 'fullstack';
   if(hasViteBuild)return 'vite';
   return null;
+}
+// 專案的網頁不一定在版本庫根目錄。monorepo 常見的形狀是根目錄放部署層或 workspace 設定，
+// 實際的前端在 frontend/、web/、client/ 這類子目錄；只看根目錄的話這種專案完全拿不到 Preview，
+// Browser Validation 也就永遠沒有可用的網址。
+//
+// 只往下找一層，而且不猜：根目錄本身是網頁專案就用根目錄；否則掃描第一層子目錄，剛好只有一個
+// 子目錄是網頁專案時才採用它。多於一個時，只有在其中恰好一個命中慣用名稱時才採用——否則寧可
+// 回報「找不到」，也不要挑錯一個目錄拿去預覽或驗收。
+const NESTED_SKIP=new Set(['node_modules','dist','build','out','coverage','tmp','temp','vendor','public','assets','docs','test','tests','__tests__','scripts','migrations']);
+const NESTED_CONVENTIONAL=['frontend','web','client','app','ui','site','www'];
+export function resolveWebRoot(path) {
+  const here=detectWebProjectHere(path);
+  if(here)return {root:path,kind:here};
+  let entries;
+  try {entries=readdirSync(path,{withFileTypes:true});}
+  catch {return null;}
+  const candidates=[];
+  for(const entry of entries){
+    if(!entry.isDirectory()||entry.name.startsWith('.')||NESTED_SKIP.has(entry.name))continue;
+    const child=join(path,entry.name);
+    const kind=detectWebProjectHere(child);
+    if(kind)candidates.push({root:child,kind,name:entry.name});
+  }
+  if(candidates.length===1)return {root:candidates[0].root,kind:candidates[0].kind};
+  if(candidates.length>1){
+    const preferred=candidates.filter(candidate=>NESTED_CONVENTIONAL.includes(candidate.name));
+    if(preferred.length===1)return {root:preferred[0].root,kind:preferred[0].kind};
+  }
+  return null;
+}
+export function detectWebProject(path) {
+  return resolveWebRoot(path)?.kind||null;
 }
 export function openFolder(path,{launch=spawn}={}) {
   if(!existsSync(path)||!statSync(path).isDirectory())throw new HttpError(404,'資料夾不存在');
@@ -150,17 +182,18 @@ export function createProjectPreview({npm=runNpm,registryPath=resolve('data/prev
     if(running.has(key))return running.get(key).info;
     if(pending.has(key))return pending.get(key);
     const job=(async()=>{
-      const kind=detectWebProject(path);
-      if(!kind)throw new HttpError(422,'目前支援 Vue／Vite 專案與純 HTML 網頁；此資料夾尚未找到可預覽的網頁。');
+      const resolved=resolveWebRoot(path);
+      if(!resolved)throw new HttpError(422,'目前支援 Vue／Vite 專案與純 HTML 網頁；此資料夾與其第一層子目錄都沒有找到可預覽的網頁。');
+      const {root:projectRoot,kind}=resolved;
       if(kind==='fullstack'){
-        const pkg=JSON.parse(readFileSync(join(path,'package.json'),'utf8'));
-        return await startFullstack(key,path,pkg);
+        const pkg=JSON.parse(readFileSync(join(projectRoot,'package.json'),'utf8'));
+        return await startFullstack(key,projectRoot,pkg);
       }
-      let root=path;
+      let root=projectRoot;
       if(kind==='vite'){
-        if(!existsSync(join(path,'node_modules')))await npm(path,['install']);
-        await npm(path,['run','build']);
-        root=join(path,'dist');
+        if(!existsSync(join(projectRoot,'node_modules')))await npm(projectRoot,['install']);
+        await npm(projectRoot,['run','build']);
+        root=join(projectRoot,'dist');
       }
       if(!existsSync(join(root,'index.html')))throw new HttpError(422,'找不到網頁入口 dist/index.html，請確認建置輸出設定。');
       root=realpathSync(root);

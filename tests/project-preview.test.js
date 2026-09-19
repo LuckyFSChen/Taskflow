@@ -4,7 +4,7 @@ import {mkdtempSync,writeFileSync,mkdirSync,rmSync,existsSync,readFileSync} from
 import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {get} from 'node:http';
-import {createProjectPreview} from '../server/project-preview.js';
+import {createProjectPreview,detectWebProject,resolveWebRoot} from '../server/project-preview.js';
 import {createStore,id} from '../server/db.js';
 import {createApp} from '../server/app.js';
 
@@ -203,3 +203,68 @@ test('Fullstack preview health check timeout rejects and kills the child instead
   assert.equal(preview.status(key),null);
 });
 
+
+// ---- monorepo：網頁不在版本庫根目錄 -----------------------------------------
+// 真實案例：idv-web 的根目錄是 Cloudflare 部署層的 wrapper（沒有 vite、沒有 index.html），
+// 實際前端在 frontend/。只看根目錄的話整個專案永遠拿不到 Preview，部署驗收也永遠停在
+// 「此資料夾尚未找到可預覽的網頁」。
+
+function monorepo(t,layout){
+ const root=mkdtempSync(join(tmpdir(),'tf-monorepo-'));
+ t.after(()=>rmSync(root,{recursive:true,force:true}));
+ for(const [rel,content] of Object.entries(layout)){
+  const target=join(root,rel);
+  mkdirSync(join(target,'..'),{recursive:true});
+  writeFileSync(target,typeof content==='string'?content:JSON.stringify(content));
+ }
+ return root;
+}
+const vitePkg={name:'web',dependencies:{vite:'^6.0.0'},scripts:{build:'vite build'}};
+
+test('A monorepo whose web app lives in a subdirectory is found, not reported as unsupported',t=>{
+ const root=monorepo(t,{
+  'package.json':{name:'deploy-wrapper',scripts:{build:'npm --prefix frontend run build'}},
+  'frontend/package.json':vitePkg,
+  'backend/package.json':{name:'api',dependencies:{express:'^5.0.0'}},
+ });
+ assert.equal(detectWebProject(root),'vite');
+ assert.equal(resolveWebRoot(root).root,join(root,'frontend'));
+});
+
+test('The repository root still wins when it is itself a web project',t=>{
+ const root=monorepo(t,{'package.json':vitePkg,'frontend/package.json':vitePkg});
+ assert.deepEqual(resolveWebRoot(root),{root,kind:'vite'});
+});
+
+test('Two equally plausible subdirectories are reported as not found rather than guessed',t=>{
+ const root=monorepo(t,{
+  'package.json':{name:'wrapper'},
+  'admin-portal/package.json':vitePkg,
+  'storefront/package.json':vitePkg,
+ });
+ assert.equal(detectWebProject(root),null,'picking one of two arbitrary candidates would preview the wrong thing');
+});
+
+test('A conventional name breaks the tie when several subdirectories qualify',t=>{
+ const root=monorepo(t,{
+  'package.json':{name:'wrapper'},
+  'frontend/package.json':vitePkg,
+  'legacy-portal/package.json':vitePkg,
+ });
+ assert.equal(resolveWebRoot(root).root,join(root,'frontend'));
+});
+
+test('Build output and dependencies are never mistaken for the web app',t=>{
+ const root=monorepo(t,{
+  'package.json':{name:'wrapper'},
+  'dist/index.html':'<!doctype html>',
+  'node_modules/something/index.html':'<!doctype html>',
+  'frontend/package.json':vitePkg,
+ });
+ assert.equal(resolveWebRoot(root).root,join(root,'frontend'));
+});
+
+test('A project with no web app anywhere is still reported as not found',t=>{
+ const root=monorepo(t,{'package.json':{name:'cli-only'},'src/index.ts':'export {}'});
+ assert.equal(detectWebProject(root),null);
+});
