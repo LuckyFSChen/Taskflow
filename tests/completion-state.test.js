@@ -185,15 +185,24 @@ test('驗收：blockingReasons／warnings／evidence／nextAction 皆為可直�
   }
 });
 
-test('驗收：舊任務資料完全沒有 git/completionTest/completionValidation 等欄位時不拋例外，且不被誤判為 completed 或 failed', () => {
+test('驗收：完全沒有 executorResult 的舊任務資料不拋例外，且不被誤判為 completed 或 failed（沒有 claim 可核對）', () => {
+  const result = reconcileCompletionState({});
   assert.doesNotThrow(() => reconcileCompletionState({}));
-  const result = reconcileCompletionState({
-    executorResult: { passed: true, questions: [], evidence: ['舊任務的既有成果'], summary: '舊任務' },
-  });
   assert.ok(COMPLETION_STATUSES.includes(result.status));
   assert.notEqual(result.status, 'completed');
   assert.notEqual(result.status, 'failed');
   assert.equal(result.passed, false);
+});
+
+test('驗收：舊任務資料缺 git/completionTest/completionValidation/completion 等欄位，但有完整有效的 claim 時，缺席類別只計入 warnings（不適用），不擋住 completed；不因此拋例外或誤判為 failed', () => {
+  const result = reconcileCompletionState({
+    executorResult: { passed: true, questions: [], evidence: ['舊任務的既有成果'], summary: '舊任務' },
+  });
+  assert.ok(COMPLETION_STATUSES.includes(result.status));
+  assert.notEqual(result.status, 'failed');
+  assert.equal(result.status, 'completed');
+  assert.equal(result.passed, true);
+  assert.equal(result.blockingReasons.length, 0);
   assert.ok(result.warnings.length > 0, '缺席的證據類別應計入 warnings，標示為不適用／尚未執行');
 });
 

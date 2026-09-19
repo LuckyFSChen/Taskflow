@@ -17,6 +17,7 @@ import {detectWebProject,createProjectPreview} from './project-preview.js';
 import {createGitWorkspace,DEFAULT_PROTECTED_BRANCHES} from './git-workspace.js';
 import {gitIssuePending} from './git-issue.js';
 import {deriveBrowserValidationRequirement,checkClaudeBrowserCapability,browserMcpServerSpec,browserMcpConfig,browserAllowedTools,isBrowserToolName,categorizeBrowserTool,reconcileBrowserValidation,defaultBrowserValidation} from './browser-capability.js';
+import {reconcileCompletionState} from './completion-state.js';
 
 const blocked=name=> /^(node_modules|\.git|\.env(?:\..*)?|data|dist|build|\.venv|venv|\.ssh|\.aws|\.codex|\.claude|\.taskflow|first-login\.txt)$/i.test(name)||/\.(pem|key|pfx|sqlite(?:-wal|-shm)?)$/i.test(name);
 export function snapshot(source,dest,{excludePaths=[]}={}) {
@@ -103,6 +104,28 @@ export function applyResultGuards(result,{phase,browserEvidence,browserRequireme
   return result;
 }
 
+// review 階段要不要把 task.status 標成 'completed'，不再只看這一次結果自己宣稱的
+// passed/evidence/questions，而是連同目前已經存在的 Git／測試比對／部署管線／部署驗收
+// 等 deterministic 證據，一起交給 reconcileCompletionState 重新核算。這裡不做任何 I/O，
+// 只是把 runner 已經握有的欄位（t.git、t.gitMerge、t.gitConflict、t.completionTest……）
+// 組成 context；部署管線與部署驗收在 review 通過前通常還沒開始，缺席會被
+// reconcileCompletionState 視為「不適用」，不會因此擋住審核，也不會被當成通過。
+function reviewCompletionContext(t,thread,result){
+  return {
+    executorResult:{passed:result.passed,questions:result.questions,evidence:result.evidence,summary:result.summary},
+    git:{headCommit:t.git?.headCommit||null,gitMerge:t.gitMerge||null,gitConflict:t.gitConflict||null},
+    tests:{completionTest:t.completionTest||null,completionMainTest:t.completionMainTest||null},
+    deployment:t.completion||null,
+    runtime:{completionValidation:t.completionValidation||null},
+    browserValidation:result.browserValidation||null,
+    pendingActions:{
+      gitIssue:gitIssuePending(t),
+      userActionRequired:t.userActionRequired?.status==='pending',
+      outputIssue:!!t.outputIssue,
+    },
+  };
+}
+
 // 一個階段的結果決定任務下一步。Output Recovery 也走這裡，確保「依原本流程繼續
 // 下一個安全階段」不是另寫一套判斷：passed=false 永遠不會變成 completed，
 // review 未通過仍然進入既有的 Validation／Repair 流程。
@@ -119,11 +142,13 @@ export function applyPhaseResult(store,t,thread,phase,result,{wasPaused=false}={
   }
   else if(phase==='review'){
     t.validationReviewPending=false;
+    const reconciled=reconcileCompletionState(reviewCompletionContext(t,thread,result));
     // 成果版本同時記下對應的 commit：之後要查「這次核准的是哪一份程式碼」看 Git 就夠了，
-    // 不需要再回頭找某個 vN 資料夾。
-    if(result.passed&&result.evidence.length&&!result.questions.length){t.status='completed';t.artifactVersion=id();t.artifactCommit=t.git?.headCommit||null;store.notify(t,t.validationSkips?.some(s=>s.planVersion===t.planVersion)?'其餘驗證完成；部分工具受限項目經同意跳過，仍標示未驗證。可於網頁查看成果。':'驗證完成，可於網頁查看成果。');}
+    // 不需要再回頭找某個 vN 資料夾。completed 必須由 reconcileCompletionState 核算後才成立，
+    // 不再只看這一次結果自己宣稱的 passed/evidence/questions。
+    if(reconciled.passed&&reconciled.status==='completed'){t.status='completed';t.artifactVersion=id();t.artifactCommit=t.git?.headCommit||null;store.notify(t,t.validationSkips?.some(s=>s.planVersion===t.planVersion)?'其餘驗證完成；部分工具受限項目經同意跳過，仍標示未驗證。可於網頁查看成果。':'驗證完成，可於網頁查看成果。');}
     else if(toolAccessFailure(result)){t.validationFailure={...result,threadId:thread.id,at:now()};t.questions=[];t.status='waiting_input';store.notify(t,'驗證工具存取失敗，請查看任務選擇「跳過受限驗證並繼續」或「不跳過，等待處理」。');}
-    else {t.round++;t.validationFailure={...result,threadId:thread.id,at:now()};t.repairPlan=null;t.approvedRepairId=null;t.repairApproval=null;t.repairFeedback='';t.status='repair_planning';store.event(t.id,'repair_analysis',`驗證未通過，先分析第 ${t.round} 輪修正方案，未核准前不修正`);store.notify(t,'驗證未通過，正在分析問題與修正方案；方案完成後等待你審核。');}
+    else {t.round++;t.validationFailure={...result,threadId:thread.id,at:now(),blockingReasons:reconciled.blockingReasons};t.repairPlan=null;t.approvedRepairId=null;t.repairApproval=null;t.repairFeedback='';t.status='repair_planning';store.event(t.id,'repair_analysis',`驗證未通過，先分析第 ${t.round} 輪修正方案，未核准前不修正`);store.notify(t,'驗證未通過，正在分析問題與修正方案；方案完成後等待你審核。');}
   }
   else if(result.questions.length){t.questions=result.questions;t.status='waiting_input';store.notify(t,`需要確認：\n${result.questions.join('\n')}`);}
   else if(!result.passed){t.status='waiting_input';if(toolAccessFailure(result)){t.questions=[];store.notify(t,'步驟驗證受限，尚未通過。請開啟任務選擇是否跳過受限檢查；保留原計畫與成果。');}else{t.questions=['此步驟未通過驗收：'+result.summary];store.notify(t,t.questions[0]);}}else t.status='queued';
