@@ -21,6 +21,9 @@ export function createStore(filename=resolve(process.env.TASKFLOW_DB_FILE||'data
     CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,owner_id TEXT NOT NULL REFERENCES users(id),project_id TEXT NOT NULL REFERENCES projects(id),status TEXT NOT NULL,priority INTEGER NOT NULL,position REAL NOT NULL,updated TEXT NOT NULL,data TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_tasks_schedule ON tasks(status,priority DESC,position);
     CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_id,updated);
+    CREATE TABLE IF NOT EXISTS plan_groups(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id),owner_id TEXT NOT NULL REFERENCES users(id),name TEXT NOT NULL,created TEXT NOT NULL,updated TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS idx_plan_groups_project ON plan_groups(project_id,created);
+    CREATE INDEX IF NOT EXISTS idx_plan_groups_owner ON plan_groups(owner_id,created);
     CREATE TABLE IF NOT EXISTS threads(id TEXT PRIMARY KEY,task_id TEXT NOT NULL REFERENCES tasks(id),data TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_threads_task ON threads(task_id);
     CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL REFERENCES tasks(id),thread_id TEXT,at TEXT NOT NULL,kind TEXT NOT NULL,message TEXT NOT NULL);
@@ -58,6 +61,22 @@ export function createStore(filename=resolve(process.env.TASKFLOW_DB_FILE||'data
     if(!columns.includes('reply_token'))db.exec('ALTER TABLE '+table+' ADD COLUMN reply_token TEXT');
     if(!columns.includes('reply_expires'))db.exec('ALTER TABLE '+table+' ADD COLUMN reply_expires INTEGER NOT NULL DEFAULT 0');
   }
+  // 方案群組（Plan Group）：舊資料庫沒有這個欄位，補上之後一律是 NULL。
+  // NULL 代表「這個任務不屬於任何方案」，前端會當成獨立任務放進「其他任務」；
+  // 絕對不用標題、專案名稱或任何模糊規則回填，否則會把不相干的舊任務黏在一起。
+  if(!db.prepare('PRAGMA table_info(tasks)').all().some(c=>c.name==='plan_group_id')){
+    // 刻意不加 FOREIGN KEY：這個欄位只是 JSON data 的鏡像，用來做索引與聚合查詢。
+    // 從備份還原時 JSON 裡可能留著一個 plan_groups 已經不存在的 id，加了 FK 會讓
+    // 整個還原失敗；真正的存在性與授權檢查在 domain 層（requirePlanGroup）。
+    db.exec('ALTER TABLE tasks ADD COLUMN plan_group_id TEXT');
+    // 既有任務的 JSON 裡也可能已經有 planGroupId（例如從備份還原），一併同步到欄位，
+    // 但只認 JSON 裡真的存在的值，不做任何推測。
+    for(const row of db.prepare('SELECT id,data FROM tasks').all()){
+      let gid=null;try{gid=JSON.parse(row.data).planGroupId||null;}catch{gid=null;}
+      if(gid)db.prepare('UPDATE tasks SET plan_group_id=? WHERE id=?').run(gid,row.id);
+    }
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_plan_group ON tasks(plan_group_id,position)');
   initDeliveryState(db,'outbox');
   const store={db,
     transaction(fn) { db.exec('BEGIN IMMEDIATE'); try { const value=fn(); db.exec('COMMIT'); return value; } catch(e) {db.exec('ROLLBACK'); throw e;} },
@@ -71,7 +90,13 @@ export function createStore(filename=resolve(process.env.TASKFLOW_DB_FILE||'data
     project(pid) {return db.prepare('SELECT * FROM projects WHERE id=?').get(pid);},
     hasProject(user,pid) {return !!store.project(pid) && (user.role==='admin'||!!db.prepare('SELECT 1 FROM memberships WHERE user_id=? AND project_id=?').get(user.id,pid));},
     task(tid) {const row=db.prepare('SELECT data FROM tasks WHERE id=?').get(tid);return row?JSON.parse(row.data):null;},
-    saveTask(t) {t.updated=now(); db.prepare('INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,priority=excluded.priority,position=excluded.position,updated=excluded.updated,data=excluded.data').run(t.id,t.ownerId,t.projectId,t.status,t.priority,t.position,t.updated,JSON.stringify(t)); return t;},
+    // 欄位一律寫明：tasks 已經多了 plan_group_id，位置式 INSERT ... VALUES 會在下次加欄位時再壞一次。
+    // JSON data 仍是任務的唯一真相；plan_group_id 只是給索引與聚合查詢用的鏡像欄位，兩者永遠一起寫入。
+    saveTask(t) {t.updated=now(); db.prepare('INSERT INTO tasks(id,owner_id,project_id,status,priority,position,updated,data,plan_group_id) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,priority=excluded.priority,position=excluded.position,updated=excluded.updated,data=excluded.data,plan_group_id=excluded.plan_group_id').run(t.id,t.ownerId,t.projectId,t.status,t.priority,t.position,t.updated,JSON.stringify(t),t.planGroupId||null); return t;},
+    planGroup(gid) {const r=gid?db.prepare('SELECT * FROM plan_groups WHERE id=?').get(gid):null;return r?{id:r.id,projectId:r.project_id,ownerId:r.owner_id,name:r.name,created:r.created,updated:r.updated}:null;},
+    savePlanGroup(g) {g.updated=now();db.prepare('INSERT INTO plan_groups(id,project_id,owner_id,name,created,updated) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,updated=excluded.updated').run(g.id,g.projectId,g.ownerId,g.name,g.created,g.updated);return store.planGroup(g.id);},
+    // 成員只看得到自己的任務，所以也只列出自己的方案；管理者看得到全部。
+    planGroups(user) {const rows=user?.role==='admin'||!user?db.prepare('SELECT * FROM plan_groups ORDER BY created,id').all():db.prepare('SELECT * FROM plan_groups WHERE owner_id=? ORDER BY created,id').all(user.id);return rows.map(r=>({id:r.id,projectId:r.project_id,ownerId:r.owner_id,name:r.name,created:r.created,updated:r.updated}));},
     tasks(user) {const rows=user?.role==='admin'||!user?db.prepare('SELECT data FROM tasks ORDER BY priority DESC,position,updated').all():db.prepare('SELECT data FROM tasks WHERE owner_id=? ORDER BY priority DESC,position,updated').all(user.id);return rows.map(r=>JSON.parse(r.data));},
     threads(tid) {return db.prepare('SELECT data FROM threads WHERE task_id=? ORDER BY rowid').all(tid).map(r=>JSON.parse(r.data));},
     saveThread(t) {db.prepare('INSERT INTO threads VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(t.id,t.taskId,JSON.stringify(t));return t;},

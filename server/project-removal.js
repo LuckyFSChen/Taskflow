@@ -71,6 +71,9 @@ export function removeProject(store,runner,previews,pid,input,options={}){
     store.transaction(()=>{
       for(const tid of plan.taskIds){store.db.prepare('DELETE FROM events WHERE task_id=?').run(tid);store.db.prepare('DELETE FROM threads WHERE task_id=?').run(tid);store.db.prepare('DELETE FROM tasks WHERE id=?').run(tid);}
       store.db.prepare('DELETE FROM memberships WHERE project_id=?').run(pid);
+      // 方案群組掛在專案底下。專案移除後它們就沒有歸屬了，而且 plan_groups.project_id
+      // 有外鍵，留著會讓下一行刪除專案直接失敗。
+      store.db.prepare('DELETE FROM plan_groups WHERE project_id=?').run(pid);
       store.db.prepare('DELETE FROM projects WHERE id=?').run(pid);
       // Clear only flows and pending notifications which reference this project or its tasks.
       const ids=[pid,...plan.taskIds];

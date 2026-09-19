@@ -3,7 +3,9 @@ import { z } from 'zod';
 import { id,now } from './db.js';
 import { defaultBrowserValidation } from './browser-capability.js';
 export const engine=z.enum(['codex','claude']);
-export const taskInput=z.object({title:z.string().trim().min(2).max(140),description:z.string().trim().min(5).max(16000),projectId:z.string().uuid(),type:z.enum(['code','research']),priority:z.number().int().min(0).max(3).default(1),planner:engine.default('claude'),executor:engine.default('codex'),reviewer:engine.default('claude')});
+// planGroupId：任務所屬的「方案群組」。永遠是明確的 id，沒有任何依標題或專案名稱的推測。
+// 省略或 null 代表這是一個獨立任務——舊任務全部落在這一類，UI 會放進「其他任務」。
+export const taskInput=z.object({title:z.string().trim().min(2).max(140),description:z.string().trim().min(5).max(16000),projectId:z.string().uuid(),type:z.enum(['code','research']),priority:z.number().int().min(0).max(3).default(1),planner:engine.default('claude'),executor:engine.default('codex'),reviewer:engine.default('claude'),planGroupId:z.string().uuid().nullable().optional()});
 export const planSchema=z.object({summary:z.string().min(1),acceptance:z.array(z.string().min(1)).min(1).max(20),questions:z.array(z.string()).max(10),steps:z.array(z.object({title:z.string().min(1),role:z.string().min(1),instructions:z.string().min(1)}).strict()).min(1).max(8)}).strict();
 export const browserCheckSchema=z.object({description:z.string().min(1),passed:z.boolean()}).strict();
 export const browserValidationSchema=z.object({
@@ -62,6 +64,15 @@ const manualActionJson={type:'object',additionalProperties:false,properties:{
 export const resultJson={type:'object',additionalProperties:false,required:['summary','questions','artifacts','passed','evidence'],properties:{summary:{type:'string'},questions:{type:'array',items:{type:'string'}},artifacts:{type:'array',items:{type:'string'}},passed:{type:'boolean'},evidence:{type:'array',items:{type:'string'}},browserValidation:browserValidationJson,userActionRequired:manualActionJson}};
 export class HttpError extends Error {constructor(status,message){super(message);this.status=status;}}
 export function requireTask(store,user,tid) {const t=store.task(tid); if(!t || (t.ownerId!==user.id&&user.role!=='admin')) throw new HttpError(404,'找不到任務');return t;}
-export function createTask(store,user,input) {const data=taskInput.parse(input);if(!store.hasProject(user,data.projectId)) throw new HttpError(403,'尚未獲授權使用此專案');const t={...data,id:id(),ownerId:user.id,status:'planning',position:Date.now(),created:now(),planVersion:1,approvedVersion:null,plan:null,round:0,questions:[],error:null,workspace:null,git:null,gitIssue:null,publishApproval:null,userActionRequired:null};store.saveTask(t);store.event(t.id,'created','任務已建立，等待根節點規劃');return t;}
+// 方案群組必須存在、屬於同一個專案，而且是呼叫者看得到的方案。不符合就直接擋下來，
+// 不會「安靜地」把任務變成獨立任務——那會讓使用者以為任務已經歸進方案裡。
+export function requirePlanGroup(store,user,groupId,projectId) {
+  if(groupId===undefined||groupId===null||groupId==='')return null;
+  const group=store.planGroup(groupId);
+  if(!group||(group.ownerId!==user.id&&user.role!=='admin'))throw new HttpError(404,'找不到方案');
+  if(projectId&&group.projectId!==projectId)throw new HttpError(409,'方案屬於其他專案，請選擇同一專案的方案。');
+  return group;
+}
+export function createTask(store,user,input) {const data=taskInput.parse(input);if(!store.hasProject(user,data.projectId)) throw new HttpError(403,'尚未獲授權使用此專案');requirePlanGroup(store,user,data.planGroupId,data.projectId);const t={...data,planGroupId:data.planGroupId||null,id:id(),ownerId:user.id,status:'planning',position:Date.now(),created:now(),planVersion:1,approvedVersion:null,plan:null,round:0,questions:[],error:null,workspace:null,git:null,gitIssue:null,publishApproval:null,userActionRequired:null};store.saveTask(t);store.event(t.id,'created','任務已建立，等待根節點規劃');return t;}
 export function approveTask(store,user,tid,version) {const t=requireTask(store,user,tid);if(t.status!=='awaiting_approval'||!t.plan||version!==t.planVersion) throw new HttpError(409,'計畫已變更或不在待審核狀態，請重新讀取');if(t.questions.length)throw new HttpError(409,'請先回答待確認問題'); t.approvedVersion=version;t.status='queued';store.saveTask(t);store.event(t.id,'approved',`${user.name} 核准計畫 v${version}`);return t;}
 export function reviseTask(store,user,tid,answer) {const t=requireTask(store,user,tid);if(!['waiting_input','awaiting_approval','paused','failed'].includes(t.status)) throw new HttpError(409,'請先暫停並等待目前工作結束');if(store.threads(tid).some(x=>x.status==='running'))throw new HttpError(409,'目前工作尚未停止');if(typeof answer!=='string'||answer.trim().length<2||answer.length>8000) throw new HttpError(400,'請輸入 2 至 8000 字的補充');recordClarification(t,store.threads(tid),t.questions||[],answer);t.description+=`\n\n補充需求：${answer.trim()}`;t.outputIssue=null;t.environmentIssue=null;t.gitIssue=null;t.gitConflict=null;t.userActionRequired=null;t.dependencyPreflight=null;t.validationReviewPending=false;t.planVersion++;t.approvedVersion=null;t.plan=null;t.questions=[];t.status='planning';t.round=0;t.repairPlan=null;t.approvedRepairId=null;t.validationFailure=null;t.error=null;t.retryAt=null;t.retryResumeStatus=null;t.publishApproval=null;store.saveTask(t);store.event(tid,'revised',`需求已更新，重新規劃 v${t.planVersion}`);return t;}
