@@ -286,7 +286,10 @@ export function createRunner(store,{adapter=cliAdapter,dataDir=resolve('data'),r
       // output，沒有 adapter 可用，因此不可能重跑 Executor／Reviewer。還原不成功就
       // 原樣往外拋，維持既有的 Output Issue 流程。
       let output=await validatedOutput(adapter,adapterOptions,validator).catch(error=>{
-        const recovery=recoverFormatFailure(error,{phase});
+        // Recovery 只在 worktree 模式下讀取「此刻」尚未提交的真實變更作為 Git 證據；
+        // 這是唯讀查詢（git status），不會執行任何 Agent，也不會修改工作目錄。
+        const gitFiles=t.git?.mode==='worktree'?gitWorkspace.currentChangedFiles({workingDirectory:t.workspace}):[];
+        const recovery=recoverFormatFailure(error,{phase,gitFiles});
         // 還原失敗的結論一併帶進 Output Issue：使用者看到的是「目前仍缺少什麼」，
         // 而且已經自動試過的還原不會再讓他按一次注定失敗的按鈕。
         if(!recovery.ok){error.recovery={ok:false,reason:recovery.reason,missing:recovery.missing||[],notes:recovery.notes||[],at:now()};throw error;}

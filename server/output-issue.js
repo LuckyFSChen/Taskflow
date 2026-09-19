@@ -112,11 +112,13 @@ export function recoverTaskOutput(store,user,tid,input={}){
   if(candidate===undefined)
     return recordFailure(store,t,issue,{reason:'找不到已保存的原始 AI 回傳，無法重新整理成果報告。'});
 
-  const recovery=deterministicResultRecovery(candidate);
-  if(!recovery.ok)return recordFailure(store,t,issue,{reason:recovery.reason,missing:recovery.missing||[],notes:recovery.notes||[]});
-
   const thread=store.threads(t.id).find(x=>x.id===issue.threadId);
   if(!thread)return recordFailure(store,t,issue,{reason:'找不到這次執行的角色工作階段，無法安全套用還原結果。'});
+
+  // thread.commit.files 是 commitPhase 實際提交時保存的真實變更檔案清單；有這份
+  // Git 證據時優先用它重建 artifacts，比重新從文字擷取更可靠。
+  const recovery=deterministicResultRecovery(candidate,thread.commit?.files?{gitFiles:thread.commit.files}:undefined);
+  if(!recovery.ok)return recordFailure(store,t,issue,{reason:recovery.reason,missing:recovery.missing||[],notes:recovery.notes||[]});
 
   // 還原的結果必須通過與正常執行完全相同的 deterministic guards。特別是
   // Browser 驗證：這次沒有任何 Browser MCP 工具呼叫紀錄可以佐證，需要 Browser

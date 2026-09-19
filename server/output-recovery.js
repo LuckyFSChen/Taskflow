@@ -105,10 +105,11 @@ export function recoverPassed(source){
   return false;
 }
 
-export function deterministicResultRecovery(raw){
+export function deterministicResultRecovery(raw,context={}){
   const value=unwrap(raw);
   const structured=value&&typeof value==='object'&&!Array.isArray(value)?value:null;
   const notes=[];
+  const gitFiles=explicitList(context?.gitFiles)||[];
 
   // 規則 1：summary 一定來自原始輸出，找不到就失敗。
   const summary=structured?text(structured.summary):text(value);
@@ -123,7 +124,11 @@ export function deterministicResultRecovery(raw){
   const evidence=structured?explicitList(structured.evidence):null;
 
   if(!questions)notes.push('原始輸出缺少 questions，安全補上空陣列。');
-  if(!artifacts)notes.push('原始輸出缺少 artifacts，改由原始輸出中明確出現的檔案路徑擷取。');
+  if(!artifacts){
+    notes.push(gitFiles.length
+      ?'原始輸出缺少 artifacts，改由本輪 Git 實際變更的檔案清單重建 artifacts。'
+      :'原始輸出缺少 artifacts，改由原始輸出中明確出現的檔案路徑擷取。');
+  }
   if(!evidence)notes.push('原始輸出缺少 evidence，只擷取原始輸出中明確的指令與結果敘述。');
 
   // 規則 2：evidence 只能來自原始輸出。原始輸出既沒有 evidence 欄位、文字裡也找不到
@@ -136,7 +141,7 @@ export function deterministicResultRecovery(raw){
   const candidate={
     summary:summary.slice(0,SUMMARY_LIMIT),
     questions:questions||[],
-    artifacts:artifacts||extractArtifacts(corpus),
+    artifacts:artifacts||(gitFiles.length?gitFiles:extractArtifacts(corpus)),
     evidence:recoveredEvidence,
     // browserValidation 與 userActionRequired 刻意不從壞掉的輸出沿用：兩者在
     // runner 內都會依實際 tool_use 證據與 summary/evidence 重新判定，交給 schema
@@ -157,10 +162,10 @@ function saveRecovery(runDir,payload){
 }
 
 // runner 的單一進入點。回傳 {ok:false} 時，呼叫端維持原本的 Output Issue 流程。
-export function recoverFormatFailure(error,{phase,runDir=error?.runDir}={}){
+export function recoverFormatFailure(error,{phase,runDir=error?.runDir,gitFiles=[]}={}){
   if(error?.code!=='OUTPUT_FORMAT')return {ok:false,reason:'不是輸出格式問題，不進行 Result Recovery。',missing:[],notes:[]};
   if(!RECOVERABLE_PHASES.includes(phase))return {ok:false,reason:`${phase} 階段不套用 Result Recovery；計畫缺少的內容沒有安全的補值方式。`,missing:[],notes:[]};
-  const recovery=deterministicResultRecovery(error.candidate!==undefined?error.candidate:error.rawResult);
+  const recovery=deterministicResultRecovery(error.candidate!==undefined?error.candidate:error.rawResult,{gitFiles});
   saveRecovery(runDir,{ok:recovery.ok,source:recovery.source,reason:recovery.reason||null,missing:recovery.missing||[],notes:recovery.notes,result:recovery.result||null,at:new Date().toISOString(),issues:error.issues||[]});
   if(!recovery.ok)return {ok:false,reason:recovery.reason,missing:recovery.missing||[],notes:recovery.notes};
   return {ok:true,result:recovery.result,missing:[],notes:recovery.notes,
