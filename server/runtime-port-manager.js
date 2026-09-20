@@ -16,9 +16,10 @@
 //   3. 「可用」是驗證過的結論：候選 port 必須同時「未被 lease」「OS 未在 Listen」
 //      「不在 Windows excludedportrange 內」，缺一不可；45000~45099 只是候選池，不是保證。
 import {connect as netConnect} from 'node:net';
+import {execFile} from 'node:child_process';
 import {mkdirSync, readFileSync, writeFileSync} from 'node:fs';
 import {dirname} from 'node:path';
-import {isAlive, waitForExit} from './process-lifecycle.js';
+import {inspectEntry, isAlive, readRegistry, waitForExit} from './process-lifecycle.js';
 
 /** 這兩個 port 永遠分別屬於 TaskFlow Core（4310）與 Service Guardian（4311），任何情況下都不可配發。 */
 export const RESERVED_PORTS = Object.freeze([4310, 4311]);
@@ -34,6 +35,49 @@ export function isReservedPort(port) {
 // acquire() 一個新的——而不是隨便重試任何失敗（例如 build 失敗、健康檢查邏輯本身不過）。
 export function isPortBindCollision(text) {
   return /EADDRINUSE|address already in use/i.test(String(text || ''));
+}
+
+/**
+ * 查詢 Windows 的 `netsh int ipv4 show excludedportrange protocol=tcp`：作業系統可能因為
+ * Hyper-V／WSL／其他系統元件把 45000~45099 內的一段保留給別人，45000~45099 只是候選池，
+ * 不是保證能用。非 Windows 平台、或 netsh 呼叫失敗，一律回傳空陣列並記警告——
+ * 這項過濾失敗不該讓整個 TaskFlow 啟動失敗，acquire() 屆時仍會用「OS 是否已在 Listen」擋下真正的衝突。
+ */
+export function queryWindowsExcludedPortRanges({exec = execFile, platform = process.platform, log = (...args) => console.warn(...args)} = {}) {
+  return new Promise(resolveRanges => {
+    if (platform !== 'win32') { resolveRanges([]); return; }
+    exec('netsh', ['int', 'ipv4', 'show', 'excludedportrange', 'protocol=tcp'], {windowsHide: true, timeout: 5000}, (error, stdout) => {
+      if (error) {
+        log(`[runtime-port] 無法查詢 Windows excludedportrange，略過此項過濾：${error.message}`);
+        resolveRanges([]);
+        return;
+      }
+      const ranges = [];
+      for (const line of String(stdout || '').split(/\r?\n/)) {
+        const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+        if (match) ranges.push({start: Number(match[1]), end: Number(match[2])});
+      }
+      resolveRanges(ranges);
+    });
+  });
+}
+
+/**
+ * Port lease 的 ownership 證明，供啟動時 reconcile() 與 Service Guardian 的定期 runtime GC 共用：
+ * 只有這個 lease 的 pid 出現在 Preview 登錄檔（process-lifecycle.js 的 registerPreview）裡，
+ * 而且那筆登錄記錄的健康檢查仍答得出來（inspectEntry 判定為 orphan），才算是 TaskFlow 自己
+ * 開的孤兒。找不到對應登錄、或答不出健康檢查，一律回傳 false——不得清理。
+ *
+ * 刻意重用 process-lifecycle.js 既有的 inspectEntry() 判斷方式，避免「怎麼證明身分」在
+ * Preview 對帳與 Port Lease 對帳兩處各自漂移出不同的標準。
+ */
+export function createPreviewRegistryOwnershipProof(previewRegistryPath, {readRegistryImpl = readRegistry, inspectEntryImpl = inspectEntry} = {}) {
+  return async function canProveOwnership(lease) {
+    const entry = readRegistryImpl(previewRegistryPath).find(item => item.pid === lease.pid);
+    if (!entry) return false;
+    const inspected = await inspectEntryImpl(entry);
+    return inspected.state === 'orphan';
+  };
 }
 
 const DEFAULT_POOL_START = 45000;

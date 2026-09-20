@@ -5,8 +5,10 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {
   RESERVED_PORTS,
+  createPreviewRegistryOwnershipProof,
   createRuntimePortManager,
   isReservedPort,
+  queryWindowsExcludedPortRanges,
   resolvePortRange,
 } from '../server/runtime-port-manager.js';
 
@@ -190,4 +192,68 @@ test('尚未綁定 pid（pending）的 lease，reconcile 不會處理', async ()
   const outcome = await manager.reconcile({alive: () => false});
   assert.equal(outcome.gone.length, 0);
   assert.equal(manager.listLeases().length, 1);
+});
+
+test('acquire()：Windows excludedportrange 內的候選 port 會被跳過，不會被配發', async () => {
+  const manager = createRuntimePortManager({
+    range: SMALL_RANGE,
+    checkPortInUse: async () => false,
+    excludedRanges: [{start: SMALL_RANGE.start, end: SMALL_RANGE.end - 1}],
+    log: silent,
+  });
+  const port = await manager.acquire({taskId: 'A', serviceId: 'backend'});
+  assert.equal(port, SMALL_RANGE.end);
+  assert.equal(await manager.isAvailable(SMALL_RANGE.start), false);
+});
+
+test('queryWindowsExcludedPortRanges：非 Windows 平台一律回傳空陣列，不呼叫 netsh', async () => {
+  let called = false;
+  const ranges = await queryWindowsExcludedPortRanges({platform: 'linux', exec: () => { called = true; }});
+  assert.deepEqual(ranges, []);
+  assert.equal(called, false);
+});
+
+test('queryWindowsExcludedPortRanges：能解析 netsh show excludedportrange 的輸出', async () => {
+  const stdout = [
+    'Protocol tcp Port Exclude Ranges',
+    '',
+    'Start Port    End Port',
+    '----------    --------',
+    '     50000       50059',
+    '     50060       50060',
+    '',
+  ].join('\r\n');
+  const ranges = await queryWindowsExcludedPortRanges({
+    platform: 'win32',
+    exec: (cmd, args, options, callback) => { callback(null, stdout); },
+  });
+  assert.deepEqual(ranges, [{start: 50000, end: 50059}, {start: 50060, end: 50060}]);
+});
+
+test('queryWindowsExcludedPortRanges：netsh 呼叫失敗時回傳空陣列並記警告，不讓啟動失敗', async () => {
+  let warned = false;
+  const ranges = await queryWindowsExcludedPortRanges({
+    platform: 'win32',
+    exec: (cmd, args, options, callback) => { callback(new Error('找不到 netsh')); },
+    log: () => { warned = true; },
+  });
+  assert.deepEqual(ranges, []);
+  assert.equal(warned, true);
+});
+
+test('createPreviewRegistryOwnershipProof：pid 有對應且健康檢查判定為 orphan 才算證明', async () => {
+  const canProveOwnership = createPreviewRegistryOwnershipProof('unused-path.json', {
+    readRegistryImpl: () => [{pid: 42, url: 'http://127.0.0.1:45012', healthUrl: 'http://127.0.0.1:45012/api/health'}],
+    inspectEntryImpl: async entry => ({...entry, state: entry.pid === 42 ? 'orphan' : 'unknown'}),
+  });
+  assert.equal(await canProveOwnership({pid: 42}), true);
+  assert.equal(await canProveOwnership({pid: 999}), false);
+});
+
+test('createPreviewRegistryOwnershipProof：registry 裡答不出健康檢查（unknown）一律不算證明', async () => {
+  const canProveOwnership = createPreviewRegistryOwnershipProof('unused-path.json', {
+    readRegistryImpl: () => [{pid: 42, url: 'http://127.0.0.1:45012'}],
+    inspectEntryImpl: async entry => ({...entry, state: 'unknown', reason: '沒有回應'}),
+  });
+  assert.equal(await canProveOwnership({pid: 42}), false);
 });
