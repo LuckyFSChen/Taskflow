@@ -27,6 +27,15 @@ export function isReservedPort(port) {
   return RESERVED_PORTS.includes(Number(port));
 }
 
+// acquire() 的「未被 lease」「OS 未在 Listen」檢查與呼叫端實際 bind 之間終究有一個檢查後才動手
+// 的空檔（TOCTOU）：另一個獨立的 TaskFlow 行程完全可能在這個空檔內搶先 bind 到同一個候選 port。
+// 這個模組不擁有「真的去 listen」那一步，偵測不到；由呼叫端在 spawn／listen 真的失敗時，
+// 用這個判斷式認出「這是port 競爭，不是別的錯誤」，才能安全地 release 掉這個 lease 後重新
+// acquire() 一個新的——而不是隨便重試任何失敗（例如 build 失敗、健康檢查邏輯本身不過）。
+export function isPortBindCollision(text) {
+  return /EADDRINUSE|address already in use/i.test(String(text || ''));
+}
+
 const DEFAULT_POOL_START = 45000;
 const DEFAULT_POOL_END = 45099;
 
@@ -132,12 +141,20 @@ export function createRuntimePortManager({
   }
 
   /**
-   * 配發一個 port。依序掃描 pool，第一個可用的就用；找不到就明確失敗並列出目前的 active leases，
+   * 配發一個 port：候選池；找不到就明確失敗並列出目前的 active leases，
    * 絕不 fallback 到保留 port 或隨機 OS port（計畫書第十七章）。
+   *
+   * 掃描起點隨機（計畫書第五章「選第一個／隨機可用 port」）：每個 TaskFlow 行程（正式環境只有
+   * 一個，但測試會同時起很多個獨立的 portManager 實例）若永遠從 range.start 開始找，彼此會一直
+   * 搶同一批低號 port，check-then-listen 之間的空檔就更容易撞在一起。隨機起點不能消除這個
+   * TOCTOU 空檔（那要靠呼叫端在真正 bind 失敗時重新 acquire()），但能大幅降低撞上的機率。
    */
   async function acquire({taskId, serviceId}) {
     if (!taskId || !serviceId) throw new Error('acquire() 需要 taskId 與 serviceId，才能記錄這個 port 是誰租的。');
-    for (let port = range.start; port <= range.end; port++) {
+    const total = range.end - range.start + 1;
+    const offset = Math.floor(Math.random() * total);
+    for (let i = 0; i < total; i++) {
+      const port = range.start + ((offset + i) % total);
       if (!(await isAvailable(port))) continue;
       const lease = {port, taskId, serviceId, pid: null, createdAt: now(), status: 'pending'};
       leases.set(port, lease);
@@ -146,7 +163,6 @@ export function createRuntimePortManager({
       emit('runtime_port_leased', {port, taskId, serviceId});
       return port;
     }
-    const total = range.end - range.start + 1;
     const active = listLeases();
     const detail = active.length ? active.map(formatLease).join(', ') : '(none)';
     throw new Error(`TaskFlow runtime port pool exhausted. Available runtime ports: 0 / ${total}. Active leases: ${detail}`);

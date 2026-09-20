@@ -12,24 +12,29 @@
 //   2. 相依沒 ready 就不啟動下游。backend 還沒好就開 frontend，只會得到一次假失敗。
 //   3. 「停止了」是驗證過的結論：PID 消失 **且** port 放掉，兩者都要。
 //   4. 絕不因為「PID 還活著」就盲殺。認不出身分的一律保留並照實回報（沿用 process-lifecycle.js）。
+//
+// 第五個原則（Runtime Port Pool 整改後新增）：
+//   5. 每個 service 實際 listen 的 port 一律由 TaskFlow Runtime Port Pool 配發，不再由這裡自己
+//      listen(0) 跟作業系統要一個隨機 port，taskflow.runtime.json 宣告的 service.port 也不再
+//      被拿去用（那正是 4310 被誤配走的成因）。port 從哪裡來收斂到 runtime-port-manager.js 一處。
 import {spawn} from 'node:child_process';
-import {createServer as createNetProbe, connect as netConnect} from 'node:net';
+import {connect as netConnect} from 'node:net';
 import {existsSync} from 'node:fs';
 import {join, sep} from 'node:path';
 import {childEnvironment, resolveNpmCli} from './npm-runner.js';
 import {isAlive, registerPreview, unregisterPreview, waitForExit} from './process-lifecycle.js';
 import {orderRuntimeServices, dependentsOf, runtimeServiceFingerprint, serviceDirectory} from './runtime-topology.js';
 import {RuntimeFailure, waitForServiceHealth} from './runtime-validation.js';
+import {createRuntimePortManager, isPortBindCollision} from './runtime-port-manager.js';
+
+/** acquire() 選中的候選 port 與呼叫端真正 bind 之間終究有一個檢查空檔；真的撞上時重新租一個。 */
+const MAX_PORT_BIND_ATTEMPTS = 5;
 
 export const SERVICE_STATES = ['STARTING', 'READY', 'STALE', 'STOPPING', 'STOPPED', 'FAILED'];
 
-/** 可用的埠。交給作業系統挑，避免自己維護一張「用過哪些」的表而與現實脫節。 */
-export function allocatePort() {
-  return new Promise((resolve, reject) => {
-    const probe = createNetProbe();
-    probe.once('error', reject);
-    probe.listen(0, '127.0.0.1', () => { const {port} = probe.address(); probe.close(() => resolve(port)); });
-  });
+/** 依 TaskFlow Runtime Port Pool 配發一個 port；port 從哪裡來只收斂在 runtime-port-manager.js 這一處。 */
+export async function allocatePort(portManager, {taskId, serviceId}) {
+  return portManager.acquire({taskId, serviceId});
 }
 
 /** 這個 port 現在還有沒有人在聽。stop() 之後要據此確認「連接埠已釋放」。 */
@@ -140,7 +145,7 @@ export function runtimePublic(runtime) {
  * @param {string} deps.registryPath 服務重啟後還認得出自己開過哪些子程序的磁碟登錄
  */
 export function createRuntimeManager({
-  registryPath, spawnProcess = spawn, fetchImpl = fetch, portAllocator = allocatePort,
+  registryPath, spawnProcess = spawn, fetchImpl = fetch, portManager = createRuntimePortManager(),
   execPath = process.execPath, healthTimeoutMs = 60000, onEvent = () => {},
 } = {}) {
   /** key → {topology, services: Map<id, state>, managed: Map<id, handle>} */
@@ -156,6 +161,9 @@ export function createRuntimeManager({
       try { await state.managedStop?.(); } catch { /* 關不掉照實回報，不重試也不升級手段 */ }
       state.status = 'STOPPED';
       const released = await waitForPortRelease(state.port);
+      // 順序不能反過來：release() 一定排在「確認 port 已不再 Listen」之後，
+      // 否則下一個 runtime 有機會搶到同一個還沒真的空出來的 port（十一章的 race condition）。
+      if (released) portManager.release(state.port);
       emit('runtime_service_stopped', {service: state.id, pid: null, verified: true, portReleased: released});
       return {id: state.id, pid: null, verified: true, portReleased: released};
     }
@@ -173,6 +181,9 @@ export function createRuntimeManager({
     const released = await waitForPortRelease(state.port);
     state.status = verified ? 'STOPPED' : 'FAILED';
     if (!verified) { state.failureKind = 'stale_runtime'; state.error = `已要求停止，但 PID ${state.pid} 仍然存在。`; }
+    // PID 沒消失就不釋放 lease：port 很可能還被那個程序聽著，釋放了只會製造下一個 runtime
+    // 搶到同一個 port 的 race condition；lease 留著，交給下次 reconcile() 依 PID 再判斷一次。
+    if (released) portManager.release(state.port);
     if (registryPath) unregisterPreview(registryPath, `${state.runtimeKey}#${state.id}`);
     emit('runtime_service_stopped', {service: state.id, pid: state.pid, verified, portReleased: released});
     return {id: state.id, pid: state.pid ?? null, verified, portReleased: released};
@@ -182,75 +193,103 @@ export function createRuntimeManager({
     const {key, projectRoot, npm, startManaged, peers, fingerprint, extraEnv} = context;
     const dir = serviceDirectory(service, projectRoot);
     if (!existsSync(dir)) throw new RuntimeFailure('service_start_failed', `service ${service.id} 的目錄不存在：${service.cwd || '.'}`);
-    const port = service.port || await portAllocator();
-    const url = `http://127.0.0.1:${port}`;
-    const state = {
-      runtimeKey: key, id: service.id, type: service.type, cwd: service.cwd, mode: service.mode,
-      dependsOn: service.dependsOn, browserEntry: service.browserEntry,
-      port, url, pid: null, child: null, status: 'STARTING', startedAt: new Date().toISOString(),
-      command: service.startCommand, health: null, failureKind: null, error: null,
-      fingerprint: runtimeServiceFingerprint(service, {projectRoot, ...fingerprint}),
-      service,
-    };
-    emit('runtime_service_starting', {service: service.id, type: service.type, cwd: service.cwd || '.', port, mode: service.mode});
 
-    // 建置是 service-aware 的：不假設根目錄有一個 npm run build（計畫書第二十六章）。
-    if (service.buildCommand && npm) {
-      if (!existsSync(join(dir, 'node_modules'))) await npm(dir, ['install']);
-      await npm(dir, ['run', service.buildCommand.replace(/^\S+\s+run\s+/, '')]);
-    } else if (service.mode === 'spawn' && npm && !existsSync(join(dir, 'node_modules')) && existsSync(join(dir, 'package.json'))) {
-      await npm(dir, ['install']);
+    // acquire() 選中的候選 port 與下面真正 spawn／listen 之間有一個檢查空檔；另一個獨立的
+    // TaskFlow 行程理論上可能在這個空檔內搶先 bind 到同一個 port（acquire() 本身已經把起點隨機化
+    // 降低機率，但無法完全消除）。真的撞上時這裡會認出來、把這個 lease 放回 pool、重新租一個
+    // 再試一次，而不是把一次巧合的競爭當成「這個 service 啟動失敗」回報出去。
+    attempts: for (let attempt = 1; attempt <= MAX_PORT_BIND_ATTEMPTS; attempt++) {
+      // taskflow.runtime.json 宣告的 service.port 只在設定解析階段拿來驗證（見 runtime-topology.js
+      // 的 assertServicePortInPool），實際 listen port 一律由 Pool 配發，不會被拿去用——這樣
+      // 即使宣告值本身合法，也不會有兩個 worktree 剛好宣告同一個固定 port 而互相打架。
+      let port;
+      try { port = await allocatePort(portManager, {taskId: key, serviceId: service.id}); }
+      catch (error) { throw new RuntimeFailure('port_conflict', `service ${service.id} 無法取得 runtime port：${error.message}`, {service: service.id}); }
+
+      const url = `http://127.0.0.1:${port}`;
+      const state = {
+        runtimeKey: key, id: service.id, type: service.type, cwd: service.cwd, mode: service.mode,
+        dependsOn: service.dependsOn, browserEntry: service.browserEntry,
+        port, url, pid: null, child: null, status: 'STARTING', startedAt: new Date().toISOString(),
+        command: service.startCommand, health: null, failureKind: null, error: null,
+        fingerprint: runtimeServiceFingerprint(service, {projectRoot, ...fingerprint}),
+        service,
+      };
+      emit('runtime_service_starting', {service: service.id, type: service.type, cwd: service.cwd || '.', port, mode: service.mode});
+
+      // 這個 lease 在下面 bind 成功前都還沒有 PID／managed handle 撐著；建置、spawn 或
+      // startManaged 任何一步在那之前失敗，都要把它放回 pool，否則就是一個永遠租不掉的孤兒 lease。
+      let bound = false;
+      try {
+        // 建置是 service-aware 的：不假設根目錄有一個 npm run build（計畫書第二十六章）。
+        if (service.buildCommand && npm) {
+          if (!existsSync(join(dir, 'node_modules'))) await npm(dir, ['install']);
+          await npm(dir, ['run', service.buildCommand.replace(/^\S+\s+run\s+/, '')]);
+        } else if (service.mode === 'spawn' && npm && !existsSync(join(dir, 'node_modules')) && existsSync(join(dir, 'package.json'))) {
+          await npm(dir, ['install']);
+        }
+
+        const env = serviceEnvironment(service, {port, peers, extra: extraEnv});
+
+        if (service.mode === 'managed') {
+          const handle = await startManaged(service, {port, url, env, dir, peers});
+          portManager.bindPid(port, null);
+          bound = true;
+          state.managedStop = handle.stop;
+          state.url = handle.url || url;
+          state.status = 'READY';
+          state.health = {passed: true, url: state.url, detail: 'TaskFlow 自管的靜態／代理伺服器。'};
+          emit('runtime_service_ready', {service: service.id, url: state.url, port, pid: null});
+          return state;
+        }
+
+        const parsed = parseStartCommand(service.startCommand, {execPath});
+        const args = [...parsed.args];
+        // frontend 自己起 dev/preview 伺服器時要把 port 告訴它：vite 這類工具不讀 PORT。
+        if (service.type === 'frontend' && parsed.viaNpm) args.push('--', '--port', String(port), '--host', '127.0.0.1');
+        const child = spawnProcess(execPath, args, {cwd: dir, env, shell: false, windowsHide: true});
+        state.child = child;
+        state.pid = child.pid ?? null;
+        portManager.bindPid(port, state.pid);
+        bound = true;
+        let stderr = '';
+        child.stderr?.on('data', data => { stderr = (stderr + data).slice(-3000); });
+        let exited = false;
+        child.once('exit', () => { exited = true; });
+        child.once('error', () => { exited = true; });
+        if (registryPath && state.pid) {
+          registerPreview(registryPath, {
+            key: `${key}#${service.id}`, pid: state.pid, url, kind: `runtime:${service.type}`, cwd: dir,
+            healthUrl: service.healthCheck?.url || (service.healthCheck?.path ? `${url}${service.healthCheck.path}` : null),
+          });
+        }
+
+        const health = await waitForServiceHealth(service, url, {timeoutMs: healthTimeoutMs, fetchImpl, isAlive: () => !exited && (state.pid ? isAlive(state.pid) : true)});
+        state.health = health;
+        if (!health.passed) {
+          state.status = 'FAILED';
+          state.failureKind = health.failureKind || 'service_unhealthy';
+          state.error = `${health.detail || '健康檢查未通過'}${stderr ? `\nstderr: ${stderr.slice(-800)}` : ''}`;
+          emit('runtime_service_failed', {service: service.id, failureKind: state.failureKind, detail: state.error});
+          await stopState(state); // 已經 bind 過，交由 stopState() 在確認 PID 消失、port 釋放後才 release。
+          if (attempt < MAX_PORT_BIND_ATTEMPTS && isPortBindCollision(stderr)) continue attempts;
+          throw new RuntimeFailure(state.failureKind, `service ${service.id} 未能就緒：${health.detail || '健康檢查未通過'}`, {service: state.id, stderr: stderr.slice(-800), health});
+        }
+        state.status = 'READY';
+        emit('runtime_service_ready', {service: service.id, url, port, pid: state.pid});
+        // 子程序在 ready 之後自己死掉：狀態要跟著變，下一次 preflight 才看得出來要重啟。
+        child.once('exit', code => {
+          if (state.status === 'READY') { state.status = 'FAILED'; state.failureKind = 'service_start_failed'; state.error = `service ${service.id} 在就緒後結束（code ${code}）。`; }
+          if (registryPath) unregisterPreview(registryPath, `${key}#${service.id}`);
+        });
+        return state;
+      } catch (error) {
+        if (!bound) portManager.release(port);
+        if (!bound && attempt < MAX_PORT_BIND_ATTEMPTS && (error?.code === 'EADDRINUSE' || isPortBindCollision(error?.message))) continue attempts;
+        throw error;
+      }
     }
-
-    const env = serviceEnvironment(service, {port, peers, extra: extraEnv});
-
-    if (service.mode === 'managed') {
-      const handle = await startManaged(service, {port, url, env, dir, peers});
-      state.managedStop = handle.stop;
-      state.url = handle.url || url;
-      state.status = 'READY';
-      state.health = {passed: true, url: state.url, detail: 'TaskFlow 自管的靜態／代理伺服器。'};
-      emit('runtime_service_ready', {service: service.id, url: state.url, port, pid: null});
-      return state;
-    }
-
-    const parsed = parseStartCommand(service.startCommand, {execPath});
-    const args = [...parsed.args];
-    // frontend 自己起 dev/preview 伺服器時要把 port 告訴它：vite 這類工具不讀 PORT。
-    if (service.type === 'frontend' && parsed.viaNpm) args.push('--', '--port', String(port), '--host', '127.0.0.1');
-    const child = spawnProcess(execPath, args, {cwd: dir, env, shell: false, windowsHide: true});
-    state.child = child;
-    state.pid = child.pid ?? null;
-    let stderr = '';
-    child.stderr?.on('data', data => { stderr = (stderr + data).slice(-3000); });
-    let exited = false;
-    child.once('exit', () => { exited = true; });
-    child.once('error', () => { exited = true; });
-    if (registryPath && state.pid) {
-      registerPreview(registryPath, {
-        key: `${key}#${service.id}`, pid: state.pid, url, kind: `runtime:${service.type}`, cwd: dir,
-        healthUrl: service.healthCheck?.url || (service.healthCheck?.path ? `${url}${service.healthCheck.path}` : null),
-      });
-    }
-
-    const health = await waitForServiceHealth(service, url, {timeoutMs: healthTimeoutMs, fetchImpl, isAlive: () => !exited && (state.pid ? isAlive(state.pid) : true)});
-    state.health = health;
-    if (!health.passed) {
-      state.status = 'FAILED';
-      state.failureKind = health.failureKind || 'service_unhealthy';
-      state.error = `${health.detail || '健康檢查未通過'}${stderr ? `\nstderr: ${stderr.slice(-800)}` : ''}`;
-      emit('runtime_service_failed', {service: service.id, failureKind: state.failureKind, detail: state.error});
-      await stopState(state);
-      throw new RuntimeFailure(state.failureKind, `service ${service.id} 未能就緒：${health.detail || '健康檢查未通過'}`, {service: state.id, stderr: stderr.slice(-800), health});
-    }
-    state.status = 'READY';
-    emit('runtime_service_ready', {service: service.id, url, port, pid: state.pid});
-    // 子程序在 ready 之後自己死掉：狀態要跟著變，下一次 preflight 才看得出來要重啟。
-    child.once('exit', code => {
-      if (state.status === 'READY') { state.status = 'FAILED'; state.failureKind = 'service_start_failed'; state.error = `service ${service.id} 在就緒後結束（code ${code}）。`; }
-      if (registryPath) unregisterPreview(registryPath, `${key}#${service.id}`);
-    });
-    return state;
+    throw new RuntimeFailure('port_conflict', `service ${service.id} 連續 ${MAX_PORT_BIND_ATTEMPTS} 次都撞上其他行程正在搶用的 port，請稍後再試。`, {service: service.id});
   }
 
   /**

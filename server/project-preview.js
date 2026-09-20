@@ -1,7 +1,6 @@
 import express from 'express';
 import {spawn} from 'node:child_process';
 import {request as httpRequest} from 'node:http';
-import {createServer as createNetProbe} from 'node:net';
 import {existsSync,readdirSync,readFileSync,realpathSync,statSync} from 'node:fs';
 import {dirname,join,resolve,relative,isAbsolute,extname} from 'node:path';
 import {HttpError} from './domain.js';
@@ -11,8 +10,13 @@ import {registerPreview,unregisterPreview,waitForExit} from './process-lifecycle
 import {acceptanceEnvironment,cleanupAcceptanceContext,createAcceptanceContext} from './acceptance-auth.js';
 import {childEnvironment,resolveNpmCli} from './npm-runner.js';
 import {resolveRuntimeTopology,serviceDirectory,topologyPublic} from './runtime-topology.js';
-import {createRuntimeManager,runtimePublic} from './runtime-manager.js';
+import {allocatePort,createRuntimeManager,runtimePublic,waitForPortRelease} from './runtime-manager.js';
+import {createRuntimePortManager,isPortBindCollision} from './runtime-port-manager.js';
 import {RuntimeFailure} from './runtime-validation.js';
+
+// acquire() 選中的候選 port 與這裡真正 spawn／listen 之間有一個檢查空檔，另一個獨立的 TaskFlow
+// 行程理論上可能搶先 bind 到同一個 port（見 runtime-port-manager.js 的 isPortBindCollision 註解）。
+const MAX_PORT_BIND_ATTEMPTS=5;
 
 const KNOWN_SERVER_DEPS=['express','fastify','koa','hapi','restify'];
 // Only a bare `node <relative-file>.js` start script is trusted enough to auto-spawn;
@@ -106,13 +110,6 @@ function runNpm(cwd,args) {
     child.on('close',code=>{clearTimeout(timer);code===0&&!timedOut?resolve():reject(new HttpError(422,timedOut?'安裝或建置超過三分鐘，請檢查專案。':`網頁建置失敗：${output}`));});
   });
 }
-function getFreePort() {
-  return new Promise((resolvePort,reject)=>{
-    const probe=createNetProbe();
-    probe.once('error',reject);
-    probe.listen(0,'127.0.0.1',()=>{const port=probe.address().port;probe.close(()=>resolvePort(port));});
-  });
-}
 function safeKeyFragment(key) {
   return key.replace(/[^a-zA-Z0-9_-]/g,'_');
 }
@@ -177,7 +174,9 @@ export function createProxyMiddleware(prefixes,target){
     req.pipe(proxied);
   };
 }
-function createStaticServer({root,kind,proxyPaths=[],proxyTarget=null,port=0}) {
+// port 一律由呼叫端先向 TaskFlow Runtime Port Pool 租好再傳進來；不再自己 listen(0)
+// 跟作業系統要一個隨機 port——那樣就繞過了 pool，變成又一個「TaskFlow 管的服務用了非 pool port」的洞。
+function createStaticServer({root,kind,proxyPaths=[],proxyTarget=null,port}) {
   root=realpathSync(root);
   const app=express();
   app.use((req,res,next)=>{
@@ -199,72 +198,93 @@ function createStaticServer({root,kind,proxyPaths=[],proxyTarget=null,port=0}) {
 
 // registryPath：把記憶體裡的 running 表同時寫一份到磁碟。純粹是為了服務重新啟動之後
 // 還認得出自己開過哪些 Preview 子程序——記憶體那份一重啟就沒了，子程序卻還活著。
-export function createProjectPreview({npm=runNpm,registryPath=resolve('data/preview/registry.json'),onRuntimeEvent=()=>{},healthTimeoutMs=120000}={}) {
+//
+// portManager：整個 Preview 模組只有這一個 TaskFlow Runtime Port Pool 實例——multi-service
+// runtime（見 startTopologyRuntime）、單一程序 fullstack（startFullstack）、純靜態／vite
+// 預覽（start() 尾端）全部共用同一份帳本，active lease 才能做到跨這些路徑全域唯一。
+export function createProjectPreview({npm=runNpm,registryPath=resolve('data/preview/registry.json'),portManager=createRuntimePortManager(),onRuntimeEvent=()=>{},healthTimeoutMs=120000}={}) {
   const running=new Map(),pending=new Map();
   // 120 秒：後端的 dev script 常常包含 prisma generate／db push／seed 這類一次性準備工作，
   // 第一次啟動本來就會比較慢。逾時太短只會把「還在準備」誤報成「啟動失敗」。
-  const manager=createRuntimeManager({registryPath,onEvent:onRuntimeEvent,healthTimeoutMs});
+  const manager=createRuntimeManager({registryPath,onEvent:onRuntimeEvent,healthTimeoutMs,portManager});
 
   async function startFullstack(key,path,pkg) {
     const serverFile=resolveFullstackEntry(path,pkg);
     if(!serverFile)throw new HttpError(422,'找不到可信任的 fullstack 啟動腳本。');
     if(!existsSync(join(path,'node_modules')))await npm(path,['install']);
     await npm(path,['run','build']);
-    const port=await getFreePort();
-    const previewDbPath=resolve('data/preview',safeKeyFragment(key),'taskflow.sqlite');
-    // 驗收身份由 AcceptanceContext 產生，Preview 與 Deployment Validator 共用同一份。
-    // 兩邊各自產生帳密，就是 /api/login 永遠 401 的成因。
-    const acceptance=createAcceptanceContext({projectPath:path,key});
-    // 每一次啟動都把驗收帳號**重設**成這一輪的密碼。之前只在「資料庫完全沒有使用者」時
-    // 才寫入，而 Preview 資料庫是跨次保留的——第二次之後 validator 手上的新密碼
-    // 與資料庫裡的舊雜湊永遠對不起來，登入必定 401。
-    try{
-      const seedStore=createStore(previewDbPath);
-      try{seedStore.upsertUser('TaskFlow Preview',acceptance.username,acceptance.password,'admin');acceptance.injection.database=true;}
-      finally{seedStore.close();}
-    }catch(error){acceptance.injection.error=String(error?.message||error).slice(0,200);}
-    const env={...process.env};
-    for(const k of ['INBOX_TOKEN','LINE_CHANNEL_SECRET','LINE_CHANNEL_ACCESS_TOKEN','OPENAI_API_KEY','CODEX_API_KEY','ANTHROPIC_API_KEY'])delete env[k];
-    env.PORT=String(port);env.HOST='127.0.0.1';env.TASKFLOW_DB_FILE=previewDbPath;
-    // 這個 Preview 只有一個程序，PORT 就是它自己的 port；語意化別名一併提供，
-    // 讓專案不必再從 PORT 反推「這是前端還是後端」（計畫書第八章）。
-    env.PREVIEW_PORT=String(port);env.PREVIEW_URL=`http://127.0.0.1:${port}`;
-    // 非 TaskFlow 結構的專案讀不到上面那個資料庫，但可以在啟動時看見這組環境變數，
-    // 自己建立同樣的暫時帳號（README 的 Acceptance Bootstrap 約定）。
-    Object.assign(env,acceptanceEnvironment(acceptance));
-    acceptance.injection.environment=true;
-    const child=spawn(process.execPath,[serverFile],{cwd:path,env,shell:false,windowsHide:true});
-    let stderr='';
-    child.stderr?.on('data',d=>{stderr=(stderr+d).slice(-3000);});
-    let startupSettled=false;
-    const exitPromise=new Promise((_,reject)=>{
-      child.once('error',err=>{if(!startupSettled){startupSettled=true;reject(new HttpError(500,`啟動 Preview 伺服器失敗：${err.message}`));}});
-      child.once('exit',code=>{if(!startupSettled){startupSettled=true;reject(new HttpError(422,`Preview 伺服器提前結束（code ${code}）：${stderr||'(無 stderr 輸出)'}`));}});
-    });
-    const url=`http://127.0.0.1:${port}`;
-    try{
-      await Promise.race([exitPromise,waitForHealth(url,20000)]);
-    }catch(err){
-      // Wait for the child to actually exit before rejecting, so a failed/timed-out startup
-      // never leaves an orphaned process still holding its cwd (and this fixture's temp dir) open.
-      await new Promise(resolveKill=>{
-        if(child.exitCode!==null||child.signalCode){resolveKill();return;}
-        const timer=setTimeout(resolveKill,5000);
-        child.once('exit',()=>{clearTimeout(timer);resolveKill();});
-        killTree(child);
-      });
-      throw err;
-    }finally{
-      exitPromise.catch(()=>{});
+    attempts: for(let attempt=1;attempt<=MAX_PORT_BIND_ATTEMPTS;attempt++){
+      const port=await allocatePort(portManager,{taskId:key,serviceId:'app'});
+      // 這個 lease 在 spawn 成功、bindPid() 之前都還沒有 PID 撐著；下面任何一步失敗都要放回 pool。
+      let bound=false;
+      try{
+        const previewDbPath=resolve('data/preview',safeKeyFragment(key),'taskflow.sqlite');
+        // 驗收身份由 AcceptanceContext 產生，Preview 與 Deployment Validator 共用同一份。
+        // 兩邊各自產生帳密，就是 /api/login 永遠 401 的成因。
+        const acceptance=createAcceptanceContext({projectPath:path,key});
+        // 每一次啟動都把驗收帳號**重設**成這一輪的密碼。之前只在「資料庫完全沒有使用者」時
+        // 才寫入，而 Preview 資料庫是跨次保留的——第二次之後 validator 手上的新密碼
+        // 與資料庫裡的舊雜湊永遠對不起來，登入必定 401。
+        try{
+          const seedStore=createStore(previewDbPath);
+          try{seedStore.upsertUser('TaskFlow Preview',acceptance.username,acceptance.password,'admin');acceptance.injection.database=true;}
+          finally{seedStore.close();}
+        }catch(error){acceptance.injection.error=String(error?.message||error).slice(0,200);}
+        const env={...process.env};
+        for(const k of ['INBOX_TOKEN','LINE_CHANNEL_SECRET','LINE_CHANNEL_ACCESS_TOKEN','OPENAI_API_KEY','CODEX_API_KEY','ANTHROPIC_API_KEY'])delete env[k];
+        env.PORT=String(port);env.HOST='127.0.0.1';env.TASKFLOW_DB_FILE=previewDbPath;
+        // 這個 Preview 只有一個程序，PORT 就是它自己的 port；語意化別名一併提供，
+        // 讓專案不必再從 PORT 反推「這是前端還是後端」（計畫書第八章）。
+        env.PREVIEW_PORT=String(port);env.PREVIEW_URL=`http://127.0.0.1:${port}`;
+        // 非 TaskFlow 結構的專案讀不到上面那個資料庫，但可以在啟動時看見這組環境變數，
+        // 自己建立同樣的暫時帳號（README 的 Acceptance Bootstrap 約定）。
+        Object.assign(env,acceptanceEnvironment(acceptance));
+        acceptance.injection.environment=true;
+        const child=spawn(process.execPath,[serverFile],{cwd:path,env,shell:false,windowsHide:true});
+        portManager.bindPid(port,child.pid);
+        bound=true;
+        let stderr='';
+        child.stderr?.on('data',d=>{stderr=(stderr+d).slice(-3000);});
+        let startupSettled=false;
+        const exitPromise=new Promise((_,reject)=>{
+          child.once('error',err=>{if(!startupSettled){startupSettled=true;reject(new HttpError(500,`啟動 Preview 伺服器失敗：${err.message}`));}});
+          child.once('exit',code=>{if(!startupSettled){startupSettled=true;reject(new HttpError(422,`Preview 伺服器提前結束（code ${code}）：${stderr||'(無 stderr 輸出)'}`));}});
+        });
+        const url=`http://127.0.0.1:${port}`;
+        try{
+          await Promise.race([exitPromise,waitForHealth(url,20000)]);
+        }catch(err){
+          // Wait for the child to actually exit before rejecting, so a failed/timed-out startup
+          // never leaves an orphaned process still holding its cwd (and this fixture's temp dir) open.
+          await new Promise(resolveKill=>{
+            if(child.exitCode!==null||child.signalCode){resolveKill();return;}
+            const timer=setTimeout(resolveKill,5000);
+            child.once('exit',()=>{clearTimeout(timer);resolveKill();});
+            killTree(child);
+          });
+          // 確認 PID 真的消失、port 真的釋放，才把 lease 放回 pool——順序不能反過來。
+          if(await waitForExit(child.pid,{timeoutMs:5000})&&await waitForPortRelease(port))portManager.release(port);
+          // acquire() 選中的候選 port 與這裡真正 spawn 之間有檢查空檔，另一個獨立的 TaskFlow
+          // 行程可能搶先 bind 到同一個 port；真的撞上時租一個新的再試，而不是當成專案本身的啟動失敗。
+          if(attempt<MAX_PORT_BIND_ATTEMPTS&&isPortBindCollision(stderr))continue attempts;
+          throw err;
+        }finally{
+          exitPromise.catch(()=>{});
+        }
+        startupSettled=true;
+        // credentials 是既有呼叫端（runner.js 的 Browser Validation prompt）用的舊形狀，
+        // 值直接取自同一個 AcceptanceContext——不是另外產生的第二組。
+        const info={url,kind:'fullstack',pid:child.pid,port,cwd:path,acceptance,credentials:{username:acceptance.username,password:acceptance.password},previewDbPath};
+        running.set(key,{child,info});
+        registerPreview(registryPath,{key,pid:child.pid,url,kind:'fullstack',cwd:path});
+        child.once('exit',()=>{if(running.get(key)?.child===child)running.delete(key);unregisterPreview(registryPath,key);});
+        return info;
+      }catch(error){
+        if(!bound)portManager.release(port);
+        throw error;
+      }
     }
-    startupSettled=true;
-    // credentials 是既有呼叫端（runner.js 的 Browser Validation prompt）用的舊形狀，
-    // 值直接取自同一個 AcceptanceContext——不是另外產生的第二組。
-    const info={url,kind:'fullstack',pid:child.pid,cwd:path,acceptance,credentials:{username:acceptance.username,password:acceptance.password},previewDbPath};
-    running.set(key,{child,info});
-    registerPreview(registryPath,{key,pid:child.pid,url,kind:'fullstack',cwd:path});
-    child.once('exit',()=>{if(running.get(key)?.child===child)running.delete(key);unregisterPreview(registryPath,key);});
-    return info;
+    throw new HttpError(503,'TaskFlow runtime port pool 連續多次都撞上其他行程正在搶用的 port，請稍後再試。');
   }
 
   // Multi-Service Preview：依 topology 啟動整組服務，前端由 TaskFlow 自管並轉發到後端。
@@ -327,9 +347,22 @@ export function createProjectPreview({npm=runNpm,registryPath=resolve('data/prev
         root=join(projectRoot,'dist');
       }
       if(!existsSync(join(root,'index.html')))throw new HttpError(422,'找不到網頁入口 dist/index.html，請確認建置輸出設定。');
-      const server=await createStaticServer({root,kind});
-      const info={url:`http://127.0.0.1:${server.address().port}`,kind};
-      running.set(key,{server,info});return info;
+      for(let attempt=1;attempt<=MAX_PORT_BIND_ATTEMPTS;attempt++){
+        const port=await allocatePort(portManager,{taskId:key,serviceId:'preview'});
+        let server;
+        try{server=await createStaticServer({root,kind,port});}
+        catch(error){
+          portManager.release(port);
+          // acquire() 選中的候選 port 與這裡真正 listen 之間有檢查空檔，另一個獨立的 TaskFlow
+          // 行程可能搶先 bind 到同一個 port；真的撞上時租一個新的再試。
+          if(attempt<MAX_PORT_BIND_ATTEMPTS&&(error?.code==='EADDRINUSE'||isPortBindCollision(error?.message)))continue;
+          throw error;
+        }
+        portManager.bindPid(port,null);
+        const info={url:`http://127.0.0.1:${server.address().port}`,kind,port};
+        running.set(key,{server,info});return info;
+      }
+      throw new HttpError(503,'TaskFlow runtime port pool 連續多次都撞上其他行程正在搶用的 port，請稍後再試。');
     })();
     pending.set(key,job);
     try{return await job;}finally{pending.delete(key);}
@@ -357,7 +390,13 @@ export function createProjectPreview({npm=runNpm,registryPath=resolve('data/prev
       return {stopped:true,pid:null,verified:outcome.verified!==false,services:outcome.services};
     }
     if(item.server){item.server.closeAllConnections();await new Promise(resolve=>item.server.close(resolve));}
-    if(!item.child){unregisterPreview(registryPath,key);return {stopped:true,pid:null,verified:true};}
+    if(!item.child){
+      unregisterPreview(registryPath,key);
+      // 單一服務靜態／vite 預覽沒有子程序，express 的 close() callback 已經確認關閉，
+      // 這裡仍照既有原則再向作業系統確認一次「port 真的不再 Listen」才 release，不用猜的。
+      if(item.info?.port!=null&&await waitForPortRelease(item.info.port))portManager.release(item.info.port);
+      return {stopped:true,pid:null,verified:true};
+    }
     await new Promise(resolveStop=>{
       if(item.child.exitCode!==null||item.child.signalCode){resolveStop();return;}
       const timer=setTimeout(resolveStop,5000);
@@ -367,6 +406,9 @@ export function createProjectPreview({npm=runNpm,registryPath=resolve('data/prev
     // killTree() 在 Windows 上是射後不理，子程序的 exit 事件也只在「它是我們的子程序」時才可靠。
     // 這裡再向作業系統確認一次 PID 真的不見了；沒消失就照實回報 verified:false，不假裝停好了。
     const verified=await waitForExit(item.info?.pid,{timeoutMs:5000});
+    // PID 沒真的消失就不 release：port 可能還被它聽著，放回 pool 只會製造下一個 runtime
+    // 搶到同一個 port 的 race condition，交給日後的 reconcile() 依 PID 再判斷一次。
+    if(verified&&item.info?.port!=null&&await waitForPortRelease(item.info.port))portManager.release(item.info.port);
     unregisterPreview(registryPath,key);
     // 一次性驗收身份到這裡為止：把帳號與工作階段從 Preview 資料庫刪掉，再把記憶體裡的
     // 祕密抹掉。留著等下一次「反正會重設」不算隔離——Preview 資料庫在磁碟上是留著的。

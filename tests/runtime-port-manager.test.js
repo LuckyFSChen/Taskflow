@@ -69,8 +69,11 @@ test('Test 3: 連續 acquire 不會配到同一個 port，跨 task 也全域唯�
 test('Test 4: 外部程式佔用的 port 會被跳過，不會被配發也不會被 kill', async () => {
   const busy = new Set([SMALL_RANGE.start, SMALL_RANGE.start + 1]);
   const manager = createRuntimePortManager({range: SMALL_RANGE, checkPortInUse: async port => busy.has(port), log: silent});
+  // acquire() 的掃描起點是隨機的（降低多個獨立 TaskFlow 行程互撞的機率，見 runtime-port-manager.js
+  // 的註解），所以這裡不能斷言配到「哪一個」空的 port，只能斷言絕對不會是被佔用的那兩個。
   const port = await manager.acquire({taskId: 'A', serviceId: 'backend'});
-  assert.equal(port, SMALL_RANGE.start + 2);
+  assert.ok(!busy.has(port), `不得配到外部程式已佔用的 port，實際配到 ${port}`);
+  assert.ok(port >= SMALL_RANGE.start && port <= SMALL_RANGE.end);
   assert.equal(await manager.isAvailable(SMALL_RANGE.start), false);
 });
 
