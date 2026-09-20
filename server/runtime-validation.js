@@ -50,11 +50,25 @@ export class RuntimeFailure extends Error {
   }
 }
 
-const HTML_BODY = /^\s*(<!doctype html|<html[\s>])/i;
+// 我們真正要抓的是「請求落進了前端的 SPA fallback」，也就是拿到一份**完整的 HTML 文件**。
+// 這跟 express `res.redirect()` 那種 `<p>Moved Permanently…</p>` 的小 HTML 片段不同，
+// 也跟後端自己回的一頁錯誤訊息不同。只看 Content-Type 是 text/html 會把 301 redirect
+// 誤判成 proxy 失敗——那正是把 /uploads 判死的原因。
+const HTML_DOCUMENT = /<!doctype html|<html[\s>]/i;
 
 function mediaType(header) {
   return String(header || '').split(';')[0].trim().toLowerCase();
 }
+
+function looksLikeSpaFallback(contentType, text) {
+  return mediaType(contentType) === 'text/html' && HTML_DOCUMENT.test(text || '');
+}
+
+const matchesPrefix = (path, prefix) => {
+  if (prefix === '/') return true;
+  const clean = prefix.endsWith('/') ? prefix.slice(0, -1) : prefix;
+  return path === clean || path.startsWith(`${clean}/`);
+};
 
 /**
  * 驗一次 API 回應的語意，而不只是狀態碼。
@@ -85,13 +99,25 @@ export async function validateApiResponse(url, expectation = {}, {fetchImpl = fe
   const preview = text.slice(0, 200);
   const result = {...base, status, contentType, bodyPreview: preview};
 
+  const spaFallback = looksLikeSpaFallback(contentType, text);
+
   if (expectation.anyHttpResponse) {
     // 「有回應就算通過」的最弱模式，但仍然要排除 SPA fallback：後端如果回的是 HTML 首頁，
     // 那多半代表我們打到的是前端而不是後端。
-    if (HTML_BODY.test(text) || contentType === 'text/html') {
-      return {...result, failureKind: expectation.via === 'frontend' ? 'proxy_routing_failure' : 'unexpected_content_type', detail: `期待後端回應，實際收到 HTML（${contentType || '未標示型別'}）。`};
+    if (spaFallback) {
+      return {...result, failureKind: expectation.via === 'frontend' ? 'proxy_routing_failure' : 'unexpected_content_type', detail: `期待後端回應，實際收到 HTML 文件（${contentType || '未標示型別'}），這是前端的 SPA fallback。`};
     }
     return {...result, passed: true};
+  }
+
+  // static／媒體 namespace 的判準：唯一不可接受的是「落進 SPA fallback」。
+  // 301 導向、404 找不到檔案、200 image/*、200 application/pdf 全都是合法的轉發結果。
+  if (expectation.mode === 'not_spa_fallback') {
+    if (status >= 300 && status < 400) return {...result, passed: true, detail: `${status} 導向，未落入 SPA fallback。`};
+    if (spaFallback) {
+      return {...result, failureKind: expectation.via === 'frontend' ? 'proxy_routing_failure' : 'unexpected_content_type', detail: `落進前端的 SPA fallback：${status} ${contentType}，body 是完整的 HTML 文件。`};
+    }
+    return {...result, passed: true, detail: `${status} ${contentType || '未標示型別'}，未落入 SPA fallback。`};
   }
 
   if (expectation.expectedStatus != null && status !== expectation.expectedStatus) {
@@ -102,10 +128,10 @@ export async function validateApiResponse(url, expectation = {}, {fetchImpl = fe
     const expected = mediaType(expectation.expectedContentType);
     if (contentType !== expected) {
       // 這是整個整改的核心判定：200 + text/html 而我們要的是 JSON，就是 routing／proxy 壞了。
-      const kind = (contentType === 'text/html' || HTML_BODY.test(text))
+      const kind = spaFallback
         ? (expectation.via === 'frontend' ? 'proxy_routing_failure' : 'unexpected_content_type')
         : 'unexpected_content_type';
-      return {...result, failureKind: kind, detail: `expected ${expected}, received ${contentType || '（未標示 Content-Type）'}${HTML_BODY.test(text) ? '，且 body 是 HTML 文件（SPA fallback）' : ''}。`};
+      return {...result, failureKind: kind, detail: `expected ${expected}, received ${contentType || '（未標示 Content-Type）'}${spaFallback ? '，且 body 是 HTML 文件（SPA fallback）' : ''}。`};
     }
   }
 
@@ -180,38 +206,92 @@ export async function validateFrontendRoot(frontendUrl, {fetchImpl = fetch, time
  * 直接打 backend port 只證明後端活著，證明不了前端那一層的轉發有沒有接上——而使用者
  * 在瀏覽器裡走的正是前端那一層。所以這裡刻意繞遠路，經過 frontend preview。
  */
-export async function validateConnectivity({frontendUrl, probes = [], fetchImpl = fetch, timeoutMs = 5000} = {}) {
+export async function validateConnectivity({frontendUrl, probes = [], skipped = [], fetchImpl = fetch, timeoutMs = 5000} = {}) {
   const checks = [];
   for (const probe of probes) {
     const url = join(frontendUrl, probe.path);
+    const isStatic = probe.kind === 'static';
     const outcome = await validateApiResponse(url, {
       expectedStatus: probe.expectedStatus ?? null,
-      expectedContentType: probe.expectedContentType || 'application/json',
+      expectedContentType: isStatic ? null : (probe.expectedContentType || 'application/json'),
       expectedJsonShape: probe.expectedJsonShape || null,
+      mode: isStatic ? 'not_spa_fallback' : 'json',
       via: 'frontend',
     }, {fetchImpl, timeoutMs});
     checks.push({
-      name: probe.name || `connectivity:${probe.path}`,
+      name: probe.name || `frontend_proxy:${probe.path}`,
       method: 'GET',
       path: probe.path,
-      expected: `${probe.expectedStatus ?? '2xx/4xx'} ${probe.expectedContentType || 'application/json'}`,
-      actual: outcome.passed ? `${outcome.status} ${outcome.contentType}` : `${outcome.status ?? '無回應'} ${outcome.contentType || ''}`.trim(),
+      kind: probe.kind || 'api',
+      expected: isStatic ? '任何非 SPA fallback 的回應' : `${probe.expectedStatus ?? '任意狀態碼'} ${probe.expectedContentType || 'application/json'}`,
+      actual: `${outcome.status ?? '無回應'} ${outcome.contentType || ''}`.trim(),
       passed: outcome.passed,
       failureKind: outcome.failureKind,
       detail: outcome.detail,
+      source: probe.source || null,
       url,
     });
+  }
+  // 驗不到的項目標成 skipped 並說明原因，不是靜靜放行、也不是判失敗。
+  for (const item of skipped) {
+    checks.push({name: item.name, method: '—', path: item.path || null, kind: item.kind || 'static', expected: '—', actual: '未驗證', passed: true, skipped: true, failureKind: null, detail: item.reason, url: null});
   }
   const failed = checks.find(check => !check.passed);
   return {passed: !failed, checks, failureKind: failed?.failureKind || null, detail: failed?.detail || null};
 }
 
 /**
- * 沒有登入也應該回 JSON 的探針。401/403 都算「後端真的接到了」——重點是 Content-Type，
- * 不是狀態碼。只有 200-but-HTML 才是我們要抓的那個假陽性。
+ * 決定「要打哪些端點」來證明前端到後端的轉發真的通了。
+ *
+ * 這裡有一個曾經搞錯的區別，必須寫清楚：
+ *
+ *   proxyPaths 是 **namespace**——`/api` 的意思是「`/api/*` 轉發給後端」，
+ *   它**不**代表後端有實作 `GET /api`。拿 namespace 本身當端點去打，會得到
+ *   一個完全合理的 404，然後被誤判成 proxy_routing_failure，接著整組 runtime
+ *   被沒必要地重啟兩次——真正的問題反而被這些 noise 蓋掉。
+ *
+ * 所以端點的來源只有三個，依序：
+ *   1. service.validationProbes 明確宣告的端點
+ *   2. 呼叫端另外指定的端點
+ *   3. 後端 healthCheck.path（而且必須被某條 proxyPath 涵蓋）
+ *
+ * static namespace（/uploads、/static…）沒有可驗證的實際檔案時一律 skipped，
+ * 不編一個路徑出來，也不要求它回 JSON。
  */
-export function defaultConnectivityProbes(service, {extraPaths = []} = {}) {
-  const health = service?.healthCheck?.path;
-  const paths = [...new Set([health, ...extraPaths].filter(path => typeof path === 'string' && path.startsWith('/')))];
-  return paths.map(path => ({path, name: `frontend_proxy:${path}`, expectedContentType: 'application/json', expectedStatus: null}));
+export function deriveConnectivityProbes(topology, entry, {extraProbes = []} = {}) {
+  const probes = [], skipped = [];
+  const proxies = (entry?.proxyPaths || []).map(item => (typeof item === 'string' ? {path: item, kind: 'api'} : item));
+  const covered = path => proxies.find(proxy => matchesPrefix(path, proxy.path)) || null;
+  const push = (probe, source) => {
+    if (probes.some(item => item.path === probe.path)) return;
+    probes.push({...probe, source});
+  };
+
+  for (const probe of entry?.validationProbes || []) push(probe, '專案宣告的 validationProbes');
+  for (const probe of extraProbes) push(typeof probe === 'string' ? {path: probe, kind: 'api', expectedContentType: 'application/json'} : probe, '呼叫端指定');
+
+  if (!probes.some(probe => (probe.kind || 'api') === 'api')) {
+    for (const service of (topology?.services || []).filter(item => ['backend', 'worker'].includes(item.type))) {
+      const path = service.healthCheck?.path;
+      if (!path || !path.startsWith('/') || service.healthCheck?.inferred) {
+        skipped.push({name: `frontend_proxy:${service.id}`, reason: `${service.id} 沒有可靠的健康檢查端點（偵測不到，或只是推測值），無法據此驗證前端到後端的轉發。請在 taskflow.runtime.json 的 validationProbes 指定一個實際端點。`});
+        continue;
+      }
+      if (!covered(path)) {
+        skipped.push({name: `frontend_proxy:${service.id}`, path, reason: `${service.id} 的健康檢查端點 ${path} 不在前端的轉發範圍（${proxies.map(proxy => proxy.path).join('、') || '無'}）內，無法經由前端驗證。`});
+        continue;
+      }
+      push({path, kind: 'api', expectedStatus: null, expectedContentType: service.healthCheck.expectedContentType || 'application/json', expectedJsonShape: null}, `${service.id} 的健康檢查端點`);
+    }
+  }
+
+  for (const proxy of proxies.filter(item => item.kind === 'static')) {
+    if (probes.some(probe => matchesPrefix(probe.path, proxy.path))) continue;
+    skipped.push({
+      name: `frontend_proxy:${proxy.path}`, path: proxy.path, kind: 'static',
+      reason: `${proxy.path} 是檔案／媒體 namespace，沒有可驗證的實際檔案。它合法地可能回 301、404 或二進位內容，因此不套用 JSON 驗證。要驗的話請在 validationProbes 指定一個確實存在的檔案路徑。`,
+    });
+  }
+
+  return {probes, skipped};
 }

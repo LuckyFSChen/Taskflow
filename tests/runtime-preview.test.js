@@ -39,7 +39,7 @@ createServer((req, res) => {
 
 const SPA = '<!DOCTYPE html><html><head><title>fixture</title></head><body><div id="app">frontend</div></body></html>';
 
-function writeFixture({healthy = true, proxyPaths = ['/api', '/uploads']} = {}) {
+function writeFixture({healthy = true, proxyPaths = ['/api', '/uploads'], validationProbes = null} = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tf-runtime-'));
   mkdirSync(join(root, 'backend'), {recursive: true});
   mkdirSync(join(root, 'frontend/dist'), {recursive: true});
@@ -55,7 +55,7 @@ function writeFixture({healthy = true, proxyPaths = ['/api', '/uploads']} = {}) 
           healthCheck: {path: '/api/health', expectedStatus: 200, expectedContentType: 'application/json', expectedJsonShape: {ok: true}},
           environment: {TF_MARKER: join(root, 'backend-started.json').split('\\').join('/')},
         },
-        {id: 'frontend', type: 'frontend', cwd: 'frontend', dependsOn: ['backend'], browserEntry: true, proxyPaths},
+        {id: 'frontend', type: 'frontend', cwd: 'frontend', dependsOn: ['backend'], browserEntry: true, proxyPaths, ...(validationProbes ? {validationProbes} : {})},
       ],
     },
   }));
@@ -144,10 +144,11 @@ test('Test 4 — backend 健康檢查失敗時，整組 runtime 不成立，Brow
   assert.equal(previews.status('multi-unhealthy'), null);
 });
 
-test('Test 5 — 轉發沒涵蓋 /api 時，SPA fallback 的 200 被判定為 proxy_routing_failure 而非通過', async t => {
-  // 這正是整改前 idv-web 的形狀：frontend preview 開得起來、/api/* 回 200，
-  // 但內容是 index.html。整改後必須辨識得出來，並說得出「expected json, received html」。
-  const root = writeFixture({proxyPaths: ['/nothing']});
+test('Test 5 — 宣告的驗證端點實際上沒有被轉發時，SPA fallback 的 200 判定為 proxy_routing_failure', async t => {
+  // 這正是整改前 idv-web 的形狀：frontend preview 開得起來、被驗的那條路徑回 200，
+  // 但內容是 index.html。這裡用「宣告了 /api/health 這個驗證端點，但轉發範圍其實沒有涵蓋它」
+  // 來忠實重現——注意 namespace 本身（/api、/uploads）永遠不會被拿去打，那是另一回事。
+  const root = writeFixture({proxyPaths: ['/nothing'], validationProbes: [{path: '/api/health'}]});
   const previews = createProjectPreview({npm: fakeNpm, registryPath: join(root, 'registry.json')});
   t.after(async () => { await previews.close().catch(() => {}); rmDirSafe(root); });
 
@@ -168,6 +169,72 @@ test('Test 5 — 轉發沒涵蓋 /api 時，SPA fallback 的 200 被判定為 pr
   assert.match(failed.detail, /received text\/html/);
   // 自動回復用盡才 block，而且次數有上限。
   assert.ok(outcome.attempts.length >= 1 && outcome.attempts.length <= 2);
+});
+
+// --- 案例 4／5：recovery 之後的 authoritative runtime state ----------------------
+// Windows 實測暴露的矛盾：事件裡明明有 runtime_service_ready backend／frontend，
+// 步驟卻說「沒有後端服務」，shutdown 還回 []。原因是回復建立的新 runtime 沒有成為
+// 呼叫端持有的那一份。這兩個測試把「誰是 authoritative runtime state」釘死。
+test('案例 4 — 第一次失敗、第二次成功時，呼叫端拿到的是第二次那一組 runtime', async t => {
+  const root = writeFixture();
+  const real = createProjectPreview({npm: fakeNpm, registryPath: join(root, 'registry.json')});
+  t.after(async () => { await real.close().catch(() => {}); rmDirSafe(root); });
+
+  let starts = 0;
+  const previews = {
+    start: async (key, path) => {
+      starts++;
+      // 第一次以一個可回復的 runtime 失敗收場（例如連接埠被別人占走）。
+      if (starts === 1) { const error = new Error('連接埠已被占用'); error.kind = 'port_conflict'; throw error; }
+      return real.start(key, path);
+    },
+    stop: key => real.stop(key),
+    status: key => real.status(key),
+  };
+
+  const outcome = await runtimePreflight('multi-recover', root, {previews});
+  assert.equal(starts, 2, '第一次失敗之後必須真的重試一次');
+  assert.equal(outcome.passed, true);
+  assert.ok(outcome.runtime, '通過時也要帶著 authoritative runtime 狀態');
+  assert.equal(outcome.runtime.services.length, 2);
+  const backend = outcome.runtime.services.find(service => service.id === 'backend');
+  assert.equal(backend.status, 'READY');
+  // 這個 PID 必須是**現在真的活著**的那一個，不是第一輪留下的舊值。
+  assert.equal(isAlive(backend.pid), true);
+  assert.equal(outcome.previewUrl, real.status('multi-recover').url);
+  // 經由這一組（而不是舊的）確認轉發真的通。
+  const health = await fetch(`${outcome.previewUrl}/api/health`);
+  assert.match(health.headers.get('content-type'), /application\/json/);
+
+  const stopped = await previews.stop('multi-recover');
+  assert.equal(stopped.services.length, 2);
+  assert.equal(isAlive(backend.pid), false);
+});
+
+test('案例 5 — 回復用盡而 block 時，runtime 狀態與 shutdown 結果都要帶回來，不得是空的', async t => {
+  const root = writeFixture({proxyPaths: ['/nothing'], validationProbes: [{path: '/api/health'}]});
+  const previews = createProjectPreview({npm: fakeNpm, registryPath: join(root, 'registry.json')});
+  t.after(async () => { await previews.close().catch(() => {}); rmDirSafe(root); });
+
+  const outcome = await runtimePreflight('multi-blocked', root, {previews, maxAttempts: 1});
+  assert.equal(outcome.passed, false);
+  assert.equal(outcome.previewUrl, null, 'runtime 已經收掉了，不該再給一個指向死掉服務的網址');
+
+  // 服務**確實**曾經 READY——這是「卡在轉發那一層」的唯一證據，不能被丟掉。
+  assert.ok(outcome.runtime, 'block 的結論必須帶著最後一次實際建立的 runtime 狀態');
+  const backend = outcome.runtime.services.find(service => service.id === 'backend');
+  const frontend = outcome.runtime.services.find(service => service.id === 'frontend');
+  assert.equal(backend.status, 'READY');
+  assert.equal(frontend.status, 'READY');
+  assert.ok(Number.isInteger(backend.pid));
+
+  // shutdown 是 preflight 在回復流程裡做的，但結果必須交回呼叫端：不能是 []。
+  assert.ok(outcome.shutdown, 'block 時也要回報關閉結果');
+  assert.equal(outcome.shutdown.services.length, 2);
+  for (const service of outcome.shutdown.services) assert.equal(service.verified, true);
+  assert.equal(isAlive(backend.pid), false, '最後一組 runtime 的子程序必須真的被停掉');
+  assert.equal(await portInUse(frontend.port), false);
+  assert.equal(previews.status('multi-blocked'), null);
 });
 
 test('Test 7／8 — runtime 指紋改變時只重啟受影響的服務，沒變的沿用同一個程序', async t => {

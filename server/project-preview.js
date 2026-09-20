@@ -156,7 +156,9 @@ function matchesPrefix(path,prefix){
   return path===clean||path.startsWith(clean+'/');
 }
 export function createProxyMiddleware(prefixes,target){
-  const list=(prefixes||[]).filter(prefix=>typeof prefix==='string'&&prefix.startsWith('/'));
+  // proxyPaths 現在是 {path,kind} 的陣列（kind 只影響驗證方式，不影響轉發本身）；
+  // 仍接受純字串，讓舊的呼叫端與測試不必一起改。
+  const list=(prefixes||[]).map(entry=>typeof entry==='string'?entry:entry?.path).filter(prefix=>typeof prefix==='string'&&prefix.startsWith('/'));
   if(!list.length||!target)return (req,res,next)=>next();
   const upstream=new URL(target);
   return (req,res,next)=>{

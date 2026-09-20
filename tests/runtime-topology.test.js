@@ -14,8 +14,9 @@ import {tmpdir} from 'node:os';
 import {
   detectTopology, resolveRuntimeTopology, normalizeTopology, orderRuntimeServices,
   dependentsOf, runtimeServiceFingerprint, detectProxyPaths, detectPackageManager, detectHealthPath,
+  proxyPathKind, normalizeProxyPath,
 } from '../server/runtime-topology.js';
-import {validateApiResponse, validateConnectivity, RUNTIME_FAILURE_KINDS} from '../server/runtime-validation.js';
+import {validateApiResponse, validateConnectivity, deriveConnectivityProbes, RUNTIME_FAILURE_KINDS} from '../server/runtime-validation.js';
 import {
   isRecoverableRuntimeFailure, requiresUserInput, shouldTriggerRepair, failureOwner,
   recoveryPlan, MAX_RUNTIME_RECOVERY_ATTEMPTS,
@@ -87,7 +88,9 @@ test('Test 2 — frontend/backend 同時存在時偵測出兩個 service，且�
   assert.equal(frontend.cwd, 'frontend');
   assert.equal(frontend.browserEntry, true);
   assert.deepEqual(frontend.dependsOn, ['backend']);
-  assert.deepEqual(frontend.proxyPaths, ['/api', '/uploads'], 'proxy 路徑取自專案自己的 vite 設定');
+  // proxy 路徑取自專案自己的 vite 設定，而且帶 kind：/api 是 JSON API namespace，
+  // /uploads 是檔案 namespace。少了這個區分，一個合法的 301 就會被誤判成轉發失敗。
+  assert.deepEqual(frontend.proxyPaths, [{path: '/api', kind: 'api'}, {path: '/uploads', kind: 'static'}]);
 
   // detectWebProject 必須仍然回報「這是網頁專案」，否則 Browser Validation 根本不會被要求。
   assert.equal(detectWebProject(root), 'vite');
@@ -291,8 +294,124 @@ test('detectProxyPaths 只取路徑、不沿用寫死的 target；沒有 proxy �
   const root = fixture();
   t.after(() => rmDirSafe(root));
   const withProxy = writeFrontend(root, {name: 'frontend'});
-  assert.deepEqual(detectProxyPaths(withProxy), ['/api', '/uploads']);
+  assert.deepEqual(detectProxyPaths(withProxy), [{path: '/api', kind: 'api'}, {path: '/uploads', kind: 'static'}]);
   const withoutProxy = writeFrontend(root, {name: 'plain', proxy: false});
-  assert.deepEqual(detectProxyPaths(withoutProxy), ['/api']);
+  assert.deepEqual(detectProxyPaths(withoutProxy), [{path: '/api', kind: 'api'}]);
   assert.equal(detectHealthPath(writeBackend(root, {name: 'svc'})), '/api/health');
+});
+
+// --- Probe semantics：namespace 不等於端點 -------------------------------------
+// 這一組守住 Windows 實測暴露的問題：把 proxy namespace 本身當 API endpoint 去打，
+// 會得到一個完全合理的 404／301，然後被誤判成 proxy_routing_failure，
+// 接著整組 runtime 被沒必要地重啟兩次——真正的問題反而被 noise 蓋掉。
+test('proxyPath 帶 kind：/api 是 API namespace，/uploads 是檔案 namespace', () => {
+  assert.equal(proxyPathKind('/api'), 'api');
+  assert.equal(proxyPathKind('/graphql'), 'api');
+  assert.equal(proxyPathKind('/uploads'), 'static');
+  assert.equal(proxyPathKind('/static'), 'static');
+  assert.equal(proxyPathKind('/media'), 'static');
+  assert.deepEqual(normalizeProxyPath('/uploads'), {path: '/uploads', kind: 'static'});
+  // 明確宣告永遠贏過推測。
+  assert.deepEqual(normalizeProxyPath({path: '/uploads', kind: 'api'}), {path: '/uploads', kind: 'api'});
+  assert.throws(() => normalizeProxyPath('api'), /必須是以 \/ 開頭/);
+});
+
+test('案例 1／2 — 驗證端點由 healthCheck 衍生，namespace 本身不會被拿去打；static namespace 標成未驗證', () => {
+  const topology = normalizeTopology({services: [
+    {id: 'backend', type: 'backend', cwd: '', startCommand: 'node s.js',
+      healthCheck: {path: '/api/health', expectedStatus: 200, expectedContentType: 'application/json'}},
+    {id: 'frontend', type: 'frontend', cwd: '', dependsOn: ['backend'], browserEntry: true, proxyPaths: ['/api', '/uploads']},
+  ]}, '/tmp');
+  const entry = topology.services.find(service => service.browserEntry);
+  const {probes, skipped} = deriveConnectivityProbes(topology, entry);
+
+  // 案例 1：只打 /api/health，不打 /api 本身。
+  assert.deepEqual(probes.map(probe => probe.path), ['/api/health']);
+  assert.equal(probes[0].kind, 'api');
+  assert.match(probes[0].source, /健康檢查端點/);
+  assert.equal(probes.some(probe => probe.path === '/api'), false, '/api 是 namespace，不是端點');
+
+  // 案例 2：/uploads 沒有可驗證的實際檔案 → skipped 並說明原因，不是 fail。
+  assert.deepEqual(skipped.map(item => item.path), ['/uploads']);
+  assert.match(skipped[0].reason, /檔案／媒體 namespace/);
+  assert.equal(probes.some(probe => probe.path === '/uploads'), false);
+});
+
+test('案例 2 — /uploads 的 301 導向與二進位回應都不算 proxy_routing_failure', async () => {
+  const redirect = await validateApiResponse('http://127.0.0.1:1/uploads', {mode: 'not_spa_fallback', via: 'frontend'},
+    {fetchImpl: async () => response(301, 'text/html; charset=utf-8', '<p>Moved Permanently. Redirecting to /uploads/</p>')});
+  assert.equal(redirect.passed, true, 'express 的 redirect 會帶一小段 HTML，那不是 SPA fallback');
+
+  const image = await validateApiResponse('http://127.0.0.1:1/uploads/a.png', {mode: 'not_spa_fallback', via: 'frontend'},
+    {fetchImpl: async () => response(200, 'image/png', '\u0089PNG')});
+  assert.equal(image.passed, true);
+
+  const missing = await validateApiResponse('http://127.0.0.1:1/uploads/a.png', {mode: 'not_spa_fallback', via: 'frontend'},
+    {fetchImpl: async () => response(404, 'application/json', '{"error":"not found"}')});
+  assert.equal(missing.passed, true, '檔案不存在是後端的合法回應，不是轉發失敗');
+
+  // 但落進 SPA fallback 仍然要抓出來——這才是 static namespace 真正要防的事。
+  const fallback = await validateApiResponse('http://127.0.0.1:1/uploads/a.png', {mode: 'not_spa_fallback', via: 'frontend'},
+    {fetchImpl: async () => response(200, 'text/html', '<!DOCTYPE html><html><body><div id="app"></div></body></html>')});
+  assert.equal(fallback.passed, false);
+  assert.equal(fallback.failureKind, 'proxy_routing_failure');
+});
+
+test('案例 3 — 真實 API 端點被 SPA fallback 回 200 text/html，仍然必須判 proxy_routing_failure', async () => {
+  const outcome = await validateConnectivity({
+    frontendUrl: 'http://127.0.0.1:1',
+    probes: [{path: '/api/profile', kind: 'api', expectedContentType: 'application/json'}],
+    fetchImpl: async () => response(200, 'text/html; charset=utf-8', '<!DOCTYPE html><html><body><div id="app"></div></body></html>'),
+  });
+  assert.equal(outcome.passed, false);
+  assert.equal(outcome.failureKind, 'proxy_routing_failure');
+  assert.match(outcome.checks[0].detail, /SPA fallback/);
+});
+
+test('/api root 回 404 不影響結論：衍生出來的端點是 /api/health，而它是 JSON', async () => {
+  const topology = normalizeTopology({services: [
+    {id: 'backend', type: 'backend', cwd: '', startCommand: 'node s.js', healthCheck: {path: '/api/health', expectedContentType: 'application/json'}},
+    {id: 'frontend', type: 'frontend', cwd: '', dependsOn: ['backend'], browserEntry: true, proxyPaths: ['/api']},
+  ]}, '/tmp');
+  const {probes, skipped} = deriveConnectivityProbes(topology, topology.services[1]);
+  const outcome = await validateConnectivity({
+    frontendUrl: 'http://127.0.0.1:1', probes, skipped,
+    // /api 本身 404 text/html；/api/health 正常 JSON。
+    fetchImpl: async url => (url.endsWith('/api/health')
+      ? response(200, 'application/json', '{"ok":true}')
+      : response(404, 'text/html', '<!DOCTYPE html><html><body>nope</body></html>')),
+  });
+  assert.equal(outcome.passed, true, '/api root 不存在不該讓 runtime 被判失敗');
+});
+
+test('明確宣告的 validationProbes 優先於衍生，且 static 類不套 JSON', () => {
+  const topology = normalizeTopology({services: [
+    {id: 'backend', type: 'backend', cwd: '', startCommand: 'node s.js', healthCheck: {path: '/api/health', expectedContentType: 'application/json'}},
+    {id: 'frontend', type: 'frontend', cwd: '', dependsOn: ['backend'], browserEntry: true,
+      proxyPaths: ['/api', '/uploads'],
+      validationProbes: [{path: '/api/profile'}, {path: '/uploads/seed.png', kind: 'static'}]},
+  ]}, '/tmp');
+  const {probes, skipped} = deriveConnectivityProbes(topology, topology.services[1]);
+  assert.deepEqual(probes.map(probe => probe.path), ['/api/profile', '/uploads/seed.png']);
+  assert.equal(probes[0].expectedContentType, 'application/json');
+  assert.equal(probes[1].expectedContentType, null, 'static 類不預設 Content-Type');
+  assert.equal(skipped.length, 0, '已經有明確的檔案探針就不必跳過 /uploads');
+});
+
+test('後端 health 只是推測值、或不在轉發範圍內時，標成未驗證並說明原因', () => {
+  const inferred = normalizeTopology({services: [
+    {id: 'backend', type: 'backend', cwd: '', startCommand: 'node s.js', healthCheck: {path: '/', anyHttpResponse: true, inferred: true}},
+    {id: 'frontend', type: 'frontend', cwd: '', dependsOn: ['backend'], browserEntry: true, proxyPaths: ['/api']},
+  ]}, '/tmp');
+  const first = deriveConnectivityProbes(inferred, inferred.services[1]);
+  assert.equal(first.probes.length, 0);
+  assert.match(first.skipped[0].reason, /偵測不到，或只是推測值/);
+
+  const outside = normalizeTopology({services: [
+    {id: 'backend', type: 'backend', cwd: '', startCommand: 'node s.js', healthCheck: {path: '/healthz', expectedContentType: 'application/json'}},
+    {id: 'frontend', type: 'frontend', cwd: '', dependsOn: ['backend'], browserEntry: true, proxyPaths: ['/api']},
+  ]}, '/tmp');
+  const second = deriveConnectivityProbes(outside, outside.services[1]);
+  assert.equal(second.probes.length, 0);
+  assert.match(second.skipped[0].reason, /不在前端的轉發範圍/);
 });

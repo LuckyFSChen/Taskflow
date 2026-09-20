@@ -61,9 +61,35 @@ Task
 其他自動判斷：
 
 * `healthCheck.path`：掃該服務的原始碼找 `'/api/health'`、`'/healthz'`、`'/ping'`、`'/status'` 這類路由。掃不到就標成 `inferred: true` 並改用 `anyHttpResponse`（「伺服器回應得出 HTTP 且不是 HTML」），不假裝有一個不存在的端點。
-* `proxyPaths`：讀專案自己的 `vite.config.*`／`vue.config.js`／`next.config.js` 的 `proxy` 區塊，**只取路徑，不取 target**。讀不到就預設 `['/api']`。
+* `proxyPaths`：讀專案自己的 `vite.config.*`／`vue.config.js`／`next.config.js` 的 `proxy` 區塊，**只取路徑，不取 target**。讀不到就預設 `/api`。每一條都帶 `kind`（見下節）。
 * `packageManager`：每個服務各自判斷（`pnpm-lock.yaml` / `yarn.lock` / `composer.json` / 預設 npm）。
 * 後端**不**自動建置：`dev` script 幾乎都是從原始碼直接跑（`tsx watch`、`nodemon`、`artisan serve`），先跑一次 `tsc` 只是白花時間，而且 build 失敗會擋住一個其實跑得起來的服務。需要先建置的專案在明確設定寫 `buildCommand`。
+
+## proxy namespace 與驗證端點是兩件事
+
+這是最容易搞錯、而且搞錯會很吵的一個區別：
+
+* `proxyPaths` 是 **namespace**。`/api` 的意思是「`/api/*` 轉發給後端」，**不**代表後端有實作 `GET /api`。拿 namespace 本身當端點去打，會得到一個完全合理的 404，然後被誤判成 `proxy_routing_failure`，接著整組 runtime 被沒必要地重啟——真正的問題反而被這些 noise 蓋掉。
+* 驗證端點是**實際存在的路徑**，例如 `/api/health`、`/api/profile`。
+
+每一條 proxy path 因此帶 `kind`：
+
+| kind | 什麼 | 怎麼驗 |
+| --- | --- | --- |
+| `api` | JSON API namespace（`/api`、`/graphql`、`/trpc`…） | 用**已知端點**驗，期待 `application/json` |
+| `static` | 檔案／媒體 namespace（`/uploads`、`/static`、`/media`、`/files`、`/assets`…） | 只證明「沒有落進 SPA fallback」。301 導向、404、`image/*`、`application/pdf` 全都合法 |
+
+`kind` 由路徑推斷，明確宣告永遠優先。
+
+驗證端點的來源依序是：
+
+1. service 的 `validationProbes`（明確宣告）
+2. 呼叫端另外指定的端點
+3. 後端 `healthCheck.path`，而且**必須被某條 proxyPath 涵蓋**
+
+三者都拿不到時（後端 health 是推測值、或不在轉發範圍內、或 static namespace 沒有可驗證的實際檔案），該項標成 **skipped 並附上原因**——不是 fail，也不是靜靜放行。
+
+「落進 SPA fallback」的判準是**完整的 HTML 文件**（`<!doctype html>` / `<html>`），不是單看 `Content-Type: text/html`——express 的 `res.redirect()` 也會送一小段 `<p>Moved Permanently…</p>`，那不是 SPA fallback。
 
 ## 明確宣告格式
 
@@ -93,14 +119,21 @@ Task
         "cwd": "frontend",
         "dependsOn": ["backend"],
         "browserEntry": true,
-        "proxyPaths": ["/api", "/uploads"]
+        "proxyPaths": [
+          { "path": "/api", "kind": "api" },
+          { "path": "/uploads", "kind": "static" }
+        ],
+        "validationProbes": [
+          { "path": "/api/profile" },
+          { "path": "/uploads/seed.png", "kind": "static" }
+        ]
       }
     ]
   }
 }
 ```
 
-`type` 是 `frontend` / `backend` / `worker` / `database` / `other`。`cwd` 必須在專案目錄內（`../` 會被拒絕）。`browserEntry` 最多一個。`dependsOn` 不得成環、不得指向不存在的 service——兩者都在解析階段就丟出可讀的錯誤，不會等到啟動時才炸。`persistent: true` 的服務在 Task 結束時不會被停掉。
+`proxyPaths` 也接受純字串（`"/api"`），`kind` 會依路徑推斷。`validationProbes` 省略時由後端的 `healthCheck` 衍生。`type` 是 `frontend` / `backend` / `worker` / `database` / `other`。`cwd` 必須在專案目錄內（`../` 會被拒絕）。`browserEntry` 最多一個。`dependsOn` 不得成環、不得指向不存在的 service——兩者都在解析階段就丟出可讀的錯誤，不會等到啟動時才炸。`persistent: true` 的服務在 Task 結束時不會被停掉。
 
 ## 連接埠與環境變數
 
@@ -139,7 +172,8 @@ Cleanup：反向順序關閉 → 確認 PID 消失 → 確認連接埠釋放
 直接打 backend port 只證明後端活著，證明不了前端那一層的轉發有沒有接上——而使用者在瀏覽器裡走的正是前端那一層。`validateApiResponse()` 會檢查 **status + Content-Type + body 可解析 + expectedJsonShape**，任何一項不符都判定未通過：
 
 * 期待 `application/json`、實際 `text/html`（而且 body 是 HTML 文件）→ `proxy_routing_failure`
-* `401` / `403` 但型別是 JSON → **通過**（後端真的接到了；重點是型別，不是狀態碼）
+* `401` / `403` / `404` 但型別是 JSON → **通過**（後端真的接到了；重點是型別，不是狀態碼）
+* `static` 類：`301` / `404` / `image/*` / `application/pdf` 全部通過，只有 SPA fallback 不通過
 * 轉發目標不在 → managed 前端回 `502 application/json`，**絕不**交給 SPA fallback
 
 ## 失敗分類
@@ -159,6 +193,18 @@ type RuntimeFailureKind =
 | `taskflow` | `proxy_routing_failure`、`unexpected_content_type`、`stale_runtime`、`port_conflict`、`runtime_timeout`、`dependency_unavailable`、`service_not_started` | 自動回復；用盡後 `runtime_blocked`，**不**叫 Repair Agent、**不**進 waiting_input |
 | `project` | `service_start_failed`、`service_unhealthy`、`browser_failure` | 自動回復用盡後仍起不來＝專案的程式問題，照既有流程進修正 |
 | `user` | `topology_unresolved` | 唯一會進 waiting_input 的一種，並附上「請新增 taskflow.runtime.json」的具體指示 |
+
+## Authoritative runtime state
+
+回復會停掉舊的 runtime、再建一個新的。**誰是權威的 runtime 狀態必須有明確答案：最後一次實際建立起來的那一組**，由 `runtimePreflight()` 一路帶回呼叫端：
+
+| 欄位 | 通過時 | 被 block 時 |
+| --- | --- | --- |
+| `info` / `previewUrl` | 有（Browser Validation 就在這上面跑） | `null`——runtime 已經收掉了，給一個指向死掉服務的網址只會誤導 |
+| `runtime` | 目前這一組的服務快照 | **最後一次實際建立的那一組**的快照（這是「backend 曾經 READY、卡在轉發那一層」的唯一證據） |
+| `shutdown` | `null`（由呼叫端負責停止） | preflight 在回復流程中停掉那一次的結果 |
+
+少了後兩者，呼叫端就只能說「沒有後端服務」、cleanup 只能回 `[]`——與事件紀錄裡的 `runtime_service_ready backend` 自相矛盾。
 
 ## Runtime Fingerprint 與 service-level restart
 

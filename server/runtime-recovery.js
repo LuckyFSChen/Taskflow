@@ -11,7 +11,7 @@
 //      不是無限重試，也不是靜靜放行。
 //   3. 只有真的需要人決定的事才進 waiting_input（計畫書第二十二章）。
 //      「backend 沒起來」「port 被佔用」「proxy 沒接上」都不是。
-import {RuntimeFailure, defaultConnectivityProbes, validateConnectivity, validateFrontendRoot} from './runtime-validation.js';
+import {RuntimeFailure, deriveConnectivityProbes, validateConnectivity, validateFrontendRoot} from './runtime-validation.js';
 import {browserEntryService} from './runtime-topology.js';
 
 export const MAX_RUNTIME_RECOVERY_ATTEMPTS = 2;
@@ -115,7 +115,16 @@ export async function runtimePreflight(key, projectPath, {
   const attempts = [];
   // 最後一輪的逐項檢查結果要留到最後回報。之前每一輪的 checks 都留在迴圈裡，
   // 重試用盡時回報的是一個空陣列——使用者只看得到 failureKind，看不到是哪一條路徑失敗。
-  let lastChecks = [], lastTopology = null;
+  //
+  // lastRuntime 同理，而且更嚴重：回復會停掉舊的 runtime 再建一個新的，
+  // 之前 blocked 的結論把 runtime 狀態整個丟掉，於是呼叫端看到「沒有後端服務」，
+  // 儘管事件裡明明有 runtime_service_ready backend。誰是 authoritative runtime state
+  // 必須有明確的答案：**最後一次實際建立起來的那一組**，由這裡一路帶到呼叫端。
+  let lastChecks = [], lastTopology = null, lastRuntime = null, shutdown = null;
+  // 回復之間一定要把舊的 runtime 收乾淨，否則第二輪會在半舊的服務上重跑。
+  // 收掉的結果要留著：呼叫端的 cleanup 步驟靠它回報「誰被停了、PID 有沒有消失」，
+  // 不能因為是 preflight 停的就變成一個空陣列。
+  const teardown = async () => { shutdown = await previews.stop(key).catch(() => null); };
 
   for (let attempt = 0; attempt <= maxAttempts; attempt++) {
     const checks = [];
@@ -131,8 +140,9 @@ export async function runtimePreflight(key, projectPath, {
       attempts.push({attempt, failureKind: kind, detail});
       const plan = recoveryPlan(kind, {attempt});
       emit('runtime_service_failed', {attempt, failureKind: kind, detail, recovery: plan.action});
-      if (plan.action !== 'restart_runtime') return blocked(kind, attempts, checks, detail);
-      await previews.stop(key).catch(() => {});
+      // 啟動失敗時 manager 已經把半開的服務收掉了，但仍要把 key 上的殘留清乾淨。
+      await teardown();
+      if (plan.action !== 'restart_runtime') return blocked({failureKind: kind, attempts, checks, detail, topology: lastTopology, runtime: lastRuntime, shutdown});
       continue;
     }
 
@@ -152,38 +162,47 @@ export async function runtimePreflight(key, projectPath, {
 
     let connectivity = {passed: true, checks: []};
     if (root.passed && topology && topology.services.some(service => ['backend', 'worker'].includes(service.type))) {
-      const backends = topology.services.filter(service => ['backend', 'worker'].includes(service.type));
-      const probes = backends.flatMap(service => defaultConnectivityProbes(service, {extraPaths: [...(entry?.proxyPaths || []), ...extraProbePaths].filter(path => path && !path.endsWith('*'))}))
-        // 同一條路徑不重複打。
-        .filter((probe, index, list) => list.findIndex(item => item.path === probe.path) === index);
-      connectivity = await validateConnectivity({frontendUrl: info.url, probes, fetchImpl});
+      // 端點由 deriveConnectivityProbes 決定，**不是**把每一條 proxy namespace 直接拿去打。
+      // `/api` 是 namespace，不是端點；`/uploads` 是檔案 namespace，不該要求它回 JSON。
+      const {probes, skipped} = deriveConnectivityProbes(topology, entry, {extraProbes: extraProbePaths});
+      connectivity = await validateConnectivity({frontendUrl: info.url, probes, skipped, fetchImpl});
       checks.push(...connectivity.checks);
-      if (connectivity.passed) emit('runtime_api_validation_passed', {url: info.url, probes: probes.map(probe => probe.path)});
+      if (connectivity.passed) emit('runtime_api_validation_passed', {url: info.url, probes: probes.map(probe => probe.path), skipped: skipped.map(item => item.name)});
       else emit('runtime_proxy_validation_failed', {url: info.url, failureKind: connectivity.failureKind, detail: connectivity.detail});
     }
 
     lastChecks = checks;
     lastTopology = topology;
+    lastRuntime = info.runtime || null;
     const failed = checks.find(item => !item.passed);
-    if (!failed) return {passed: true, previewUrl: info.url, info, topology, checks, attempts, failureKind: null, owner: null, blocked: false};
+    // 成功時 runtime 留著給呼叫端用（Browser Validation 就在這個 URL 上跑），
+    // 由呼叫端負責停止——preflight 不會替它收掉一個還要用的東西。
+    if (!failed) return {passed: true, previewUrl: info.url, info, topology, runtime: lastRuntime, shutdown: null, checks, attempts, failureKind: null, owner: null, blocked: false};
 
     const kind = failed.failureKind || 'unknown';
     attempts.push({attempt, failureKind: kind, detail: failed.detail});
     const plan = recoveryPlan(kind, {attempt});
-    if (plan.action !== 'restart_runtime') { await previews.stop(key).catch(() => {}); return blocked(kind, attempts, checks, failed.detail, topology); }
+    if (plan.action !== 'restart_runtime') {
+      await teardown();
+      return blocked({failureKind: kind, attempts, checks, detail: failed.detail, topology, runtime: lastRuntime, shutdown});
+    }
     emit('runtime_service_restarting', {attempt, failureKind: kind, reason: plan.reason});
-    // 重試前一定要把現有的 runtime 收乾淨，否則第二輪會在半舊的服務上重跑，
-    // 得到的結論既不是舊的也不是新的。
-    await previews.stop(key).catch(() => {});
+    await teardown();
   }
 
   const last = attempts.at(-1);
-  return blocked(last?.failureKind || 'unknown', attempts, lastChecks, last?.detail || '超過自動回復次數上限。', lastTopology);
+  return blocked({failureKind: last?.failureKind || 'unknown', attempts, checks: lastChecks, detail: last?.detail || '超過自動回復次數上限。', topology: lastTopology, runtime: lastRuntime, shutdown});
 }
 
-// blocked 的結論一律不帶 previewUrl：到這裡 runtime 已經收掉了，給一個指向死掉服務的網址
-// 只會讓呼叫端以為還有東西可以開。
-function blocked(failureKind, attempts, checks, detail, topology = null) {
+/**
+ * blocked 的結論不帶 previewUrl／info：到這裡 runtime 已經收掉了，給一個指向死掉服務的
+ * 網址只會讓呼叫端以為還有東西可以開。
+ *
+ * 但 **runtime 的狀態快照要帶著**：那是「backend 曾經 READY、frontend 曾經 READY、
+ * 卡在轉發驗證」這個結論的唯一證據。把它一起丟掉，呼叫端就只能說「沒有後端服務」，
+ * 與事件紀錄自相矛盾。shutdown 同理：preflight 停掉的那一次結果就是 cleanup 的結果。
+ */
+function blocked({failureKind, attempts, checks, detail, topology = null, runtime = null, shutdown = null}) {
   return {
     passed: false,
     blocked: true,
@@ -198,13 +217,16 @@ function blocked(failureKind, attempts, checks, detail, topology = null) {
     detail,
     previewUrl: null,
     info: null,
+    runtime,
+    shutdown,
     topology,
   };
 }
 
 /** 給事件與 UI 用的一句話結論，說得出卡在哪一層。 */
 export function preflightSummary(outcome) {
-  if (outcome?.passed) return `Runtime preflight 通過：${outcome.checks.length} 項檢查全部通過，Preview 可進行 Browser Validation。`;
+  const skipped = (outcome?.checks || []).filter(item => item.skipped).length;
+  if (outcome?.passed) return `Runtime preflight 通過：${outcome.checks.length - skipped} 項檢查通過${skipped ? `，另有 ${skipped} 項未驗證（已註明原因）` : ''}，Preview 可進行 Browser Validation。`;
   const failed = (outcome?.checks || []).filter(item => !item.passed);
   const detail = failed.map(item => `${item.name}（${item.actual || item.detail || '未通過'}）`).join('、');
   return `Runtime preflight 未通過：failureKind=${outcome?.failureKind || 'unknown'}${detail ? `，${detail}` : ''}${outcome?.detail ? `。${outcome.detail}` : ''}`;

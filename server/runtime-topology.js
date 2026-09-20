@@ -126,6 +126,26 @@ export function detectHealthPath(path, {maxFiles = 200} = {}) {
 // frontend 需要被代理到後端的路徑。先讀專案自己的 vite/next 設定（那是專案作者已經宣告過的
 // 意圖），讀不到才退回 /api。**絕不**沿用設定裡的 target：那通常是寫死的 localhost:3001，
 // 正是計畫書第八章禁止的東西；TaskFlow 只取「哪些路徑要轉發」，target 一律用實際配到的 port。
+//
+// 每一條轉發路徑都帶 kind。這是為了把「namespace」與「可驗證的端點」分開：
+//   api    —— 這個 namespace 底下有 JSON API。可以用**已知的端點**（不是 namespace 本身）
+//             驗證它真的轉發到後端。
+//   static —— 檔案／媒體 namespace。它合法地可能回 301、404、image/*、application/pdf，
+//             要求它回 application/json 是錯的。這一類只需要證明「沒有落進 SPA fallback」。
+// 沒有 kind 的話，/uploads 這種路徑會被當成 API 驗，於是一個 301 redirect 就被誤判成
+// proxy_routing_failure，接著整組 runtime 被沒必要地重啟——那是 noise，不是問題。
+const STATIC_NAMESPACE = /^\/(uploads?|static|media|files?|assets?|storage|images?|img|public|download(s)?)\b/i;
+export function proxyPathKind(path) {
+  return STATIC_NAMESPACE.test(path) ? 'static' : 'api';
+}
+export function normalizeProxyPath(entry) {
+  const raw = typeof entry === 'string' ? {path: entry} : {...entry};
+  const path = String(raw.path || '').trim();
+  if (!path.startsWith('/')) throw new Error(`proxyPaths 的項目必須是以 / 開頭的路徑：${JSON.stringify(entry)}`);
+  const kind = raw.kind === 'static' || raw.kind === 'api' ? raw.kind : proxyPathKind(path);
+  return {path, kind};
+}
+
 const PROXY_KEY = /['"`](\/[\w\-./]*)['"`]\s*:\s*[{'"`]/g;
 export function detectProxyPaths(path) {
   const found = new Set();
@@ -143,7 +163,7 @@ export function detectProxyPaths(path) {
     while ((match = PROXY_KEY.exec(tail))) found.add(match[1]);
   }
   if (!found.size) found.add('/api');
-  return [...found];
+  return [...found].map(normalizeProxyPath);
 }
 
 /**
@@ -224,6 +244,21 @@ export function detectTopology(projectRoot, {maxDepthDirs = 40} = {}) {
 
 // --- 正規化與明確設定 ---------------------------------------------------------
 
+export function normalizeProbe(entry) {
+  const raw = typeof entry === 'string' ? {path: entry} : {...entry};
+  const path = String(raw.path || '').trim();
+  if (!path.startsWith('/')) throw new Error(`validationProbes 的項目必須是以 / 開頭的路徑：${JSON.stringify(entry)}`);
+  const kind = raw.kind === 'static' ? 'static' : 'api';
+  return {
+    path,
+    kind,
+    expectedStatus: Number.isInteger(raw.expectedStatus) ? raw.expectedStatus : null,
+    // static 類不預設 Content-Type：它合法地可能是 image/*、application/pdf、或一個 301。
+    expectedContentType: raw.expectedContentType || (kind === 'api' ? 'application/json' : null),
+    expectedJsonShape: raw.expectedJsonShape || null,
+  };
+}
+
 export function normalizeService(raw, projectRoot) {
   if (!raw || typeof raw !== 'object') throw new Error('runtime service 必須是物件');
   const id = String(raw.id || '').trim();
@@ -246,7 +281,11 @@ export function normalizeService(raw, projectRoot) {
     healthCheck: health,
     dependsOn: Array.isArray(raw.dependsOn) ? [...new Set(raw.dependsOn.map(String))] : [],
     browserEntry: raw.browserEntry === true,
-    proxyPaths: Array.isArray(raw.proxyPaths) ? raw.proxyPaths.map(String) : null,
+    proxyPaths: Array.isArray(raw.proxyPaths) ? raw.proxyPaths.map(normalizeProxyPath) : null,
+    // 可以驗證的實際端點，與上面的 namespace 分開宣告。沒有宣告時由後端的 healthCheck 衍生
+    // （見 runtime-validation.js 的 deriveConnectivityProbes）——**絕不**拿 namespace 本身當端點：
+    // proxyPaths 裡的 /api 只代表「/api/* 轉發給後端」，不代表後端必須實作 GET /api。
+    validationProbes: Array.isArray(raw.validationProbes) ? raw.validationProbes.map(normalizeProbe) : null,
     environment: raw.environment && typeof raw.environment === 'object' ? {...raw.environment} : {},
     persistent: raw.persistent === true,
     // managed：TaskFlow 自己用 express 伺服建置輸出並轉發 proxy，沒有子程序。
@@ -420,6 +459,7 @@ export function topologyPublic(topology) {
       dependsOn: service.dependsOn,
       browserEntry: service.browserEntry,
       proxyPaths: service.proxyPaths,
+      validationProbes: service.validationProbes,
     })),
   };
 }
