@@ -111,7 +111,9 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   // 一般前端 UI 一律拿不到，避免外洩到瀏覽器或被其他使用者看見。
   // acceptance（AcceptanceContext）裡有完整的 password 與 token，和 credentials 一樣不得離開伺服器；
   // 前端要的只是 url 與 kind，連「驗收身份存在」這件事都不需要知道。
-  const withoutCredentials=info=>info?{...info,credentials:undefined,acceptance:undefined,previewDbPath:undefined}:info;
+  // topology 內部形狀會帶 explicit config 宣告的 environment（可能含專案自己的祕密），
+  // 一律不送到瀏覽器；UI 要的是 runtime／topologyPublic 那兩個已經過濾過的版本。
+  const withoutCredentials=info=>info?{...info,credentials:undefined,acceptance:undefined,previewDbPath:undefined,topology:undefined}:info;
   app.get('/api/projects/:id/targets',(req,res)=>{
     const p=store.project(req.params.id);if(!p||!store.hasProject(req.user,p.id))throw new HttpError(404,'找不到專案');
     const targets=[{taskId:null,label:'原始專案',web:detectWebProject(p.path),preview:withoutCredentials(previews.status(p.id))},...store.tasks(req.user).filter(t=>t.projectId===p.id&&t.workspace).map(t=>({taskId:t.id,label:`${t.title} · v${t.planVersion} 工作副本`,web:detectWebProject(t.workspace),preview:withoutCredentials(previews.status(`${p.id}:${t.id}:${t.planVersion}`))}))];
@@ -177,6 +179,20 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/tasks/:id/plan-group',(req,res)=>res.json(decorated(store.transaction(()=>assignTaskPlanGroup(store,req.user,req.params.id,req.body)))));
   app.get('/api/tasks/:id',(req,res)=>{const t=requireTask(store,req.user,req.params.id);res.json({...decorated(t),events:store.events(t.id)});});
   app.post('/api/tasks/:id/preflight/retry',(req,res)=>{const t=requireTask(store,req.user,req.params.id);if(!t.environmentIssue||t.environmentIssue.id!==req.body.issueId||t.environmentIssue.planVersion!==t.planVersion||t.status!=='waiting_input')throw new HttpError(409,'環境問題已變更，請重新查看');t.environmentIssue=null;t.dependencyPreflight=null;t.error=null;t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'awaiting_approval';t.controlVersion=(t.controlVersion||0)+1;store.saveTask(t);store.event(t.id,'preflight_approved',`${req.user.name} 核准重新檢查套件環境；通過前不執行工作`);res.json(decorated(t));});
+  // Runtime 被擋住（runtime_blocked）之後的重試入口。刻意與 waiting_input 分開：
+  // 執行環境沒準備好不是「請使用者回答問題」，使用者要做的只有「再試一次」或先自己排除
+  // 環境問題（例如關掉佔用連接埠的程式、修正 taskflow.runtime.json）後再試。
+  // 每次重試都先把該任務殘留的 Preview／runtime 全部停掉，避免在半舊的 runtime 上重跑。
+  app.post('/api/tasks/:id/runtime/retry',async(req,res)=>{
+    const t=requireTask(store,req.user,req.params.id);
+    if(!t.runtimeIssue||t.runtimeIssue.id!==req.body.issueId||t.runtimeIssue.planVersion!==t.planVersion)throw new HttpError(409,'執行環境問題已變更，請重新查看');
+    await previews.stop(`${t.projectId}:${t.id}:${t.planVersion}`).catch(()=>{});
+    t.runtimeIssue=null;t.error=null;t.questions=[];
+    t.status=t.plan&&t.approvedVersion===t.planVersion?'queued':'awaiting_approval';
+    t.controlVersion=(t.controlVersion||0)+1;store.saveTask(t);
+    store.event(t.id,'runtime_retry_requested',`${req.user.name} 要求重新準備執行環境；既有的 Preview 服務已全部停止。`);
+    res.json(decorated(t));
+  });
   // Git 安全守門（未提交修改、受保護分支、巢狀版本庫…）的三個人工出路。沿用既有的
   // gitIssue／resumeStatus 機制與這條既有路徑，不另外開 /git/approve、/git/retry：
   //   action='recheck'（預設，向後相容原本只帶 issueId 的呼叫）真的重跑 git status

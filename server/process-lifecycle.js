@@ -87,10 +87,13 @@ export function unregisterPreview(path, key) {
 export async function inspectEntry(entry, { alive = isAlive, fetchImpl = fetch, timeoutMs = 2000 } = {}) {
   if (!alive(entry.pid)) return { ...entry, state: 'gone' };
   if (!entry.url) return { ...entry, state: 'unknown', reason: '沒有記錄網址，無法確認這個 PID 是不是 TaskFlow 開的 Preview。' };
+  // multi-service 的每個 service 各自宣告 health 路徑（runtime-manager.js 寫入 healthUrl）；
+  // 沒有記錄的沿用舊行為打 /api/health，服務重啟後仍認得出整改前留下的登錄。
+  const probe = entry.healthUrl || `${entry.url}/api/health`;
   try {
-    const response = await fetchImpl(`${entry.url}/api/health`, { signal: AbortSignal.timeout(timeoutMs) });
+    const response = await fetchImpl(probe, { signal: AbortSignal.timeout(timeoutMs) });
     if (response.status === 200) return { ...entry, state: 'orphan' };
-    return { ...entry, state: 'unknown', reason: `${entry.url}/api/health 回傳 HTTP ${response.status}，無法確認身分。` };
+    return { ...entry, state: 'unknown', reason: `${probe} 回傳 HTTP ${response.status}，無法確認身分。` };
   } catch (error) {
     return { ...entry, state: 'unknown', reason: `${entry.url} 沒有回應（${String(error?.message || error).slice(0, 120)}），無法確認這個 PID 的身分。` };
   }

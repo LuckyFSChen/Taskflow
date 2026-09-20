@@ -143,6 +143,9 @@ const percent=(t:any)=>t.status==='completed'?100:t.totalSteps?Math.round(t.comp
 const statusLabel=(t:any)=>t.status==='completed'&&t.manualCompletion?'手動完成':statuses[t.displayStatus||t.status]||statuses[t.status]||t.status;
 let interval:ReturnType<typeof setInterval>,toastTimer:ReturnType<typeof setTimeout>;
 function notify(message:string){toast.value=message;clearTimeout(toastTimer);toastTimer=setTimeout(()=>toast.value='',6000);}
+// 責任歸屬要用使用者看得懂的話講出來：是 TaskFlow 的執行環境、專案自己的程式，
+// 還是真的需要他提供資訊。這三件事對應的下一步完全不同。
+function runtimeOwnerLabel(owner:string){return ({taskflow:'TaskFlow 執行環境',project:'專案程式',user:'需要你提供資訊'} as Record<string,string>)[owner]||owner||'未判定';}
 async function run(fn:()=>Promise<any>){if(busy.value)return;busy.value=true;try{await fn();await store.refresh();if(selected.value)await loadTask(selected.value.id);}catch(e:any){notify(e.message);}finally{busy.value=false;}}
 async function projectRemoved(projectId:string,pendingCleanup:string[]=[]){removalCleanup.value=pendingCleanup;if(selected.value?.projectId===projectId)selected.value=null;if(newTask.projectId===projectId)newTask.projectId='__new__';users.value=await api('/admin/users');notify(pendingCleanup.length?'專案已移除，部分磁碟檔案尚待清理':'專案及磁碟檔案已移除');}
 async function signIn(){loginError.value='';try{await api('/login',login);login.password='';await store.refresh();void store.loadHealth();}catch(e:any){loginError.value=e.message;}}
@@ -442,6 +445,22 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
         <section v-if="detailPending.length" class="pending-actions" aria-label="需要你處理的事情"><h3><AlertCircle :size="17"/>需要你處理（{{detailPending.length}}）</h3><ul><li v-for="item in detailPending" :key="item.id"><strong>{{item.title}}</strong><small>{{item.description}}</small></li></ul><p class="subtle">以下依序列出可以處理的區塊。</p></section>
         <ManualAction :request="selected.manualAction" :skips="selected.manualActionSkips" :busy="busy" @decide="(decision,note)=>run(()=>api(`/tasks/${selected.id}/user-action/decision`,{requestId:selected.manualAction.id,decision,note}))"/>
         <GitIssue :task="selected" :busy="busy" @decide="action=>run(()=>api(`/tasks/${selected.id}/git/recheck`,{issueId:selected.gitRequest.requestId,action}))"/>
+        <!-- 執行環境（runtime）被擋住。刻意與「待回答問題」分開呈現：使用者要看到的是
+             「卡在哪一層」——哪一個服務、哪一條路徑、期待什麼、實際拿到什麼。 -->
+        <section v-if="selected.runtimeIssue" class="questions">
+          <h3>{{selected.runtimeIssue.owner==='user'?'需要你宣告專案要啟動哪些服務':'執行環境未就緒（runtime_blocked）'}}</h3>
+          <p class="prewrap">{{selected.runtimeIssue.message}}</p>
+          <ul class="runtime-checks">
+            <li v-for="check in selected.runtimeIssue.checks" :key="check.name" :class="{bad:check.passed===false}">
+              <strong>{{check.name}}</strong>
+              <span>{{check.passed===false?`期待 ${check.expected||'—'}，實際 ${check.actual||'無回應'}`:check.actual||'通過'}}</span>
+              <small v-if="check.detail">{{check.detail}}</small>
+            </li>
+          </ul>
+          <p><small>失敗分類：{{selected.runtimeIssue.failureKind}}（責任歸屬：{{runtimeOwnerLabel(selected.runtimeIssue.owner)}}）。已自動嘗試回復 {{selected.runtimeIssue.attempts}} 次。</small></p>
+          <button class="primary" :disabled="busy" @click="run(()=>api(`/tasks/${selected.id}/runtime/retry`,{issueId:selected.runtimeIssue.id}))">重新準備執行環境</button>
+          <p>這一層的失敗不會交給修正流程去改你的程式碼。按下按鈕會先停掉這個任務殘留的所有 Preview 服務，再從頭重新準備。</p>
+        </section>
         <section v-if="selected.environmentIssue" class="questions"><h3>套件環境處理方案待審核</h3><p class="prewrap">{{selected.environmentIssue.message}}</p><button v-if="selected.status==='waiting_input'" class="primary" :disabled="busy" @click="run(()=>api(`/tasks/${selected.id}/preflight/retry`,{issueId:selected.environmentIssue.id}))">環境已處理，核准重新檢查</button><p>檢查通過才繼續已核准的步驟；更換套件須在下方補充需求並重新審核計畫。</p></section>
         <OutputIssue :task="selected" :busy="busy" :raw="outputRaw" :recovery="outputRecovery" @recover="recoverOutput" @raw="loadOriginalOutput" @replan="focusRevise"/>
         <ValidationSkip :request="selected.validationSkipRequest" :skips="selected.validationSkips" :busy="busy" @decide="decision=>run(()=>api(`/tasks/${selected.id}/validation/decision`,{requestId:selected.validationSkipRequest.id,decision}))"/>

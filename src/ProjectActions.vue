@@ -4,8 +4,16 @@ import {Folder,ExternalLink,Square,LoaderCircle} from 'lucide-vue-next';
 import {api,useTaskStore} from './store';
 const store=useTaskStore();
 const props=defineProps<{project:any}>();
-const targets=ref<any[]>([]),chosen=ref(''),busy=ref(false),message=ref(''),url=ref('');
-async function refresh(){const data=await api(`/projects/${props.project.id}/targets`);targets.value=data.targets;url.value=targets.value.find(t=>(t.taskId||'')===chosen.value)?.preview?.url||'';}
+const targets=ref<any[]>([]),chosen=ref(''),busy=ref(false),message=ref(''),url=ref(''),runtime=ref<any>(null);
+async function refresh(){
+  const data=await api(`/projects/${props.project.id}/targets`);
+  targets.value=data.targets;
+  const preview=targets.value.find(t=>(t.taskId||'')===chosen.value)?.preview;
+  url.value=preview?.url||'';
+  // Multi-Service 專案的 Preview 不是一個程序，而是一組。使用者要看得到每個服務
+  // 各自跑在哪個連接埠、是不是 READY，失敗時卡在哪一層（計畫書第二十八章）。
+  runtime.value=preview?.runtime||null;
+}
 onMounted(async()=>{try{await refresh();const latest=targets.value.find(t=>t.taskId&&t.web);if(latest){chosen.value=latest.taskId;await refresh();}}catch(e:any){message.value=e.message;}});
 async function stopAll(){busy.value=true;try{await api(`/admin/projects/${props.project.id}/previews/stop`,{});await refresh();message.value='此專案的所有版本預覽已停止';}catch(e:any){message.value=e.message;}finally{busy.value=false;}}
 async function perform(action:string){
@@ -31,6 +39,15 @@ async function perform(action:string){
       <button v-if="store.user?.role==='admin'" class="secondary" :disabled="busy" @click="stopAll"><Square :size="14"/>停止所有預覽</button>
       <button v-if="url" class="secondary" :disabled="busy" @click="perform('preview/stop')"><Square :size="14"/>停止預覽</button>
     </div>
+    <ul v-if="runtime" class="runtime-services">
+      <li v-for="service in runtime.services" :key="service.id">
+        <strong>{{service.id}}</strong>
+        <span class="kind">{{service.type}}{{service.browserEntry?'．瀏覽器入口':''}}</span>
+        <span class="state" :class="service.status==='READY'?'ready':'bad'">{{service.status}}</span>
+        <span class="kind">{{service.url||'—'}}{{service.pid?`．PID ${service.pid}`:'．TaskFlow 自管'}}</span>
+        <small v-if="service.error" class="error-text">{{service.failureKind}}：{{service.error}}</small>
+      </li>
+    </ul>
     <a v-if="url" :href="url" target="_blank" rel="noopener noreferrer">{{url}} ↗</a>
     <small v-if="!targets.find(t=>(t.taskId||'')===chosen)?.web">尚未找到 Vue／Vite 或純 HTML 網頁，可切換到 AI 工作副本。</small>
     <small role="status">{{message}}</small>

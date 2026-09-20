@@ -102,6 +102,12 @@ const PENDING_RULES = [
     description: '目前的執行環境無法完成這個操作，需要你在本機處理後回報結果。',
   },
   {
+    id: 'runtime_blocked',
+    match: task => !!task.runtimeIssue,
+    title: task => (task.runtimeIssue?.owner === 'user' ? '需要你宣告專案要啟動哪些服務' : '執行環境未就緒'),
+    description: '自動回復已經試過並用盡。這一層失敗與專案的程式無關，尚未交給修正流程；處理完按「重新準備執行環境」即可繼續。',
+  },
+  {
     id: 'environment_issue',
     match: task => !!task.environmentIssue,
     title: () => '套件環境需要你處理',
@@ -239,7 +245,7 @@ function executionSteps(task) {
   if (!steps.length) return [];
   const done = Number.isInteger(task.completedSteps) ? task.completedSteps : 0;
   const running = runningThread(task, ['execute']);
-  const blocked = !!task.manualAction || !!task.environmentIssue || !!task.executionApproval || !!task.gitRequest;
+  const blocked = !!task.manualAction || !!task.environmentIssue || !!task.executionApproval || !!task.gitRequest || !!task.runtimeIssue;
   // 目前這一步已經跑過、而且回報未通過時，不能顯示成「尚未開始」：待處理橫幅正在說
   // 「此步驟未通過驗收」，進度卻畫一個空心圈，兩邊互相矛盾。
   //

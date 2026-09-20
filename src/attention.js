@@ -24,6 +24,15 @@ function shorten(value, limit = REASON_LIMIT) {
   return line.length > limit ? line.slice(0, limit - 1) + '…' : line;
 }
 
+// 執行環境的失敗要說得出是哪一條路徑、期待什麼、實際拿到什麼——
+// 「browser validation failed」正是這次整改要消滅的那種說法。
+function failedRuntimeCheck(task) {
+  const checks = Array.isArray(task?.runtimeIssue?.checks) ? task.runtimeIssue.checks : [];
+  const failed = checks.find(check => check && check.passed === false);
+  if (!failed) return '';
+  return `${failed.name}：${failed.detail || `期待 ${failed.expected || '—'}，實際 ${failed.actual || '無回應'}`}`;
+}
+
 function firstQuestion(task) {
   const questions = Array.isArray(task?.questions) ? task.questions.filter(q => text(q)) : [];
   return questions.length ? shorten(`${questions[0]}${questions.length > 1 ? `（另有 ${questions.length - 1} 個問題）` : ''}`) : '';
@@ -59,6 +68,21 @@ const RULES = [
       reason: shorten(task.manualAction?.reason),
       action: '查看操作步驟',
       priority: 5,
+    }),
+  },
+  {
+    // 執行環境被擋住：這不是「請你回答問題」，而是「TaskFlow 自己準備不出可驗證的
+    // 執行環境，已經自動重試過但沒成功」。說得出卡在哪一層，使用者才知道要看哪裡。
+    match: task => !!task.runtimeIssue,
+    build: task => ({
+      type: 'runtime_blocked',
+      title: task.runtimeIssue?.owner === 'user' ? '需要你宣告專案要啟動哪些服務' : '執行環境未就緒，任務停在 runtime 層',
+      description: task.runtimeIssue?.owner === 'user'
+        ? 'TaskFlow 判定不出這個專案要啟動哪些服務才能預覽，需要你補上 runtime 宣告。'
+        : '自動回復已經試過並用盡，Preview 仍然無法通過驗證。這不是專案的程式問題，也還沒有交給修正流程。',
+      reason: shorten(failedRuntimeCheck(task) || task.runtimeIssue?.message),
+      action: '查看執行環境問題',
+      priority: 6,
     }),
   },
   {

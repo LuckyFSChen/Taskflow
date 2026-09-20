@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtempSync,mkdirSync,writeFileSync,rmSync} from 'node:fs';
+import {createServer} from 'node:http';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createStore,id} from '../server/db.js';
@@ -118,6 +119,16 @@ test('deriveBrowserValidationRequirement flags requiresInteraction for button/cl
 // --- Runner-level integration: the guard is actually wired into the review phase --------
 const plan={summary:'新增按鈕與彈窗',acceptance:['按鈕可點擊並顯示彈窗'],questions:[],steps:[{title:'確認 fixture',role:'工程',instructions:'確認頁面已有按鈕'}]};
 const goodExecute={summary:'完成',questions:[],artifacts:['index.html'],passed:true,evidence:['已建立按鈕'],browserValidation:defaultBrowserValidation()};
+// Preview 的網址現在必須**真的回應得出 HTML**：Runtime Preflight 會在 Browser Validation
+// 之前實際 GET 一次根路徑（計畫書第十二章「Frontend Ready 也不能只看 Port」）。
+// 寫死一個沒有人在聽的 127.0.0.1:59999 會被正確地判定成服務沒起來，所以這些測試改用
+// 一個真的（極小的）伺服器當 Preview——這讓它們驗到的東西比整改前更接近真實流程。
+function previewStub(t){
+  const server=createServer((_req,res)=>{res.writeHead(200,{'Content-Type':'text/html'});res.end('<!DOCTYPE html><html><body><h1>Hi</h1><button id="b">Open</button></body></html>');});
+  const url=new Promise(resolve=>server.listen(0,'127.0.0.1',()=>resolve(`http://127.0.0.1:${server.address().port}`)));
+  t.after(()=>new Promise(done=>{server.closeAllConnections();server.close(done);}));
+  return {url};
+}
 function browserFixture(t,{capabilityAvailable=true}={}){
   const dir=mkdtempSync(join(tmpdir(),'tf-browser-'));
   const store=createStore(join(dir,'db.sqlite'));
@@ -127,7 +138,8 @@ function browserFixture(t,{capabilityAvailable=true}={}){
   store.db.prepare('INSERT INTO projects VALUES (?,?,?,?)').run(projectId,'demo','Demo',source);
   store.db.prepare('INSERT INTO memberships VALUES (?,?)').run(owner.id,projectId);
   t.after(()=>{store.close();rmSync(dir,{recursive:true,force:true});});
-  const previews={start:async()=>({url:'http://127.0.0.1:59999',kind:'static'}),stop:async()=>{},status:()=>null,close:async()=>{}};
+  const preview=previewStub(t);
+  const previews={start:async()=>({url:await preview.url,kind:'static'}),stop:async()=>{},status:()=>null,close:async()=>{}};
   const checkBrowserCapability=async()=>capabilityAvailable?{available:true,provider:'playwright-mcp',cli:'claude',error:null}:{available:false,provider:null,cli:'claude',error:'Playwright MCP unavailable'};
   return {dir,store,owner,projectId,previews,checkBrowserCapability,
     create:(extra={})=>createTask(store,owner,{title:'UI 按鈕與彈窗',description:'網頁需要一個按鈕，點擊後顯示彈窗（modal dialog），這是前端 UI 互動修改。',projectId,type:'code',executor:'claude',reviewer:'claude',...extra})};
@@ -180,7 +192,7 @@ test('Real tool_use evidence lets a genuine browser pass complete the task, and 
       if(o.readOnly)return {result:plan};
       if(o.prompt.includes('你是 TaskFlow 的 獨立驗證')){
         reviewCalls++;
-        assert.match(o.prompt,/Browser Preview URL：http:\/\/127\.0\.0\.1:59999/);
+        assert.match(o.prompt,/Browser Preview URL：http:\/\/127\.0\.0\.1:\d+/);
         const passed=reviewCalls>=2;
         return {result:{summary:passed?'按鈕點擊後彈窗顯示':'按鈕點擊後彈窗未顯示',questions:[],artifacts:['index.html'],passed,evidence:[passed?'browser_click 後確認彈窗顯示':'browser_click 後彈窗仍隱藏'],browserValidation:{...defaultBrowserValidation(),required:true,status:passed?'passed':'failed',executed:true,passed,toolUsed:true,toolCallCount:3}},browserEvidence:{toolUsed:true,toolCallCount:3,categories:{navigate:1,interact:2}}};
       }
@@ -224,8 +236,9 @@ test('Backend-only task on a non-web project never triggers Browser MCP wiring',
 test('Browser Validation 使用與 API 驗收相同的 Acceptance Identity',async t=>{
   const f=browserFixture(t,{capabilityAvailable:true});
   const acceptance={id:'ctx-browser',mode:'credentials',username:'taskflow-preview',password:'one-time-browser-pw',injection:{environment:true,database:true,error:null}};
+  const preview=previewStub(t);
   const previews={
-    start:async()=>({url:'http://127.0.0.1:59999',kind:'fullstack',pid:1234,acceptance,credentials:{username:acceptance.username,password:acceptance.password}}),
+    start:async()=>({url:await preview.url,kind:'fullstack',pid:1234,acceptance,credentials:{username:acceptance.username,password:acceptance.password}}),
     stop:async()=>{},status:()=>null,close:async()=>{},
   };
   const prompts=[];
@@ -243,4 +256,57 @@ test('Browser Validation 使用與 API 驗收相同的 Acceptance Identity',asyn
   assert.match(browserPrompt,/username=taskflow-preview/);
   assert.ok(browserPrompt.includes(`password=${acceptance.password}`),'交給 Browser 的必須是同一組一次性帳密，不是另外產生的');
   assert.match(browserPrompt,/禁止嘗試讀取 data\/first-login.txt、猜測或使用任何正式使用者帳密/);
+});
+
+// --- Runtime preflight 與 waiting_input 的界線（計畫書第二十一、二十二章）-----------------
+// Test 9：可回復的 runtime 失敗在自動回復用盡之後，任務必須停在 runtime 層，
+//         **不得**變成 waiting_input，也**不得**觸發 Repair Agent 去改一份沒有壞的程式碼。
+test('Test 9 — TaskFlow 自己的 runtime 失敗不會變成 waiting_input，也不會叫 Repair Agent',async t=>{
+  const f=browserFixture(t,{capabilityAvailable:true});
+  let startCalls=0,reviewCalls=0;
+  const previews={
+    start:async()=>{startCalls++;const error=new Error('連接埠已被占用（EADDRINUSE）');error.kind='port_conflict';throw error;},
+    stop:async()=>{},status:()=>null,close:async()=>{},
+  };
+  const runner=createRunner(f.store,{dataDir:join(f.dir,'runs'),recover:false,previews,checkBrowserCapability:f.checkBrowserCapability,
+    adapter:async o=>{if(o.readOnly)return {result:plan};if(o.prompt.includes('你是 TaskFlow 的 獨立驗證'))reviewCalls++;return {result:goodExecute};}});
+  t.after(()=>runner.stop());f.store.setSetting('runnerEnabled',true);
+  const task=f.create();approveWithCompletedStep(f.store,task);
+  await runner.tick();
+
+  const after=f.store.task(task.id);
+  assert.ok(startCalls>1,'可回復的 runtime 失敗必須真的自動重試過');
+  assert.ok(startCalls<=3,`自動回復必須有上限，實際嘗試 ${startCalls} 次`);
+  assert.equal(reviewCalls,0,'runtime 沒準備好時不該讓 Reviewer 跑，更不該產生「驗證失敗」的結論');
+  assert.notEqual(after.status,'waiting_input','連接埠衝突不是需要使用者回答的問題');
+  assert.notEqual(after.status,'repair_planning','runtime 失敗不得直接觸發 Repair Agent');
+  assert.equal(after.status,'failed');
+  assert.ok(after.runtimeIssue,'必須留下結構化的 runtime 問題紀錄');
+  assert.equal(after.runtimeIssue.state,'runtime_blocked');
+  assert.equal(after.runtimeIssue.failureKind,'port_conflict');
+  assert.equal(after.runtimeIssue.owner,'taskflow');
+  assert.deepEqual(after.questions,[],'不該對使用者提問');
+  assert.ok(f.store.events(task.id).some(event=>event.kind==='runtime_blocked'));
+});
+
+// Test 10：真的需要使用者提供資訊時（TaskFlow 判定不出這個專案要啟動哪些服務），
+//          而且只有這一種情況，才可以進 waiting_input。
+test('Test 10 — 只有 topology 判定不出來這種真的需要使用者回答的情況才進 waiting_input',async t=>{
+  const f=browserFixture(t,{capabilityAvailable:true});
+  const previews={
+    start:async()=>{throw new Error('此資料夾與其第一層子目錄都沒有找到可預覽的網頁。');},
+    stop:async()=>{},status:()=>null,close:async()=>{},
+  };
+  const runner=createRunner(f.store,{dataDir:join(f.dir,'runs'),recover:false,previews,checkBrowserCapability:f.checkBrowserCapability,
+    adapter:async o=>(o.readOnly?{result:plan}:{result:goodExecute})});
+  t.after(()=>runner.stop());f.store.setSetting('runnerEnabled',true);
+  const task=f.create();approveWithCompletedStep(f.store,task);
+  await runner.tick();
+
+  const after=f.store.task(task.id);
+  assert.equal(after.status,'waiting_input');
+  assert.equal(after.runtimeIssue.failureKind,'topology_unresolved');
+  assert.equal(after.runtimeIssue.owner,'user');
+  assert.equal(after.questions.length,1);
+  assert.match(after.questions[0],/taskflow\.runtime\.json/,'要告訴使用者具體該補什麼，而不是只說失敗');
 });

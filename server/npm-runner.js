@@ -26,8 +26,15 @@ export const SENSITIVE_ENV_KEYS = [
  * @returns {string|null} 找不到時回傳 null，由呼叫端決定要丟什麼錯誤
  */
 export function resolveNpmCli(execPath = process.execPath) {
-  const cli = join(dirname(execPath), 'node_modules/npm/bin/npm-cli.js');
-  return existsSync(cli) ? cli : null;
+  // Windows 的安裝把 npm 放在 node.exe 旁邊；POSIX 慣例（Linux／macOS／WSL、Docker 映像）
+  // 則是 <prefix>/bin/node 搭配 <prefix>/lib/node_modules/npm。只認第一種的話，TaskFlow 在
+  // 非 Windows 環境一律回報「找不到 npm」——那不是使用者的環境壞了，是這裡少找一個位置。
+  const candidates = [
+    join(dirname(execPath), 'node_modules/npm/bin/npm-cli.js'),
+    join(dirname(execPath), '../lib/node_modules/npm/bin/npm-cli.js'),
+    join(dirname(execPath), '../libexec/lib/node_modules/npm/bin/npm-cli.js'),
+  ];
+  return candidates.find(existsSync) || null;
 }
 
 /** 子程序環境：複製目前環境後移除秘密。 */

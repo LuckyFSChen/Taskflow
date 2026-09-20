@@ -341,3 +341,18 @@ input,select,textarea{border-radius:var(--radius-control);border-color:#dcdce0;t
   .runtime-facts{grid-template-columns:1fr;gap:3px}
   .runtime-facts dd{margin-bottom:10px}
 }
+
+/* Runtime（多服務執行環境）：Task Drawer 的 runtime_blocked 逐項檢查，以及專案動作區的服務清單。
+   兩邊都刻意把「期待什麼／實際拿到什麼」直接寫在畫面上——使用者要看得出卡在哪一層，
+   而不是只看到一句「驗證失敗」。 */
+.runtime-checks{list-style:none;margin:12px 0;padding:0;display:grid;gap:8px}
+.runtime-checks li{background:#fff;border:1px solid var(--line);border-left:3px solid #9bb;border-radius:8px;padding:9px 12px;display:grid;gap:2px;font-size:.8125rem;overflow-wrap:anywhere}
+.runtime-checks li.bad{border-left-color:#b53e42;background:#fff6f6}
+.runtime-checks li strong{font-size:.8125rem}
+.runtime-checks li small{color:var(--muted)}
+.runtime-services{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px;max-width:620px}
+.runtime-services li{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;font-size:.8rem;background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px 11px;overflow-wrap:anywhere}
+.runtime-services .state{font-weight:600}
+.runtime-services .state.ready{color:var(--accent)}
+.runtime-services .state.bad{color:#b53e42}
+.runtime-services .kind{color:var(--muted)}
