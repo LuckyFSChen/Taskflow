@@ -29,7 +29,9 @@ if (!projectPath) { console.error('用法：node scripts/runtime-acceptance.js <
 const steps = [];
 let stepNo = 0;
 const record = (name, status, detail = '') => {
-  const entry = {step: ++stepNo, name, status, passed: status === 'pass', detail: String(detail).slice(0, 2000)};
+  // skipped 的 passed 是 null，不是 false：「沒有驗」與「驗了沒過」是兩回事，
+  // 報告的消費端不該把前者讀成後者。status 才是權威欄位。
+  const entry = {step: ++stepNo, name, status, passed: status === 'skip' ? null : status === 'pass', detail: String(detail).slice(0, 2000)};
   steps.push(entry);
   const mark = {pass: 'PASS', fail: 'FAIL', skip: 'SKIP'}[status];
   console.log(`${String(entry.step).padStart(2, ' ')}. ${mark}  ${name}${detail ? `\n      ${String(detail).slice(0, 600)}` : ''}`);
