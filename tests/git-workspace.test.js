@@ -14,6 +14,8 @@ import {
   prepareTaskWorkspace,
   assertWorkingBranch,
   ensureProjectRepository,
+  taskDiffFiles,
+  taskFileDiff,
 } from '../server/git-workspace.js';
 import { detectRepositoryInfo, evaluateRepositoryPolicy, samePath } from '../server/git-repository.js';
 
@@ -784,4 +786,102 @@ test('舊版 git（沒有 merge-tree --write-tree）：專案未設定 git 身�
   assert.ok(blocked.files.includes('a.txt'));
   assert.equal(readText(join(path, 'a.txt')), 'from main\n', '正式分支的內容不得被動到');
   assert.equal(run(path, 'status', '--porcelain'), '', '不得留在解到一半的 merge 狀態');
+});
+
+// ── 「成果」分頁的圖形化 diff 檢視：taskDiffFiles／taskFileDiff ──────────────────────────
+//
+// 基準固定是 task.git.baseCommit 到「目前工作副本」，天然涵蓋已經 commit 的階段成果
+// 與使用者這一刻還沒 commit 的變更；不是只比對 index／HEAD。
+
+test('diff 清單／內容：新增、修改、刪除、重新命名同時呈現，且涵蓋已 commit 與尚未 commit 的變更', t => {
+  const root = sandbox(t), path = project(root);
+  // modify-me.md／delete-me.md／rename-me.md 必須在 baseCommit 就已經存在：diff 的基準是
+  // 「baseCommit → 目前工作副本」的兩點比較，任務分支自己新建立又修改／刪除／重新命名的
+  // 檔案，relative 到 baseCommit 一律只會是「新增」，不會是 modified／deleted／renamed。
+  writeFileSync(join(path, 'modify-me.md'), 'original content\n');
+  writeFileSync(join(path, 'delete-me.md'), 'will be removed\n');
+  writeFileSync(join(path, 'rename-me.md'), 'keep this content\n');
+  existingRepo(path);
+  const prepared = workspace.prepare({ projectPath: path, taskId, title: 'Diff view', worktreesDir: join(root, 'worktrees') });
+  const wd = prepared.git.workingDirectory, baseCommit = prepared.git.baseCommit, branch = prepared.git.workingBranch;
+
+  // 模擬 execute 階段又新增並 commit 過的成果：這個檔案 baseCommit 沒有，屬於「已 commit 的階段成果」。
+  writeFileSync(join(wd, 'committed.md'), 'already delivered\n');
+  const committedOutcome = workspace.commit({ workingDirectory: wd, workingBranch: branch, subject: 'taskflow(execute): 完成第一階段' });
+  assert.equal(committedOutcome.committed, true);
+
+  // 之後還有尚未 commit 的變更：修改、刪除、重新命名既有檔案，加上全新的未追蹤與已 staged 的檔案。
+  writeFileSync(join(wd, 'modify-me.md'), 'changed content\n');
+  rmSync(join(wd, 'delete-me.md'));
+  run(wd, 'mv', 'rename-me.md', 'renamed.md');
+  writeFileSync(join(wd, 'new-untracked.md'), 'brand new work\n');
+  writeFileSync(join(wd, 'new-staged.md'), 'staged content\n');
+  run(wd, 'add', 'new-staged.md');
+  // 機密／執行期檔案：即使有變更也不得出現在清單或可被讀取。
+  writeFileSync(join(wd, '.env'), 'SECRET=leak\n');
+  mkdirSync(join(wd, 'server'), { recursive: true });
+  writeFileSync(join(wd, 'server', 'key.pem'), 'PRIVATE KEY\n');
+
+  const list = workspace.diffFiles({ workingDirectory: wd, baseCommit });
+  assert.equal(list.available, true);
+  assert.deepEqual(list.files.map(f => f.path), ['committed.md', 'delete-me.md', 'modify-me.md', 'new-staged.md', 'new-untracked.md', 'renamed.md'], '依路徑排序，機密檔案與重新命名的舊路徑不得出現');
+  const byPath = Object.fromEntries(list.files.map(f => [f.path, f]));
+  assert.equal(byPath['committed.md'].status, 'added');
+  assert.equal(byPath['modify-me.md'].status, 'modified');
+  assert.equal(byPath['delete-me.md'].status, 'deleted');
+  assert.equal(byPath['renamed.md'].status, 'renamed');
+  assert.equal(byPath['renamed.md'].oldPath, 'rename-me.md');
+  assert.equal(byPath['new-untracked.md'].status, 'added');
+  assert.equal(byPath['new-staged.md'].status, 'added');
+
+  // 逐一取得 diff 內容：已 commit＋尚未 commit 要合併在同一份 diff 裡呈現。
+  const modified = workspace.fileDiff({ workingDirectory: wd, baseCommit, path: 'modify-me.md' });
+  assert.equal(modified.available, true);
+  assert.match(modified.diff, /-original content/);
+  assert.match(modified.diff, /\+changed content/);
+
+  const deleted = workspace.fileDiff({ workingDirectory: wd, baseCommit, path: 'delete-me.md' });
+  assert.equal(deleted.available, true);
+  assert.match(deleted.diff, /-will be removed/);
+  assert.doesNotMatch(deleted.diff, /\+will be removed/);
+
+  const renamed = workspace.fileDiff({ workingDirectory: wd, baseCommit, path: 'renamed.md', oldPath: 'rename-me.md' });
+  assert.equal(renamed.available, true);
+  assert.match(renamed.diff, /rename from rename-me\.md/);
+  assert.match(renamed.diff, /rename to renamed\.md/);
+
+  const untracked = workspace.fileDiff({ workingDirectory: wd, baseCommit, path: 'new-untracked.md' });
+  assert.equal(untracked.available, true);
+  assert.equal(untracked.status, 'added');
+  assert.match(untracked.diff, /\+brand new work/);
+
+  const staged = workspace.fileDiff({ workingDirectory: wd, baseCommit, path: 'new-staged.md' });
+  assert.equal(staged.available, true);
+  assert.match(staged.diff, /\+staged content/);
+
+  const addedCommitted = workspace.fileDiff({ workingDirectory: wd, baseCommit, path: 'committed.md' });
+  assert.equal(addedCommitted.available, true);
+  assert.match(addedCommitted.diff, /\+already delivered/);
+
+  // 機密路徑就算知道確切檔名，也不得被讀出內容。
+  for (const unsafe of ['.env', 'server/key.pem', '.git/config']) {
+    assert.throws(() => workspace.fileDiff({ workingDirectory: wd, baseCommit, path: unsafe }),
+      e => e.code === 'GIT_SAFETY' && e.reason === 'unsafe_path', `${unsafe} 必須被拒絕`);
+  }
+});
+
+test('diff 清單：沒有任何變更時為空陣列', t => {
+  const root = sandbox(t), path = project(root);
+  existingRepo(path);
+  const prepared = workspace.prepare({ projectPath: path, taskId, title: 'Empty diff', worktreesDir: join(root, 'worktrees') });
+  const list = workspace.diffFiles({ workingDirectory: prepared.git.workingDirectory, baseCommit: prepared.git.baseCommit });
+  assert.deepEqual(list, { available: true, files: [] });
+});
+
+test('diff：非 Git 模式（baseCommit 為空）回報明確狀態，不拋錯', () => {
+  const list = taskDiffFiles({ workingDirectory: 'irrelevant-when-not-git', baseCommit: null, git });
+  assert.deepEqual(list, { available: false, reason: 'not_git', message: '此任務非 Git 模式，無法顯示差異。', files: [] });
+
+  const content = taskFileDiff({ workingDirectory: 'irrelevant-when-not-git', baseCommit: null, path: 'a.txt', git });
+  assert.deepEqual(content, { available: false, reason: 'not_git', message: '此任務非 Git 模式，無法顯示差異。', diff: '' });
 });
