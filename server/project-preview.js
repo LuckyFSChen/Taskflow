@@ -1,7 +1,6 @@
 import express from 'express';
 import {spawn} from 'node:child_process';
 import {request as httpRequest} from 'node:http';
-import {createServer as createNetProbe} from 'node:net';
 import {existsSync,readdirSync,readFileSync,realpathSync,statSync} from 'node:fs';
 import {dirname,join,resolve,relative,isAbsolute,extname} from 'node:path';
 import {HttpError} from './domain.js';
@@ -10,6 +9,7 @@ import {createStore} from './db.js';
 import {registerPreview,unregisterPreview,waitForExit} from './process-lifecycle.js';
 import {acceptanceEnvironment,cleanupAcceptanceContext,createAcceptanceContext} from './acceptance-auth.js';
 import {childEnvironment,resolveNpmCli} from './npm-runner.js';
+import {allocateRuntimePort} from './ports.js';
 import {resolveRuntimeTopology,serviceDirectory,topologyPublic} from './runtime-topology.js';
 import {createRuntimeManager,runtimePublic} from './runtime-manager.js';
 import {RuntimeFailure} from './runtime-validation.js';
@@ -106,12 +106,9 @@ function runNpm(cwd,args) {
     child.on('close',code=>{clearTimeout(timer);code===0&&!timedOut?resolve():reject(new HttpError(422,timedOut?'安裝或建置超過三分鐘，請檢查專案。':`網頁建置失敗：${output}`));});
   });
 }
+// Preview 與 Task runtime 共用同一個配發者：作業系統挑，但 4310／4311 一律重配。
 function getFreePort() {
-  return new Promise((resolvePort,reject)=>{
-    const probe=createNetProbe();
-    probe.once('error',reject);
-    probe.listen(0,'127.0.0.1',()=>{const port=probe.address().port;probe.close(()=>resolvePort(port));});
-  });
+  return allocateRuntimePort();
 }
 function safeKeyFragment(key) {
   return key.replace(/[^a-zA-Z0-9_-]/g,'_');
@@ -223,9 +220,13 @@ export function createProjectPreview({npm=runNpm,registryPath=resolve('data/prev
       try{seedStore.upsertUser('TaskFlow Preview',acceptance.username,acceptance.password,'admin');acceptance.injection.database=true;}
       finally{seedStore.close();}
     }catch(error){acceptance.injection.error=String(error?.message||error).slice(0,200);}
-    const env={...process.env};
-    for(const k of ['INBOX_TOKEN','LINE_CHANNEL_SECRET','LINE_CHANNEL_ACCESS_TOKEN','OPENAI_API_KEY','CODEX_API_KEY','ANTHROPIC_API_KEY'])delete env[k];
+    // childEnvironment()：剝掉秘密，也剝掉「我是主服務」的 port 身分。
+    // 被 Preview 的專案如果就是 TaskFlow 自己（自我專案），繼承到 TASKFLOW_PORT=4310
+    // 會讓 Preview 去搶正式服務的位置。
+    const env=childEnvironment(process.env);
     env.PORT=String(port);env.HOST='127.0.0.1';env.TASKFLOW_DB_FILE=previewDbPath;
+    // TaskFlow 結構的專案讀的是 TASKFLOW_PORT：明確告訴它「這一輪你自己的 port 是這個」。
+    env.TASKFLOW_PORT=String(port);env.TASKFLOW_HOST='127.0.0.1';
     // 這個 Preview 只有一個程序，PORT 就是它自己的 port；語意化別名一併提供，
     // 讓專案不必再從 PORT 反推「這是前端還是後端」（計畫書第八章）。
     env.PREVIEW_PORT=String(port);env.PREVIEW_URL=`http://127.0.0.1:${port}`;

@@ -3,6 +3,14 @@ $ErrorActionPreference='Stop'
 if($CheckOnly -and $Restart){throw 'CheckOnly and Restart cannot be combined.'}
 $taskRoot=Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $taskRoot
+# Port ownership 只有一份定義（scripts/TaskFlow-Ports.ps1，對應 server/ports.js）。
+. (Join-Path $PSScriptRoot 'TaskFlow-Ports.ps1')
+# 這支腳本由 Service Guardian 啟動，而 Guardian 自己可能是從某個 runtime 環境啟動的。
+# 繼承來的 PORT 會一路傳進新的 server\index.js，讓主服務綁到隨機高位 Port。
+Reset-TaskFlowPortEnvironment
+$localUrl="http://127.0.0.1:$TaskFlowMainPort"
+# 本輪啟動的主服務；啟動失敗時必須停掉，不得留下第二個 server\index.js。
+$startedServer=$null
 $serverPath=Join-Path $taskRoot 'server\index.js'
 $tunnelExe=Join-Path $taskRoot 'data\tools\cloudflared.exe'
 function Test-ServiceUrl([string]$url){
@@ -53,7 +61,7 @@ try{
     if($LASTEXITCODE -ne 0){throw "Build failed with exit code $LASTEXITCODE; the running service was not stopped."}
     if(!(Test-Path -LiteralPath (Join-Path $taskRoot 'dist\index.html'))){throw 'Build finished but dist\index.html is missing; the running service was not stopped.'}
   }
-  $localReady=Test-ServiceUrl 'http://127.0.0.1:4310'
+  $localReady=Test-ServiceUrl $localUrl
   if((!$localReady -or $Restart) -and !$CheckOnly){
     $old=Owned-Process 'data/server.pid' $serverPath -Node
     if($old){
@@ -63,15 +71,23 @@ try{
       Stop-Process -Id $old.ProcessId
       Wait-Process -Id $old.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
     }
-    if(Get-NetTCPConnection -LocalPort 4310 -State Listen -ErrorAction SilentlyContinue){throw 'Port 4310 is occupied; refused to stop an unknown process.'}
+    if(Get-TaskFlowPortOwner -Port $TaskFlowMainPort){throw "Port $TaskFlowMainPort is occupied; refused to stop an unknown process."}
     $localReady=$false
     $server=Start-Process -FilePath (Get-Command node.exe).Source -ArgumentList ('"'+$serverPath+'"') -WorkingDirectory $taskRoot -WindowStyle Hidden -RedirectStandardOutput 'data/server.log' -RedirectStandardError 'data/server-error.log' -PassThru
+    $startedServer=$server
     $server.Id | Set-Content -LiteralPath 'data/server.pid'
     for($attempt=0;$attempt -lt 20;$attempt++){
-      if(Test-ServiceUrl 'http://127.0.0.1:4310'){$localReady=$true;break}
       if($server.HasExited){throw 'TaskFlow exited during startup.'}
+      # 服務啟動成功時會把自己的網址寫進 server.log。Port 不是正式 Port 就是 startup failure，
+      # 不再繼續等健康檢查，也不接受那個 Port。
+      $loggedPort=Get-TaskFlowLoggedPort -LogPath 'data/server.log'
+      if($loggedPort -and $loggedPort -ne $TaskFlowMainPort){throw "TaskFlow main server started on an unexpected port. Expected: $TaskFlowMainPort. Actual: $loggedPort."}
+      $owner=Get-TaskFlowPortOwner -Port $TaskFlowMainPort
+      if($owner -and $owner.OwningProcess -eq $server.Id -and (Test-ServiceUrl $localUrl)){$localReady=$true;break}
       Start-Sleep -Milliseconds 500
     }
+    # 本輪啟動的服務已經健康而且真的擁有正式 Port：它不再是「待清理的殘留」。
+    if($localReady){$startedServer=$null}
   }
   if(!$localReady){throw 'Local TaskFlow is not responding.'}
   $configuredPublicUrl=''
@@ -100,7 +116,7 @@ try{
       if(!$publicReady){
         $oldTunnel=Owned-Process 'data/tunnel.pid' $tunnelExe
         if($oldTunnel){Stop-Process -Id $oldTunnel.ProcessId}
-        $tunnel=Start-Process -FilePath $tunnelExe -ArgumentList 'tunnel --url http://127.0.0.1:4310 --no-autoupdate' -WorkingDirectory $taskRoot -WindowStyle Hidden -RedirectStandardOutput 'data/tunnel-out.log' -RedirectStandardError 'data/tunnel.log' -PassThru
+        $tunnel=Start-Process -FilePath $tunnelExe -ArgumentList "tunnel --url $localUrl --no-autoupdate" -WorkingDirectory $taskRoot -WindowStyle Hidden -RedirectStandardOutput 'data/tunnel-out.log' -RedirectStandardError 'data/tunnel.log' -PassThru
         $tunnel.Id | Set-Content -LiteralPath 'data/tunnel.pid'
         $publicUrl=''
         for($attempt=0;$attempt -lt 45;$attempt++){
@@ -125,6 +141,13 @@ try{
   if($ResultFile){$result | Set-Content -LiteralPath $ResultFile -Encoding UTF8}
   $result
 }catch{
+  # 只停本輪啟動、而且沒有成功接管正式 Port 的那一個 PID：不碰其他任何程序。
+  if($startedServer){
+    [void](Stop-TaskFlowProcessById -ProcessId $startedServer.Id)
+    $savedPid=$null
+    if(Test-Path -LiteralPath 'data/server.pid'){$savedPid=(Get-Content -LiteralPath 'data/server.pid' -Raw -ErrorAction SilentlyContinue).Trim()}
+    if($savedPid -eq "$($startedServer.Id)"){Remove-Item -LiteralPath 'data/server.pid' -Force -ErrorAction SilentlyContinue}
+  }
   if($ResultFile){@{ok=$false;error=$_.Exception.Message} | ConvertTo-Json -Compress | Set-Content -LiteralPath $ResultFile -Encoding UTF8}
   throw
 }finally{

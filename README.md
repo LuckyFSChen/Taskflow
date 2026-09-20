@@ -5,6 +5,8 @@ Windows 本地 AI 任務工作台。Vue 3 + TypeScript + Vite + Pinia + Vue Rout
 ## 開啟工作台
 目前的本地網址：http://127.0.0.1:4310
 
+主服務固定使用 `4310`、Service Guardian 固定使用 `4311`；任務 worktree、Preview 與 Browser Validation 使用動態高位連接埠，兩者完全隔離（見 `server/ports.js`）。要改主服務的連接埠請設定 `.env` 的 `TASKFLOW_PORT`——泛用的 `PORT` 屬於任務 runtime，主服務不會讀它。
+
 首次登入資訊在 `data/first-login.txt`，只保存在你的電腦，未硬編碼於程式。登入後請在設定變更密碼並刪除首次登入檔。沒有預設共用密碼。
 
 後續可在 PowerShell 執行 `./Start-TaskFlow.ps1`。若已安裝依賴及建置，也可 `npm start`。需 Node.js 24 以上。

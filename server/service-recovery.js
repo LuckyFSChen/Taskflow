@@ -2,6 +2,7 @@ import {spawn} from 'node:child_process';
 import {mkdtempSync,readFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
+import {infrastructureEnvironment} from './ports.js';
 
 // Windows background descendants can inherit execFile's output pipes and keep
 // its callback waiting after PowerShell exits. Use a result file and no pipes.
@@ -13,7 +14,9 @@ export async function runServiceRecovery({checkOnly=false,build=false,spawnProce
   const resultFile=join(directory,'result.json');
   try{
     const code=await new Promise((resolveExit,reject)=>{
-      const child=spawnProcess('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',resolve('scripts/Recover-TaskFlow.ps1'),checkOnly?'-CheckOnly':'-Restart',...(build?['-Build']:[]),'-ResultFile',resultFile],{cwd:resolve('.'),windowsHide:true,stdio:'ignore'});
+      // 這支腳本會再啟動一次 server/index.js。它繼承到的環境若帶著某個 runtime 的 PORT，
+      // 新的主服務就會綁到那個 port——所以在這裡就把 port 身分清乾淨並釘上正式值。
+      const child=spawnProcess('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',resolve('scripts/Recover-TaskFlow.ps1'),checkOnly?'-CheckOnly':'-Restart',...(build?['-Build']:[]),'-ResultFile',resultFile],{cwd:resolve('.'),windowsHide:true,stdio:'ignore',env:infrastructureEnvironment()});
       const timer=setTimeout(()=>{child.kill();reject(new Error('Service recovery timed out'));},timeoutMs);
       child.once('error',error=>{clearTimeout(timer);reject(error);});
       child.once('exit',exitCode=>{clearTimeout(timer);resolveExit(exitCode);});

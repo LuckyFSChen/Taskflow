@@ -39,10 +39,13 @@ import {guardianAlive,initControlRequests,isSelfProject,latestRestart,recoverStu
 import {createCompletionValidations,completionValidationPublic} from './completion-validation.js';
 import {legacyWorkspaceStatus,migrateLegacyWorkspace} from './git-migration.js';
 import {createGitWorkspace} from './git-workspace.js';
+// 允許的來源要跟著主服務真正的 port 走（4310），不是跟著繼承來的 PORT 走。
+import {resolveMainPort} from './ports.js';
 
 export function allowedOrigins(publicOrigin=process.env.PUBLIC_ORIGIN) {
-  const configured=new URL(publicOrigin||`http://127.0.0.1:${process.env.PORT||4310}`).origin;
-  const allowed=new Set([configured,`http://127.0.0.1:${process.env.PORT||4310}`,`http://localhost:${process.env.PORT||4310}`,`http://[::1]:${process.env.PORT||4310}`,'http://127.0.0.1:5173','http://localhost:5173']);
+  const port=resolveMainPort();
+  const configured=new URL(publicOrigin||`http://127.0.0.1:${port}`).origin;
+  const allowed=new Set([configured,`http://127.0.0.1:${port}`,`http://localhost:${port}`,`http://[::1]:${port}`,'http://127.0.0.1:5173','http://localhost:5173']);
   const url=new URL(configured);
   if(['127.0.0.1','localhost','[::1]'].includes(url.hostname)) {
     for(const host of ['127.0.0.1','localhost','[::1]']) {

@@ -13,6 +13,7 @@ import {spawn} from 'node:child_process';
 import {existsSync, mkdirSync, writeFileSync} from 'node:fs';
 import {dirname, join} from 'node:path';
 import {killTree} from './runner.js';
+import {withoutInfrastructurePorts} from './ports.js';
 
 // 這些變數只屬於 TaskFlow 本體；專案的建置或測試沒有任何理由需要它們。
 export const SENSITIVE_ENV_KEYS = [
@@ -37,9 +38,15 @@ export function resolveNpmCli(execPath = process.execPath) {
   return candidates.find(existsSync) || null;
 }
 
-/** 子程序環境：複製目前環境後移除秘密。 */
+/**
+ * 子程序環境：複製目前環境後移除秘密，並移除主服務的 port 身分。
+ *
+ * 後者同樣重要：主服務的 PORT=4310 若原封不動傳給任務專案的 backend，那個 backend 會
+ * 試著綁 4310（實際發生過）；反過來，runtime 的 PORT 若回流到主服務，主服務就會跑到
+ * 隨機 port。每一個子程序自己的 port 一律由呼叫端明確設定。
+ */
 export function childEnvironment(env = process.env, extra = {}) {
-  const copy = { ...env, ...extra };
+  const copy = { ...withoutInfrastructurePorts(env), ...extra };
   for (const key of SENSITIVE_ENV_KEYS) delete copy[key];
   return copy;
 }

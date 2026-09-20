@@ -8,6 +8,9 @@ import { recoverCompletionTests } from './completion-test.js';
 import { recoverStuckRestarts } from './control-requests.js';
 import { recoverCompletionValidations } from './completion-validation.js';
 import { reconcilePreviewRegistry, stopPid } from './process-lifecycle.js';
+// 主服務的 port 是固定的基礎設施，不是由誰配發的 runtime 資源（server/ports.js）。
+import { inheritedRuntimePorts, resolveMainHost, resolveMainPort } from './ports.js';
+import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 const store=createStore();
 if(!store.db.prepare('SELECT id FROM users LIMIT 1').get()){console.error('請先執行 npm run setup 建立管理者。');process.exit(1);}
@@ -33,6 +36,26 @@ const completionTimer=setInterval(()=>{
   try{app.locals.completionPipeline.tick();}
   catch(error){console.error(new Date().toISOString(),'Completion pipeline tick failed',String(error?.message||error).slice(0,300));}
 },3000);
-const server=app.listen(Number(process.env.PORT||4310),process.env.HOST||'127.0.0.1',()=>console.log(`TaskFlow: http://${process.env.HOST||'127.0.0.1'}:${process.env.PORT||4310}`));
+// 主服務的位置：TASKFLOW_PORT 或 4310。泛用的 PORT 屬於 runtime 子程序，這裡一律不看，
+// 但如果它被繼承進來，就照實記錄一行——那是「為什麼服務跑到別的 port」唯一的直接證據。
+const port=resolveMainPort(),host=resolveMainHost();
+const inheritedPorts=inheritedRuntimePorts();
+if(inheritedPorts.length)console.warn(`忽略從啟動環境繼承的 runtime port 變數：${inheritedPorts.join('、')}；主服務固定使用 ${port}。`);
+const server=app.listen(port,host,()=>{
+  const actual=server.address()?.port;
+  // 綁到別的 port 就是啟動失敗，不是「換個 port 也能用」：Restart、Guardian、PUBLIC_ORIGIN
+  // 與所有健康檢查都以這個 port 為準。
+  if(actual!==port){console.error(`TaskFlow main server started on an unexpected port.\n\nExpected:\n${port}\n\nActual:\n${actual}`);process.exit(1);}
+  // server.pid 必須是「現在真的在聽這個 port 的那一個主服務」。由服務自己在確定聽到之後寫，
+  // 啟動腳本就不會把一個還沒成功、或根本綁錯 port 的 PID 留在檔案裡。
+  try{writeFileSync(resolve('data/server.pid'),String(process.pid));}
+  catch(error){console.error('無法寫入 data/server.pid',String(error?.message||error).slice(0,200));}
+  console.log(`TaskFlow: http://${host}:${actual}`);
+});
+server.on('error',error=>{
+  if(error?.code==='EADDRINUSE')console.error(`Port ${port} is already in use; TaskFlow main server did not start.`);
+  else console.error('TaskFlow main server failed to start',String(error?.message||error).slice(0,300));
+  process.exit(1);
+});
 function stop(){runner.stop();bridge.stop();clearInterval(completionTimer);app.locals.completionPipeline?.stop();void app.locals.previews.close();server.close(()=>process.exit(0));setTimeout(()=>process.exit(0),3000).unref();}
 process.on('SIGINT',stop);process.on('SIGTERM',stop);

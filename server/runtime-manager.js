@@ -13,23 +13,23 @@
 //   3. 「停止了」是驗證過的結論：PID 消失 **且** port 放掉，兩者都要。
 //   4. 絕不因為「PID 還活著」就盲殺。認不出身分的一律保留並照實回報（沿用 process-lifecycle.js）。
 import {spawn} from 'node:child_process';
-import {createServer as createNetProbe, connect as netConnect} from 'node:net';
+import {connect as netConnect} from 'node:net';
 import {existsSync} from 'node:fs';
 import {join, sep} from 'node:path';
 import {childEnvironment, resolveNpmCli} from './npm-runner.js';
+import {allocateRuntimePort, isReservedPort, RESERVED_PORTS} from './ports.js';
 import {isAlive, registerPreview, unregisterPreview, waitForExit} from './process-lifecycle.js';
 import {orderRuntimeServices, dependentsOf, runtimeServiceFingerprint, serviceDirectory} from './runtime-topology.js';
 import {RuntimeFailure, waitForServiceHealth} from './runtime-validation.js';
 
 export const SERVICE_STATES = ['STARTING', 'READY', 'STALE', 'STOPPING', 'STOPPED', 'FAILED'];
 
-/** 可用的埠。交給作業系統挑，避免自己維護一張「用過哪些」的表而與現實脫節。 */
+/**
+ * 可用的埠。交給作業系統挑，避免自己維護一張「用過哪些」的表而與現實脫節；
+ * 但 TaskFlow 自己的 4310／4311 一律重配——runtime 永遠不得佔走基礎設施的位置。
+ */
 export function allocatePort() {
-  return new Promise((resolve, reject) => {
-    const probe = createNetProbe();
-    probe.once('error', reject);
-    probe.listen(0, '127.0.0.1', () => { const {port} = probe.address(); probe.close(() => resolve(port)); });
-  });
+  return allocateRuntimePort();
 }
 
 /** 這個 port 現在還有沒有人在聽。stop() 之後要據此確認「連接埠已釋放」。 */
@@ -94,6 +94,10 @@ export function serviceEnvironment(service, {port, peers = [], base = process.en
   const env = childEnvironment(base, {});
   env.PORT = String(port);
   env.HOST = '127.0.0.1';
+  // TaskFlow 結構的專案（自我專案的 worktree）讀的是 TASKFLOW_PORT。不明確覆寫的話，
+  // 它會沿用預設的 4310 並直接撞上正式服務。
+  env.TASKFLOW_PORT = String(port);
+  env.TASKFLOW_HOST = '127.0.0.1';
   env.TASKFLOW_SERVICE_ID = service.id;
   env.TASKFLOW_SERVICE_TYPE = service.type;
   for (const peer of peers) {
@@ -182,7 +186,10 @@ export function createRuntimeManager({
     const {key, projectRoot, npm, startManaged, peers, fingerprint, extraEnv} = context;
     const dir = serviceDirectory(service, projectRoot);
     if (!existsSync(dir)) throw new RuntimeFailure('service_start_failed', `service ${service.id} 的目錄不存在：${service.cwd || '.'}`);
+    // 專案宣告的 port 到這裡已經過 normalizeService() 的保留 port 檢查；再擋一次，
+    // 因為 portAllocator 是可以被呼叫端替換的。
     const port = service.port || await portAllocator();
+    if (isReservedPort(port)) throw new RuntimeFailure('service_start_failed', `service ${service.id} 取得了 TaskFlow 保留的 port ${port}（保留：${[...RESERVED_PORTS].join('、')}），已拒絕啟動。`);
     const url = `http://127.0.0.1:${port}`;
     const state = {
       runtimeKey: key, id: service.id, type: service.type, cwd: service.cwd, mode: service.mode,

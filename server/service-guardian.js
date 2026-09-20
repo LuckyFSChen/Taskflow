@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import {createServer} from 'node:net';
+import {resolveGuardianPort} from './ports.js';
 import {writeFileSync} from 'node:fs';
 import {runServiceRecovery} from './service-recovery.js';
 import {createStore} from './db.js';
@@ -38,7 +39,8 @@ async function tick(){
   }catch(e){console.error(new Date().toISOString(),e.code||'Guardian cycle failed',String(e.message||'').slice(0,300));}
   finally{busy=false;}
 }
-lock.listen(4311,'127.0.0.1',()=>{
+// Guardian 的 port 同樣固定（TASKFLOW_GUARDIAN_PORT 或 4311），不受 runtime port 影響。
+lock.listen(resolveGuardianPort(),'127.0.0.1',()=>{
   writeFileSync('data/service-guardian.pid',String(process.pid));
   console.log('TaskFlow LINE recovery guardian ready');void tick();setInterval(()=>void tick(),5000);
 });

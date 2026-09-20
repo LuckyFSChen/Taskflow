@@ -149,7 +149,19 @@ FRONTEND_PORT / FRONTEND_URL         前端服務自己的
 
 單一服務的 Preview 另外提供 `PREVIEW_PORT` / `PREVIEW_URL`。
 
-連接埠一律向作業系統要（`allocatePort()`），不寫死任何數字。
+連接埠一律向作業系統要（`allocatePort()` → `server/ports.js` 的 `allocateRuntimePort()`），不寫死任何數字。
+
+### 保留連接埠：4310 / 4311
+
+`4310`（TaskFlow 主服務）與 `4311`（Service Guardian）屬於 TaskFlow Infrastructure，不是可以被配發的 runtime 資源：
+
+- 配發者永遠不會交出這兩個 port（配到就重配）。
+- `taskflow.runtime.json` / `package.json` 宣告 `port: 4310` 或 `4311` 會在解析階段就被擋下。
+- 主服務只讀 `TASKFLOW_PORT`（預設 4310），Guardian 只讀 `TASKFLOW_GUARDIAN_PORT`（預設 4311）。
+  泛用的 `PORT` 是 runtime 子程序的身分，**不會**影響主服務——否則從任務 runtime 啟動一次
+  TaskFlow，主服務就會跟著跑到隨機高位 port。
+- 主服務也不把自己的 `PORT` / `HOST` 傳給子程序（`childEnvironment()`），避免任務專案的
+  backend 反過來去綁 4310。
 
 ## 啟動與驗證流程
 

@@ -13,6 +13,7 @@ import { planSchema,resultSchema,planJson,resultJson } from './domain.js';
 import { commandPermissionArgs, developmentCommandRules, matchingCommandApprovals, approvedCommandRules, consumeCommandApprovals } from './command-permissions.js';
 import {detectManualActionRequirement,buildUserActionRequest} from './manual-action.js';
 import {resolveCliExecutable} from './cli-executable.js';
+import {withoutInfrastructurePorts} from './ports.js';
 import {detectWebProject,createProjectPreview} from './project-preview.js';
 import {createGitWorkspace,DEFAULT_PROTECTED_BRANCHES} from './git-workspace.js';
 import {gitIssuePending} from './git-issue.js';
@@ -46,7 +47,9 @@ export function cliAdapter({engine,prompt,cwd,schema,readOnly,runDir,onEvent,onP
     prompt+='\n完整結構範例（僅示範欄位與型別，內容必須來自本次工作，不得照抄）：'+JSON.stringify(schema.properties?.acceptance?{summary:'本次計畫摘要',acceptance:['實際驗收條件'],questions:[],steps:[{title:'實際步驟',role:'負責角色',instructions:'具體做法'}]}:preflight?{summary:'實際檢查摘要',toolAvailable:false,registryReachable:false,installationAllowed:false,evidence:['實際指令結果']}:{summary:'實際工作摘要',questions:[],artifacts:[],passed:false,evidence:[]});
     if(!readOnly&&!preflight)prompt+='\n平台已授權在工作副本內執行 npm/pnpm/yarn install、npm ci、test，以及 run build/test/lint/typecheck/check/dev/preview。需要安裝、建置、測試時直接執行，不必再次詢問；指令請從目前工作目錄執行。安裝可下載公開依賴。不得執行部署、publish 或 push；其他未授權操作遇到拒絕時回報具體指令。版本控制由平台負責：你的工作是修改檔案，平台會在這個階段結束後自動把變更 commit 到任務分支，所以不要執行 git add、git commit、git push 或任何會改動版控狀態的指令。這類指令被執行環境擋下是預期中的正常結果，不是錯誤、也不影響這一步的成敗；不要因此把 passed 設為 false，也不要在 userActionRequired 要求使用者手動 commit——使用者手動執行只會多出一個平台沒有記錄的 commit。檔案留在工作目錄即可。';
     const executable=resolveCliExecutable(engine);
-    const childEnv={...process.env,NO_COLOR:'1'};
+    // 主服務的 PORT／HOST 不往下傳：任務裡的 backend 曾因此去綁 4310，
+    // 而在這個環境裡開出來的終端機再啟動一次 TaskFlow 時，也會把 runtime port 帶回主服務。
+    const childEnv={...withoutInfrastructurePorts(process.env),NO_COLOR:'1'};
     if(engine==='codex'&&process.platform==='win32'){
       const nodeBin=resolve('data/tools/node');
       if(existsSync(join(nodeBin,'npm.cmd'))){

@@ -11,6 +11,7 @@
 //   3. 偵測不到就照實說「偵測不到」，絕不挑一個看起來最像的目錄硬跑——挑錯比沒有更糟。
 import {existsSync, readFileSync, readdirSync, statSync} from 'node:fs';
 import {createHash} from 'node:crypto';
+import {isReservedPort, RESERVED_PORTS} from './ports.js';
 import {join, relative, isAbsolute, sep} from 'node:path';
 
 export const RUNTIME_SERVICE_TYPES = ['frontend', 'backend', 'worker', 'database', 'other'];
@@ -259,6 +260,16 @@ export function normalizeProbe(entry) {
   };
 }
 
+/**
+ * 專案可以宣告自己的 port，但不可以宣告 TaskFlow 的。taskflow.runtime.json 裡的 4310
+ * 會讓一個 worktree runtime 直接佔走主服務的位置——那是設定錯誤，要在解析階段就說出來。
+ */
+export function normalizeServicePort(port, id) {
+  if (!Number.isInteger(port)) return null;
+  if (isReservedPort(port)) throw new Error(`runtime service ${id} 宣告的 port ${port} 是 TaskFlow 保留給主服務與 Service Guardian 的（${[...RESERVED_PORTS].join('、')}）；請移除這個宣告，改由 TaskFlow 配發。`);
+  return port;
+}
+
 export function normalizeService(raw, projectRoot) {
   if (!raw || typeof raw !== 'object') throw new Error('runtime service 必須是物件');
   const id = String(raw.id || '').trim();
@@ -277,7 +288,7 @@ export function normalizeService(raw, projectRoot) {
     buildCommand: raw.buildCommand ? String(raw.buildCommand).trim() : null,
     installCommand: raw.installCommand ? String(raw.installCommand).trim() : null,
     packageManager: raw.packageManager || 'npm',
-    port: Number.isInteger(raw.port) ? raw.port : null,
+    port: normalizeServicePort(raw.port, id),
     healthCheck: health,
     dependsOn: Array.isArray(raw.dependsOn) ? [...new Set(raw.dependsOn.map(String))] : [],
     browserEntry: raw.browserEntry === true,
