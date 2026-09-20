@@ -149,7 +149,7 @@ FRONTEND_PORT / FRONTEND_URL         前端服務自己的
 
 單一服務的 Preview 另外提供 `PREVIEW_PORT` / `PREVIEW_URL`。
 
-連接埠一律向作業系統要（`allocatePort()`），不寫死任何數字。
+連接埠一律由 **TaskFlow Runtime Port Pool**（預設 `45000`~`45099`，可用 `TASKFLOW_RUNTIME_PORT_START`／`TASKFLOW_RUNTIME_PORT_END` 調整）配發，`4310`／`4311` 永遠保留給 TaskFlow Core 與 Service Guardian，不會配給任何 worktree service。`taskflow.runtime.json` 的 `service.port` 不作為實際 bind port 使用——若要宣告，只能落在 Pool 範圍內；宣告值落在範圍外或等於 `4310`／`4311` 時，在設定解析階段就會直接丟出錯誤並擋下啟動，不會被靜默忽略後改配到別的 port。
 
 ## 啟動與驗證流程
 
