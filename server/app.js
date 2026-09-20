@@ -328,6 +328,27 @@ export function createApp(store,runner,{dist=resolve('dist'),previews=createProj
   app.post('/api/reorder',(req,res)=>{const ids=z.array(z.string().uuid()).max(500).parse(req.body.ids);if(new Set(ids).size!==ids.length)throw new HttpError(400,'重複任務');const tasks=ids.map(tid=>requireTask(store,req.user,tid));store.transaction(()=>{const positions=tasks.map(t=>t.position).sort((a,b)=>a-b);tasks.forEach((t,i)=>{t.position=positions[i]+i*0.001;store.saveTask(t);});});res.json({ok:true});});
   app.get('/api/tasks/:id/artifacts',(req,res)=>{const t=requireTask(store,req.user,req.params.id);const files=[];if(t.workspace&&existsSync(t.workspace)){const walk=(dir,depth=0)=>{if(depth>12||files.length>=500)return;for(const entry of readdirSync(dir,{withFileTypes:true})){if(entry.isSymbolicLink()||['node_modules','.git','.venv'].includes(entry.name)||entry.name.startsWith('.env'))continue;const p=join(dir,entry.name);if(entry.isDirectory())walk(p,depth+1);else if(files.length<500)files.push({path:relative(t.workspace,p).replaceAll('\\','/'),size:lstatSync(p).size});}};walk(t.workspace);}res.json({files,note:'工作副本中的檔案（含原始專案），最多列出 500 個。'});});
   app.get('/api/tasks/:id/download',(req,res)=>{const t=requireTask(store,req.user,req.params.id);if(!t.workspace)throw new HttpError(404,'尚無成果');const input=z.string().max(1000).parse(req.query.path);const path=resolve(t.workspace,input);if(!existsSync(path))throw new HttpError(404,'檔案不存在');const rel=relative(realpathSync(t.workspace),realpathSync(path));if(rel.startsWith('..')||isAbsolute(rel)||rel.split(/[\\/]/).some(p=>p.startsWith('.env')||['.git','.ssh','.aws','.codex','.claude'].includes(p))||/\.(pem|key|pfx)$/i.test(rel)||!lstatSync(path).isFile())throw new HttpError(403,'不允許存取');res.download(path);});
+  // 「成果」分頁的圖形化 diff 檢視：清單只回報 path／status，內容另外用 /diff/content 依需要才取，
+  // 避免一次把所有變更檔案的 diff 內容都算出來。安全檢查沿用 /download 的路徑逃逸／機密副檔名規則，
+  // 差別只在於這裡的檔案可能已被刪除（不存在於磁碟上），所以不能像 /download 一樣用 realpathSync(path)
+  // 與 lstatSync 檢查——那些只適用於「檔案現在還在」的下載情境。
+  const resolveDiffPath=(t,raw)=>{const root=realpathSync(t.workspace);const abs=resolve(root,raw);const rel=relative(root,abs);if(rel.startsWith('..')||isAbsolute(rel)||rel.split(/[\\/]/).some(p=>p.startsWith('.env')||['.git','.ssh','.aws','.codex','.claude'].includes(p))||/\.(pem|key|pfx)$/i.test(rel))throw new HttpError(403,'不允許存取');return rel.replaceAll('\\','/');};
+  app.get('/api/tasks/:id/diff',(req,res)=>{
+    const t=requireTask(store,req.user,req.params.id);
+    if(t.git?.mode!=='worktree')return res.json({available:false,reason:'not_git',message:'此任務非 Git 模式，無法顯示差異。',files:[]});
+    if(!t.workspace||!existsSync(t.workspace))return res.json({available:false,reason:'workspace_missing',message:'工作副本已不存在，無法顯示差異。',files:[]});
+    const result=gitWorkspace.diffFiles({workingDirectory:t.workspace,baseCommit:t.git.baseCommit});
+    res.json(result.available&&result.files.length>500?{...result,files:result.files.slice(0,500),truncated:true}:result);
+  });
+  app.get('/api/tasks/:id/diff/content',(req,res)=>{
+    const t=requireTask(store,req.user,req.params.id);
+    const input=z.object({path:z.string().min(1).max(1000),oldPath:z.string().max(1000).optional()}).parse(req.query);
+    if(t.git?.mode!=='worktree')return res.json({available:false,reason:'not_git',message:'此任務非 Git 模式，無法顯示差異。',diff:''});
+    if(!t.workspace||!existsSync(t.workspace))return res.json({available:false,reason:'workspace_missing',message:'工作副本已不存在，無法顯示差異。',diff:''});
+    const path=resolveDiffPath(t,input.path);
+    const oldPath=input.oldPath?resolveDiffPath(t,input.oldPath):null;
+    res.json(gitWorkspace.fileDiff({workingDirectory:t.workspace,baseCommit:t.git.baseCommit,path,oldPath}));
+  });
   app.post('/api/account/password',(req,res)=>{const input=z.object({current:z.string().max(200),password:z.string().min(12).max(200)}).parse(req.body);const u=store.db.prepare('SELECT password FROM users WHERE id=?').get(req.user.id);if(!passwordMatches(input.current,u.password))throw new HttpError(400,'目前密碼不正確');store.db.prepare('UPDATE users SET password=? WHERE id=?').run(passwordHash(input.password),req.user.id);store.db.prepare('DELETE FROM sessions WHERE user_id=? AND token<>?').run(req.user.id,req.sessionHash);res.json({ok:true});});
   app.get('/api/account/line-links',(req,res)=>{const pending=store.db.prepare('SELECT link_expires FROM users WHERE id=? AND link_hash IS NOT NULL AND link_expires>?').get(req.user.id,Date.now());res.json({links:store.lineLinks(req.user.id).map(({line_id,...link})=>({...link,lineHint:line_id.slice(0,5)+'…'+line_id.slice(-5),notifications:!!link.notifications})),pendingExpires:pending?.link_expires||null});});
   app.post('/api/account/line-link',(req,res)=>{const input=z.object({label:z.string().trim().max(80).default('LINE')}).parse(req.body);const code=randomBytes(18).toString('base64url');const expires=Date.now()+10*60000;store.db.prepare('UPDATE users SET link_hash=?,link_expires=?,link_label=? WHERE id=?').run(hash(code),expires,input.label||'LINE',req.user.id);res.json({command:`/link ${code}`,expiresMinutes:10,expiresAt:expires});});

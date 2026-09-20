@@ -307,6 +307,106 @@ export function currentChangedFiles({ workingDirectory, git }) {
   return changedPaths(git, workingDirectory).filter(path => !path.split('/').some(isUnsafeToCommit));
 }
 
+// `git diff --name-status -z` 的 rename／copy 紀錄是 `R100\0舊路徑\0新路徑\0`，其餘狀態是
+// `<status>\0路徑\0`。這裡把它轉成給「成果」分頁用的結構化清單，狀態轉成中性英文字，
+// 不依賴呼叫端認得 git 的單字母代碼。
+function parseDiffNameStatus(raw) {
+  const tokens = String(raw || '').split('\0');
+  const statusName = { A: 'added', M: 'modified', D: 'deleted', T: 'modified' };
+  const files = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const status = tokens[i];
+    if (!status) continue;
+    if (status[0] === 'R' || status[0] === 'C') {
+      const oldPath = tokens[++i];
+      const path = tokens[++i];
+      if (path) files.push({ path, oldPath, status: status[0] === 'R' ? 'renamed' : 'copied' });
+    } else {
+      const path = tokens[++i];
+      if (path) files.push({ path, status: statusName[status[0]] || 'modified' });
+    }
+  }
+  return files;
+}
+
+// 「成果」分頁的 diff 清單：基準固定是 task.git.baseCommit，範圍涵蓋「baseCommit 到目前
+// 工作副本」——也就是已經 commit 的階段成果，加上使用者這一刻還沒 commit 的變更，兩者
+// 合在一起才是使用者現在看到的完整差異，不是只比對 index／HEAD。
+//
+// `git diff <baseCommit>`（不帶第二個 ref）本身就是拿 baseCommit 與目前工作樹比較，天然
+// 涵蓋尚未 commit 的部分；缺的只有完全沒進過 index 的 untracked 新檔案，另外用
+// `git status` 補上。非 Git 模式（baseCommit 為空）不是錯誤，只是沒有 diff 可看。
+export function taskDiffFiles({ workingDirectory, baseCommit, git }) {
+  if (!baseCommit) {
+    return { available: false, reason: 'not_git', message: '此任務非 Git 模式，無法顯示差異。', files: [] };
+  }
+
+  const tracked = git(workingDirectory, ['diff', '--name-status', '-M', '-z', baseCommit], { allowFailure: true });
+  if (!tracked.ok) {
+    throw new GitSafetyError('git_command_failed', `無法計算與 ${baseCommit.slice(0, 8)} 的差異：${(tracked.stderr || '').trim().slice(0, 300)}`, { baseCommit });
+  }
+  const trackedFiles = parseDiffNameStatus(tracked.stdout);
+
+  const statusRaw = git(workingDirectory, ['status', '--porcelain', '-z', '--untracked-files=all'], { allowFailure: true });
+  const untrackedFiles = [];
+  if (statusRaw.ok) {
+    const raw = statusRaw.stdout.split('\0');
+    for (let i = 0; i < raw.length; i++) {
+      const entry = raw[i];
+      if (!entry) continue;
+      if (entry.slice(0, 2) === '??') untrackedFiles.push({ path: entry.slice(3), status: 'added' });
+      else if (entry[0] === 'R' || entry[0] === 'C') i++; // 已由 tracked diff 涵蓋，這裡只跳過舊路徑欄位
+    }
+  }
+
+  const seen = new Set();
+  const files = [];
+  for (const file of [...trackedFiles, ...untrackedFiles]) {
+    const unsafe = file.path.split('/').some(isUnsafeToCommit) || (file.oldPath && file.oldPath.split('/').some(isUnsafeToCommit));
+    if (unsafe || seen.has(file.path)) continue;
+    seen.add(file.path);
+    files.push(file);
+  }
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  return { available: true, files };
+}
+
+// 單一檔案的 diff 內容，基準與 taskDiffFiles 一致（baseCommit → 目前工作副本，含未 commit
+// 變更）。已追蹤檔案（含刪除、修改、重新命名）直接用 `git diff <baseCommit> -- <path>`，
+// 一個指令天然涵蓋「已 commit ＋尚未 commit」；untracked 新檔案不在任何 commit 或 index 裡，
+// `git diff <baseCommit>` 看不到它，改用 `git diff --no-index -- /dev/null <path>` 合成一份
+// 「整檔新增」的 diff——沿用 git 自己的二進位偵測與行尾處理，不必自己重寫一套。
+//
+// 路徑安全性（拒絕逃出 workspace、.git/.env/金鑰等）由呼叫端（HTTP 路由）比照 /download
+// 既有規則檢查；這裡另外用 isUnsafeToCommit 擋一層，避免有其他呼叫路徑漏掉檢查。
+export function taskFileDiff({ workingDirectory, baseCommit, path, oldPath = null, git }) {
+  if (!baseCommit) {
+    return { available: false, reason: 'not_git', message: '此任務非 Git 模式，無法顯示差異。', diff: '' };
+  }
+  for (const segment of [path, oldPath].filter(Boolean)) {
+    if (String(segment).split('/').some(isUnsafeToCommit)) {
+      throw new GitSafetyError('unsafe_path', `不允許存取此路徑：${segment}`, { path: segment });
+    }
+  }
+
+  const statusCheck = git(workingDirectory, ['status', '--porcelain', '-z', '--untracked-files=all', '--', path], { allowFailure: true });
+  const isUntracked = statusCheck.ok && statusCheck.stdout.split('\0').some(entry => entry.slice(0, 2) === '??');
+
+  if (isUntracked) {
+    const untracked = git(workingDirectory, ['diff', '--no-index', '--', '/dev/null', path], { allowFailure: true });
+    return { available: true, status: 'added', diff: untracked.stdout || '' };
+  }
+
+  const args = ['diff', '-M', baseCommit, '--'];
+  if (oldPath && oldPath !== path) args.push(oldPath);
+  args.push(path);
+  const result = git(workingDirectory, args, { allowFailure: true });
+  if (!result.ok) {
+    throw new GitSafetyError('git_command_failed', `無法取得 ${path} 的差異內容：${(result.stderr || '').trim().slice(0, 300)}`, { path });
+  }
+  return { available: true, status: null, diff: result.stdout || '' };
+}
+
 // 用 pathspec 檔案而不是命令列參數：專案可能有上萬個檔案，Windows 的命令列長度會爆掉。
 function addPaths(git, cwd, paths) {
   const listFile = join(tmpdir(), `taskflow-add-${process.pid}-${Date.now()}.paths`);
@@ -818,5 +918,7 @@ export function createGitWorkspace({ git = createGitRunner() } = {}) {
     remoteStatus: (options) => remoteStatus({ ...options, git }),
     push: (options) => pushBaseBranch({ ...options, git }),
     currentChangedFiles: (options) => currentChangedFiles({ ...options, git }),
+    diffFiles: (options) => taskDiffFiles({ ...options, git }),
+    fileDiff: (options) => taskFileDiff({ ...options, git }),
   };
 }

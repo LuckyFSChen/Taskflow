@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import {computed,onMounted,onUnmounted,ref,reactive,watch,nextTick} from 'vue';
 import {useRoute} from 'vue-router';
-import {Activity,ArrowDown,ArrowUp,ArrowUpRight,Bell,Check,CheckCheck,ChevronRight,Clock3,FileText,Folder,GitBranch,GripVertical,Inbox,LayoutDashboard,ListTodo,LoaderCircle,LogOut,MessageSquare,MoreHorizontal,Pause,Play,Plus,Search,Settings2,ShieldCheck,Square,Terminal,Workflow,X,ExternalLink,AlertCircle,Download,Users,Radio} from 'lucide-vue-next';
+import {Activity,ArrowDown,ArrowUp,ArrowUpRight,Bell,Check,CheckCheck,ChevronRight,Clock3,FileText,Folder,GitBranch,GripVertical,Inbox,LayoutDashboard,ListTodo,LoaderCircle,LogOut,MessageSquare,MoreHorizontal,Pause,Play,Plus,Search,Settings2,ShieldCheck,Square,Terminal,Workflow,X,ExternalLink,AlertCircle,Users,Radio} from 'lucide-vue-next';
 import {useTaskStore,api} from './store';
 import {attentionItems} from './attention.js';
 import {healthAlert} from './system-health-view.js';
@@ -50,6 +50,8 @@ import OutputIssue from './OutputIssue.vue';
 // 不用「第一次登入」推測；四個步驟全部沿用既有功能。
 import OnboardingWizard from './OnboardingWizard.vue';
 import {shouldShowOnboarding} from './onboarding-view.js';
+// 「成果」分頁的圖形化 diff 檢視：取代舊有的整份工作副本清單，見 src/ResultDiff.vue。
+import ResultDiff from './ResultDiff.vue';
 const removalCleanup=ref<string[]>([]);
 const store=useTaskStore(),route=useRoute();
 // 精靈只在後端說「還沒設定過」時自動開啟；使用者按過「稍後設定」之後，
@@ -63,6 +65,7 @@ function wizardCreateTask(mode:string){
 }
 const login=reactive({username:'admin',password:''});const loginError=ref(''),initializing=ref(true),busy=ref(false),toast=ref(''),query=ref(''),filter=ref('all');
 const showNew=ref(false),selected=ref<any>(null),tab=ref(DEFAULT_TAB),answer=ref(''),files=ref<any[]>([]),users=ref<any[]>([]);
+const resultDiffAvailable=ref(true),resultDiffMessage=ref('');
 const detailTabs=DETAIL_TABS;
 // 「需要你處理」在詳情頁要一次列出所有同時成立的事情，不像列表只取一個分類。
 const detailPending=computed(()=>pendingActions(selected.value));
@@ -284,6 +287,8 @@ async function openTask(t: any) {
   tab.value = DEFAULT_TAB;
   answer.value = '';
   files.value = [];
+  resultDiffAvailable.value = true;
+  resultDiffMessage.value = '';
   outputRaw.value = null;
   outputRecovery.value = null;
 
@@ -329,7 +334,7 @@ function keyboard(event:KeyboardEvent){if(overlay.value==='none')return;if(event
 async function drop(target:any){const source=store.tasks.find(t=>t.id===dragging.value);dragging.value=null;if(!source||source.id===target.id)return;if(source.priority!==target.priority){notify('拖曳可調整相同優先級的任務；跨級請使用優先級選單。');return;}const list=store.tasks.filter(t=>t.priority===target.priority);const moved=list.splice(list.findIndex(t=>t.id===source.id),1)[0];list.splice(list.findIndex(t=>t.id===target.id),0,moved);await run(()=>api('/reorder',{ids:list.map(t=>t.id)}));}
 watch(()=>newTask.type,type=>{newTask.executor=type==='research'?'claude':'codex';newTask.reviewer=type==='research'?'codex':'claude';});
 watch(()=>route.path,async p=>{filter.value='all';query.value='';if(p==='/settings'&&store.user)void store.loadHealth();if(p==='/settings'&&store.user?.role==='admin')try{users.value=await api('/admin/users');}catch(e:any){notify(e.message);}});
-watch(tab,async v=>{if(v==='results'&&selected.value)try{files.value=(await api(`/tasks/${selected.value.id}/artifacts`)).files;}catch(e:any){notify(e.message);}});
+watch(tab,async v=>{if(v==='results'&&selected.value)try{const r=await api(`/tasks/${selected.value.id}/diff`);files.value=r.files||[];resultDiffAvailable.value=r.available!==false;resultDiffMessage.value=r.message||'';}catch(e:any){notify(e.message);}});
 onMounted(async()=>{document.addEventListener('keydown',keyboard);try{await store.refresh();if(route.path==='/settings'&&store.user?.role==='admin')users.value=await api('/admin/users');}catch{}finally{initializing.value=false;}if(store.user)void store.loadHealth();
   // 每 3 秒的輪詢只讀取 /state；系統狀態不在其中，才不會持續 spawn CLI。
   interval=setInterval(async()=>{if(!store.user||busy.value)return;try{await store.refresh();if(selected.value)await loadTask(selected.value.id);}catch{}},3000);
@@ -531,10 +536,8 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
 
       <!-- 成果：檔案、證據、Browser 驗證與發布核准集中在這裡。 -->
       <template v-else-if="tab==='results'">
-        <h3>成果檔案</h3>
-        <div class="notice"><Folder :size="18"/>工作副本中的檔案（含原始專案），最多顯示 500 個。原專案不會自動被覆寫。</div>
-        <p v-if="!files.length" class="muted">尚未建立工作副本。</p>
-        <a v-for="file in files" :key="file.path" :href="`/api/tasks/${selected.id}/download?path=${encodeURIComponent(file.path)}`" class="file-row"><FileText :size="17"/><span>{{file.path}}</span><small>{{Math.ceil(file.size/1024)}} KB</small><Download :size="16"/></a>
+        <h3>成果差異</h3>
+        <ResultDiff :task-id="selected.id" :files="files" :available="resultDiffAvailable" :message="resultDiffMessage"/>
         <h3>驗證證據</h3>
         <p v-if="!detailEvidence.length" class="muted">尚未有可確認的驗證證據。</p>
         <div v-for="item in detailEvidence" :key="item.threadId" class="evidence-block"><strong>{{item.role}}</strong><p v-if="item.summary" class="prewrap">{{item.summary}}</p><ul><li v-for="(e,i) in item.evidence" :key="i">{{e}}</li></ul></div>
