@@ -147,6 +147,32 @@ test('Test 3 — dependsOn 決定啟動順序，環狀與缺漏都有明確錯�
   ]}, '/tmp'), /依賴不存在/);
 });
 
+// --- service.port 只能落在 TaskFlow Runtime Port Pool 範圍內 -------------------
+test('service.port 落在 Runtime Port Pool 外或等於保留 port 時，解析階段直接擋下', () => {
+  assert.throws(() => normalizeTopology({services: [
+    {id: 'backend', cwd: '', startCommand: 'node server.js', port: 4310},
+  ]}, '/tmp'), /保留 port|4310/);
+
+  assert.throws(() => normalizeTopology({services: [
+    {id: 'backend', cwd: '', startCommand: 'node server.js', port: 4311},
+  ]}, '/tmp'), /保留 port|4311/);
+
+  assert.throws(() => normalizeTopology({services: [
+    {id: 'backend', cwd: '', startCommand: 'node server.js', port: 3000},
+  ]}, '/tmp'), /超出.*Runtime Port Pool|3000/);
+
+  assert.throws(() => normalizeTopology({services: [
+    {id: 'frontend', cwd: '', startCommand: 'npm run dev', port: 45100},
+  ]}, '/tmp'), /超出.*Runtime Port Pool|45100/);
+});
+
+test('service.port 落在 45000~45099 範圍內時允許解析（僅作文件用途，不作為實際 bind port）', () => {
+  const topology = normalizeTopology({services: [
+    {id: 'backend', cwd: '', startCommand: 'node server.js', port: 45012},
+  ]}, '/tmp');
+  assert.equal(topology.services[0].port, 45012);
+});
+
 // --- Explicit runtime config 優先於自動偵測 ------------------------------------
 test('明確 runtime 設定優先於自動偵測，且 cwd 不得逃出專案目錄', t => {
   const root = fixture();

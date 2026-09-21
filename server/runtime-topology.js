@@ -13,6 +13,7 @@ import {existsSync, readFileSync, readdirSync, statSync} from 'node:fs';
 import {createHash} from 'node:crypto';
 import {isReservedPort, RESERVED_PORTS} from './ports.js';
 import {join, relative, isAbsolute, sep} from 'node:path';
+import {isReservedPort, resolvePortRange} from './runtime-port-manager.js';
 
 export const RUNTIME_SERVICE_TYPES = ['frontend', 'backend', 'worker', 'database', 'other'];
 
@@ -261,6 +262,7 @@ export function normalizeProbe(entry) {
 }
 
 /**
+<<<<<<< HEAD
  * 專案可以宣告自己的 port，但不可以宣告 TaskFlow 的。taskflow.runtime.json 裡的 4310
  * 會讓一個 worktree runtime 直接佔走主服務的位置——那是設定錯誤，要在解析階段就說出來。
  */
@@ -268,6 +270,23 @@ export function normalizeServicePort(port, id) {
   if (!Number.isInteger(port)) return null;
   if (isReservedPort(port)) throw new Error(`runtime service ${id} 宣告的 port ${port} 是 TaskFlow 保留給主服務與 Service Guardian 的（${[...RESERVED_PORTS].join('、')}）；請移除這個宣告，改由 TaskFlow 配發。`);
   return port;
+=======
+ * service.port 一旦宣告固定值，就是計畫書要根治的那個洞：taskflow.runtime.json 寫死的 port
+ * 會被 runtime-manager.js 直接拿去 listen（見 startOne() 的 `service.port || await portAllocator()`），
+ * 4310 就是這樣被誤配走的。實際 listen port 一律由 TaskFlow Runtime Port Pool 配發，
+ * 宣告值只允許落在 pool 範圍內（即便如此也不會被實際使用，僅作為文件用途）；
+ * 落在範圍外或等於保留 port 一律視為設定錯誤直接擋下，絕不靜默忽略後改配。
+ */
+function assertServicePortInPool(id, port) {
+  if (port === null) return;
+  const {start, end} = resolvePortRange();
+  if (isReservedPort(port)) {
+    throw new Error(`runtime service ${id} 宣告的 port ${port} 是保留 port（${port === 4310 ? 'TaskFlow Core' : 'Service Guardian'}），不得由 worktree service 使用。實際 listen port 一律由 TaskFlow Runtime Port Pool（${start}~${end}）配發，請移除 taskflow.runtime.json 裡的 port 宣告。`);
+  }
+  if (port < start || port > end) {
+    throw new Error(`runtime service ${id} 宣告的 port ${port} 超出 TaskFlow Runtime Port Pool 範圍 ${start}~${end}。實際 listen port 一律由 Pool 全權配發，不接受落在範圍外的固定值，請移除 taskflow.runtime.json 裡的 port 宣告。`);
+  }
+>>>>>>> taskflow/multi-service-runtime
 }
 
 export function normalizeService(raw, projectRoot) {
@@ -280,6 +299,8 @@ export function normalizeService(raw, projectRoot) {
   const startCommand = raw.startCommand ? String(raw.startCommand).trim() : null;
   const health = raw.healthCheck ? {...raw.healthCheck} : null;
   if (health && !health.path && !health.url) health.path = '/';
+  const port = Number.isInteger(raw.port) ? raw.port : null;
+  assertServicePortInPool(id, port);
   return {
     id,
     type,
@@ -288,7 +309,11 @@ export function normalizeService(raw, projectRoot) {
     buildCommand: raw.buildCommand ? String(raw.buildCommand).trim() : null,
     installCommand: raw.installCommand ? String(raw.installCommand).trim() : null,
     packageManager: raw.packageManager || 'npm',
+<<<<<<< HEAD
     port: normalizeServicePort(raw.port, id),
+=======
+    port,
+>>>>>>> taskflow/multi-service-runtime
     healthCheck: health,
     dependsOn: Array.isArray(raw.dependsOn) ? [...new Set(raw.dependsOn.map(String))] : [],
     browserEntry: raw.browserEntry === true,
