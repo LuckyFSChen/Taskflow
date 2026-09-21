@@ -24,7 +24,8 @@ import {
   threadEvents,
   taskRuns,
   runTitle,
-  attemptLabel
+  attemptLabel,
+  runtimeView
 } from './task-detail-view.js';
 // src/plan-group.js（與 attention.js 同一個模式），Template 只負責畫出來。
 import {buildPlanGroups} from './plan-group.js';
@@ -77,6 +78,18 @@ const detailValidationFailure=computed(()=>validationFailureView(selected.value)
 const detailBrowser=computed(()=>browserValidations(selected.value));
 const detailPublish=computed(()=>publishState(selected.value));
 const detailFacts=computed(()=>technicalFacts(selected.value));
+// Runtime（PID／Port／State）：preview 是「工作副本」層級的資料，不在 task 物件裡，
+// 要另外向 /projects/:id/targets 要一次；純呈現既有欄位，見 task-detail-view.js。
+const taskPreview=ref<any>(null);
+const detailRuntime=computed(()=>runtimeView(taskPreview.value));
+async function loadTaskRuntime(){
+  if(!selected.value){taskPreview.value=null;return;}
+  try{
+    const data=await api(`/projects/${selected.value.projectId}/targets`);
+    const target=(data.targets||[]).find((t:any)=>t.taskId===selected.value.id);
+    taskPreview.value=target?.preview||null;
+  }catch{taskPreview.value=null;}
+}
 // Run／Attempt：由 server/run-attempt.js 純運算算好，這裡只挑要顯示的欄位，
 // 不重新定義狀態機（見 task-detail-view.js）。
 const detailRuns=computed(()=>taskRuns(selected.value));
@@ -149,7 +162,7 @@ function notify(message:string){toast.value=message;clearTimeout(toastTimer);toa
 // 責任歸屬要用使用者看得懂的話講出來：是 TaskFlow 的執行環境、專案自己的程式，
 // 還是真的需要他提供資訊。這三件事對應的下一步完全不同。
 function runtimeOwnerLabel(owner:string){return ({taskflow:'TaskFlow 執行環境',project:'專案程式',user:'需要你提供資訊'} as Record<string,string>)[owner]||owner||'未判定';}
-async function run(fn:()=>Promise<any>){if(busy.value)return;busy.value=true;try{await fn();await store.refresh();if(selected.value)await loadTask(selected.value.id);}catch(e:any){notify(e.message);}finally{busy.value=false;}}
+async function run(fn:()=>Promise<any>){if(busy.value)return;busy.value=true;try{await fn();await store.refresh();if(selected.value){await loadTask(selected.value.id);await loadTaskRuntime();}}catch(e:any){notify(e.message);}finally{busy.value=false;}}
 async function projectRemoved(projectId:string,pendingCleanup:string[]=[]){removalCleanup.value=pendingCleanup;if(selected.value?.projectId===projectId)selected.value=null;if(newTask.projectId===projectId)newTask.projectId='__new__';users.value=await api('/admin/users');notify(pendingCleanup.length?'專案已移除，部分磁碟檔案尚待清理':'專案及磁碟檔案已移除');}
 async function signIn(){loginError.value='';try{await api('/login',login);login.password='';await store.refresh();void store.loadHealth();}catch(e:any){loginError.value=e.message;}}
 async function loadTask(id:string){selected.value=await api('/tasks/'+id);}
@@ -295,9 +308,11 @@ async function openTask(t: any) {
   gitReview.value = null;
   reviewState.value = 'not_loaded';
   reviewLoadedFor.value = null;
+  taskPreview.value = null;
 
   await run(() => loadTask(t.id));
   await loadReview();
+  await loadTaskRuntime();
 }
 // 任務有可能在詳情開著的時候才跑完；輪詢只讀 /state，不碰 /git/review，所以這裡補讀一次。
 // 條件包含任務 id，換任務時會重新判斷；同一個任務只會自動讀一次。
@@ -337,7 +352,7 @@ watch(()=>route.path,async p=>{filter.value='all';query.value='';if(p==='/settin
 watch(tab,async v=>{if(v==='results'&&selected.value)try{const r=await api(`/tasks/${selected.value.id}/diff`);files.value=r.files||[];resultDiffAvailable.value=r.available!==false;resultDiffMessage.value=r.message||'';}catch(e:any){notify(e.message);}});
 onMounted(async()=>{document.addEventListener('keydown',keyboard);try{await store.refresh();if(route.path==='/settings'&&store.user?.role==='admin')users.value=await api('/admin/users');}catch{}finally{initializing.value=false;}if(store.user)void store.loadHealth();
   // 每 3 秒的輪詢只讀取 /state；系統狀態不在其中，才不會持續 spawn CLI。
-  interval=setInterval(async()=>{if(!store.user||busy.value)return;try{await store.refresh();if(selected.value)await loadTask(selected.value.id);}catch{}},3000);
+  interval=setInterval(async()=>{if(!store.user||busy.value)return;try{await store.refresh();if(selected.value){await loadTask(selected.value.id);await loadTaskRuntime();}}catch{}},3000);
   const context=(document as any).modelContext;if(context?.registerTool)Promise.resolve(context.registerTool({name:'start_task_creation',description:'Open the task creation form. Does not submit or execute a task.',inputSchema:{type:'object',properties:{},additionalProperties:false},execute:()=>{if(!store.user)throw new Error('Sign in first');newTask.projectId=store.user.role==='admin'?'__new__':store.projects[0]?.id||'';showNew.value=true;return {opened:true};}})).catch(()=>{});
 });
 onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.removeEventListener('keydown',keyboard);});
@@ -549,6 +564,21 @@ onUnmounted(()=>{clearInterval(interval);clearTimeout(toastTimer);document.remov
       <template v-else-if="tab==='technical'">
         <p class="subtle">這一頁是給 Agent 與開發者除錯用的原始資料，一般使用時不需要閱讀。</p>
         <dl class="tech-facts"><template v-for="fact in detailFacts" :key="fact.label"><dt>{{fact.label}}</dt><dd>{{fact.value}}</dd></template></dl>
+        <!-- Runtime：這個任務工作副本目前租用的 Port／PID／狀態，資料來自 /projects/:id/targets
+             的 preview.runtime（runtimePublic()），純呈現，不代表健康檢查（見 system-health-view.js）。 -->
+        <h3>Runtime</h3>
+        <p v-if="!detailRuntime" class="muted">Runtime stopped，Ports released</p>
+        <ul v-else class="runtime-services">
+          <li v-for="service in detailRuntime.services" :key="service.id">
+            <strong>{{service.id}}</strong>
+            <span class="kind">{{service.type}}</span>
+            <span class="state" :class="service.state==='READY'?'ready':'bad'">{{service.stateLabel}}</span>
+            <span class="kind">Port {{service.port??'—'}}</span>
+            <span class="kind">{{service.pid?`PID ${service.pid}`:'TaskFlow 自管'}}</span>
+            <small v-if="service.error" class="error-text">{{service.error}}</small>
+          </li>
+        </ul>
+        <p v-if="detailRuntime?.error" class="error-text">{{detailRuntime.error}}</p>
         <h3>Threads</h3>
         <div v-if="!selected.threads.length" class="empty"><GitBranch/><p>尚未開始工作。</p></div>
         <details v-for="th in selected.threads" :key="th.id" class="thread-detail" :open="th.status==='running'"><summary><span class="engine-mark">{{th.engine==='codex'?'C':'A'}}</span><div class="grow"><strong>{{th.role}}</strong><small>{{th.engine}} · {{duration(th)}}</small></div><span class="badge" :class="th.displayStatus||th.status">{{th.statusLabel||statuses[th.status]}}</span></summary>

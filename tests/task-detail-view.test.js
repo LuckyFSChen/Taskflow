@@ -19,6 +19,7 @@ import {
   taskRuns,
   runTitle,
   attemptLabel,
+  runtimeView,
 } from '../src/task-detail-view.js';
 
 // 共用的任務樣板：一個已核准、有三個步驟的程式任務。
@@ -588,4 +589,47 @@ test('推導是純函式：重複計算結果完全一致', () => {
   assert.deepEqual(progressSteps(task), progressSteps(task));
   assert.deepEqual(progressSummary(task), progressSummary(task));
   assert.deepEqual(browserValidations(task), browserValidations(task));
+});
+
+// --- Runtime（PID / Port / State） -------------------------------------------
+
+test('沒有 preview 或沒有 runtime 時視為 Runtime 已停止', () => {
+  assert.equal(runtimeView(null), null);
+  assert.equal(runtimeView({}), null);
+  assert.equal(runtimeView({ runtime: null }), null);
+});
+
+test('runtime 存在時列出每個 service 的 PID／Port／State，並把英文狀態換成中文標籤', () => {
+  const preview = {
+    runtime: {
+      status: 'READY',
+      error: null,
+      services: [
+        { id: 'backend', type: 'node', status: 'READY', url: 'http://127.0.0.1:45017', port: 45017, pid: 12345 },
+        { id: 'frontend', type: 'vite', status: 'STARTING', url: null, port: 45018, pid: 12389 },
+      ],
+    },
+  };
+  const view = runtimeView(preview);
+  assert.equal(view.status, 'READY');
+  assert.deepEqual(view.services.map(s => [s.id, s.port, s.pid, s.state, s.stateLabel]), [
+    ['backend', 45017, 12345, 'READY', '執行中'],
+    ['frontend', 45018, 12389, 'STARTING', '啟動中'],
+  ]);
+});
+
+test('service 缺 port／pid 時給 null，不假裝有數值；TaskFlow 自管的服務沒有 pid', () => {
+  const preview = { runtime: { status: 'FAILED', error: '啟動失敗', services: [
+    { id: 'proxy', type: 'static', status: 'FAILED', port: null, pid: null, error: '連線被拒絕' },
+  ] } };
+  const view = runtimeView(preview);
+  assert.equal(view.error, '啟動失敗');
+  assert.deepEqual(view.services[0], {
+    id: 'proxy', type: 'static', port: null, pid: null, state: 'FAILED', stateLabel: '失敗', url: '', error: '連線被拒絕',
+  });
+});
+
+test('推導是純函式：重複計算 runtimeView 結果完全一致', () => {
+  const preview = { runtime: { status: 'READY', error: null, services: [{ id: 'backend', type: 'node', status: 'READY', port: 45017, pid: 1 }] } };
+  assert.deepEqual(runtimeView(preview), runtimeView(preview));
 });

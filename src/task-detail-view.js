@@ -547,3 +547,45 @@ export function threadEvents(task, threadId, limit = 50) {
   const events = list(task?.events).filter(event => event.thread_id === threadId);
   return limit > 0 ? events.slice(-limit) : events;
 }
+
+// --- Runtime（PID / Port / State） ---------------------------------------------
+//
+// 資料來自 `/api/projects/:id/targets` 回傳的 preview.runtime（server/runtime-manager.js
+// 的 runtimePublic()），這裡只挑技術資訊分頁要顯示的欄位，純呈現、不新增後端 API，
+// 也不與 system-health-view.js 的健康檢查資料模型混用——那邊是「執行環境好不好」，
+// 這裡是「這個任務目前租用了哪些 Runtime Port，程序還在不在」。
+
+const SERVICE_STATE_LABELS = {
+  STARTING: '啟動中',
+  READY: '執行中',
+  STALE: '需要重啟',
+  STOPPING: '停止中',
+  STOPPED: '已停止',
+  FAILED: '失敗',
+};
+
+/**
+ * 任務詳情「技術資訊」分頁的 Runtime 區塊資料。preview 為 null／沒有 runtime
+ * 時視為目前沒有在跑的服務（Preview 已停止或尚未啟動），回傳 null，Template
+ * 顯示「Runtime stopped，Ports released」。
+ * @param {any} preview `/api/projects/:id/targets` 裡對應這個任務的 preview 欄位
+ * @returns {{status:string,error:string,services:{id:string,type:string,port:number|null,pid:number|null,state:string,stateLabel:string,url:string,error:string}[]}|null}
+ */
+export function runtimeView(preview) {
+  const runtime = preview?.runtime;
+  if (!runtime) return null;
+  return {
+    status: text(runtime.status),
+    error: text(runtime.error),
+    services: list(runtime.services).map(service => ({
+      id: text(service.id) || '—',
+      type: text(service.type),
+      port: Number.isInteger(service.port) ? service.port : null,
+      pid: Number.isInteger(service.pid) ? service.pid : null,
+      state: text(service.status) || 'unknown',
+      stateLabel: SERVICE_STATE_LABELS[service.status] || text(service.status) || '未知',
+      url: text(service.url),
+      error: text(service.error),
+    })),
+  };
+}
