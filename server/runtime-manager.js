@@ -33,18 +33,9 @@ const MAX_PORT_BIND_ATTEMPTS = 5;
 
 export const SERVICE_STATES = ['STARTING', 'READY', 'STALE', 'STOPPING', 'STOPPED', 'FAILED'];
 
-<<<<<<< HEAD
-/**
- * 可用的埠。交給作業系統挑，避免自己維護一張「用過哪些」的表而與現實脫節；
- * 但 TaskFlow 自己的 4310／4311 一律重配——runtime 永遠不得佔走基礎設施的位置。
- */
-export function allocatePort() {
-  return allocateRuntimePort();
-=======
 /** 依 TaskFlow Runtime Port Pool 配發一個 port；port 從哪裡來只收斂在 runtime-port-manager.js 這一處。 */
 export async function allocatePort(portManager, {taskId, serviceId}) {
   return portManager.acquire({taskId, serviceId});
->>>>>>> taskflow/multi-service-runtime
 }
 
 /** 這個 port 現在還有沒有人在聽。stop() 之後要據此確認「連接埠已釋放」。 */
@@ -207,23 +198,40 @@ export function createRuntimeManager({
     const {key, projectRoot, npm, startManaged, peers, fingerprint, extraEnv} = context;
     const dir = serviceDirectory(service, projectRoot);
     if (!existsSync(dir)) throw new RuntimeFailure('service_start_failed', `service ${service.id} 的目錄不存在：${service.cwd || '.'}`);
-<<<<<<< HEAD
-    // 專案宣告的 port 到這裡已經過 normalizeService() 的保留 port 檢查；再擋一次，
-    // 因為 portAllocator 是可以被呼叫端替換的。
-    const port = service.port || await portAllocator();
-    if (isReservedPort(port)) throw new RuntimeFailure('service_start_failed', `service ${service.id} 取得了 TaskFlow 保留的 port ${port}（保留：${[...RESERVED_PORTS].join('、')}），已拒絕啟動。`);
     const url = `http://127.0.0.1:${port}`;
+
     const state = {
-      runtimeKey: key, id: service.id, type: service.type, cwd: service.cwd, mode: service.mode,
-      dependsOn: service.dependsOn, browserEntry: service.browserEntry,
-      port, url, pid: null, child: null, status: 'STARTING', startedAt: new Date().toISOString(),
-      command: service.startCommand, health: null, failureKind: null, error: null,
-      fingerprint: runtimeServiceFingerprint(service, {projectRoot, ...fingerprint}),
+      runtimeKey: key,
+      id: service.id,
+      type: service.type,
+      cwd: service.cwd,
+      mode: service.mode,
+      dependsOn: service.dependsOn,
+      browserEntry: service.browserEntry,
+      port,
+      url,
+      pid: null,
+      child: null,
+      status: 'STARTING',
+      startedAt: new Date().toISOString(),
+      command: service.startCommand,
+      health: null,
+      failureKind: null,
+      error: null,
+      fingerprint: runtimeServiceFingerprint(service, {
+        projectRoot,
+        ...fingerprint,
+      }),
       service,
     };
-    emit('runtime_service_starting', {service: service.id, type: service.type, cwd: service.cwd || '.', port, mode: service.mode});
-=======
->>>>>>> taskflow/multi-service-runtime
+
+    emit('runtime_service_starting', {
+      service: service.id,
+      type: service.type,
+      cwd: service.cwd || '.',
+      port,
+      mode: service.mode,
+    });
 
     // acquire() 選中的候選 port 與下面真正 spawn／listen 之間有一個檢查空檔；另一個獨立的
     // TaskFlow 行程理論上可能在這個空檔內搶先 bind 到同一個 port（acquire() 本身已經把起點隨機化
