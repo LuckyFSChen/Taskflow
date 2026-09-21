@@ -12,6 +12,7 @@ import {createProjectPreview} from '../server/project-preview.js';
 import {isAlive} from '../server/process-lifecycle.js';
 import {portInUse, waitForPortRelease} from '../server/runtime-manager.js';
 import {runtimePreflight} from '../server/runtime-recovery.js';
+import {RESERVED_PORTS, createRuntimePortManager, isReservedPort} from '../server/runtime-port-manager.js';
 
 const rmDirSafe = path => rmSync(path, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
 const fakeNpm = async (path, args) => { if (args[0] === 'install') mkdirSync(join(path, 'node_modules'), {recursive: true}); };
@@ -23,6 +24,7 @@ import {createServer} from 'node:http';
 import {writeFileSync} from 'node:fs';
 const port = Number(process.env.PORT);
 writeFileSync(process.env.TF_MARKER, JSON.stringify({
+  pid: process.pid,
   port,
   backendPort: process.env.BACKEND_PORT || null,
   frontendPort: process.env.FRONTEND_PORT || null,
@@ -37,14 +39,44 @@ createServer((req, res) => {
 }).listen(port, '127.0.0.1');
 `;
 
+// Test 8 用：backend 真的 listen，但故意永遠不回應健康檢查請求，逼 waitForServiceHealth()
+// 真的因為 fetch abort 逾時，走到 'runtime_timeout' 這條路徑，而不是 ECONNREFUSED 的
+// 'service_unhealthy'。process 本身不能自己結束，否則驗不到「還活著但清不掉」這個情境。
+const HANGING_BACKEND = `
+import {createServer} from 'node:http';
+import {writeFileSync} from 'node:fs';
+const port = Number(process.env.PORT);
+writeFileSync(process.env.TF_MARKER, JSON.stringify({pid: process.pid, port}));
+createServer((req, res) => { /* 故意不回應，逼健康檢查逾時 */ }).listen(port, '127.0.0.1');
+`;
+
+// Test 10 用：backend 自己再開一個孫行程，真正 listen 的是孫行程，TaskFlow 追蹤的 PID
+// （runtime-manager 直接 spawn 出來的那一個）只是 parent。用來證明 killTree() 的
+// Windows `/T`（整棵 process tree）真的連孫行程一起清掉，不是只清掉 TaskFlow 認得的那個 PID。
+const BACKEND_WITH_GRANDCHILD = `
+import {spawn} from 'node:child_process';
+import {writeFileSync} from 'node:fs';
+const port = Number(process.env.PORT);
+const grandchild = spawn(process.execPath, ['-e', \`
+const {createServer} = require('node:http');
+const port = Number(process.env.PORT);
+createServer((req, res) => {
+  if (req.url === '/api/health') { res.writeHead(200, {'Content-Type': 'application/json'}); res.end(JSON.stringify({ok: true})); return; }
+  res.writeHead(404); res.end();
+}).listen(port, '127.0.0.1');
+\`], {env: process.env, stdio: 'ignore', windowsHide: true});
+writeFileSync(process.env.TF_MARKER, JSON.stringify({pid: process.pid, childPid: grandchild.pid, port}));
+setInterval(() => {}, 60000);
+`;
+
 const SPA = '<!DOCTYPE html><html><head><title>fixture</title></head><body><div id="app">frontend</div></body></html>';
 
-function writeFixture({healthy = true, proxyPaths = ['/api', '/uploads'], validationProbes = null} = {}) {
+function writeFixture({healthy = true, proxyPaths = ['/api', '/uploads'], validationProbes = null, backendSource = null} = {}) {
   const root = mkdtempSync(join(tmpdir(), 'tf-runtime-'));
   mkdirSync(join(root, 'backend'), {recursive: true});
   mkdirSync(join(root, 'frontend/dist'), {recursive: true});
   writeFileSync(join(root, 'backend/package.json'), JSON.stringify({type: 'module', dependencies: {express: '^4'}, scripts: {dev: 'node server.js'}}));
-  writeFileSync(join(root, 'backend/server.js'), BACKEND(healthy));
+  writeFileSync(join(root, 'backend/server.js'), backendSource || BACKEND(healthy));
   writeFileSync(join(root, 'frontend/package.json'), JSON.stringify({type: 'module', devDependencies: {vite: '^5'}, scripts: {build: 'vite build'}}));
   writeFileSync(join(root, 'frontend/dist/index.html'), SPA);
   writeFileSync(join(root, 'taskflow.runtime.json'), JSON.stringify({
@@ -120,7 +152,9 @@ test('Test 3／6／11 — backend 先就緒、frontend 經由轉發真的到得�
   assert.equal(await portInUse(frontend.port), false, 'frontend 的連接埠必須釋放');
 });
 
-test('Test 4 — backend 健康檢查失敗時，整組 runtime 不成立，Browser Validation 不會開始', async t => {
+// Test 7 — validation failure cleanup：即使健康檢查未通過（相當於驗證流程內部 throw），
+// backend 的 PID 與 port 也必須清乾淨，不能留下孤兒。
+test('Test 4／7 — backend 健康檢查失敗時，整組 runtime 不成立，且 process／port 都清乾淨', async t => {
   const root = writeFixture({healthy: false});
   const previews = createProjectPreview({npm: fakeNpm, registryPath: join(root, 'registry.json')});
   t.after(async () => { await previews.close().catch(() => {}); rmDirSafe(root); });
@@ -142,6 +176,13 @@ test('Test 4 — backend 健康檢查失敗時，整組 runtime 不成立，Brow
 
   // 半開的 runtime 不可以留下來：前端不該還開著。
   assert.equal(previews.status('multi-unhealthy'), null);
+
+  // Test 7：驗證失敗（這裡等同於健康檢查一路未通過而丟出 RuntimeFailure）也要清乾淨，
+  // 不是只有成功路徑才清。backend 程序即使從未 ready，也必須真的被停掉、port 也要釋放。
+  assert.ok(existsSync(markerPath(root)), 'backend 程序必須已經啟動過，才談得上要不要清乾淨');
+  const marker = JSON.parse(readFileSync(markerPath(root), 'utf8'));
+  assert.equal(isAlive(marker.pid), false, '健康檢查失敗後，backend PID 必須真的消失，不留孤兒');
+  assert.equal(await portInUse(marker.port), false, '健康檢查失敗後，backend 的 port 必須釋放');
 });
 
 test('Test 5 — 宣告的驗證端點實際上沒有被轉發時，SPA fallback 的 200 判定為 proxy_routing_failure', async t => {
@@ -280,4 +321,114 @@ test('單一服務專案完全不經過 multi-service 路徑（既有行為不�
   assert.equal(page.status, 200);
   const stopped = await previews.stop('single');
   assert.equal(stopped.verified, true);
+});
+
+// --- Runtime Port Pool / Lease 改造：需求書第二十二章 Test 5／8／9／10／14 ------------
+
+// 需求書 Test 5 — parent PORT leakage：即使父行程（這個測試檔自己）的 process.env.PORT
+// 是保留 port 4310，子行程實際收到的 PORT 也必須是這一輪 lease 配發的 450xx，不是繼承來的。
+test('需求書 Test 5 — 子行程不受父行程 process.env.PORT=4310 污染，一律使用 lease 配發的 port', async t => {
+  const root = writeFixture();
+  const previews = createProjectPreview({npm: fakeNpm, registryPath: join(root, 'registry.json')});
+  t.after(async () => { await previews.close().catch(() => {}); rmDirSafe(root); });
+
+  const originalPort = process.env.PORT;
+  process.env.PORT = '4310';
+  t.after(() => { if (originalPort === undefined) delete process.env.PORT; else process.env.PORT = originalPort; });
+
+  const info = await previews.start('multi-portenv', root);
+  const backend = info.runtime.services.find(service => service.id === 'backend');
+  const marker = JSON.parse(readFileSync(markerPath(root), 'utf8'));
+  assert.notEqual(marker.port, 4310, '子行程不得直接繼承父行程的 process.env.PORT=4310');
+  assert.equal(marker.port, backend.port, '子行程實際收到的 PORT 必須是這次 lease 配發的 port');
+  assert.ok(backend.port >= 45000 && backend.port <= 45099, 'lease 配發的 port 必須落在 Runtime Port Pool 範圍內');
+
+  await previews.stop('multi-portenv');
+});
+
+// 需求書 Test 8 — timeout cleanup：backend 真的 listen 但永遠不回應，健康檢查逾時後，
+// runtime 不成立，backend 的 PID 與 port 依然要清乾淨。
+test('需求書 Test 8 — 健康檢查逾時（timeout）後，backend 的 process／port 一樣要清乾淨', async t => {
+  const root = writeFixture({backendSource: HANGING_BACKEND});
+  const previews = createProjectPreview({npm: fakeNpm, registryPath: join(root, 'registry.json'), healthTimeoutMs: 900});
+  t.after(async () => { await previews.close().catch(() => {}); rmDirSafe(root); });
+
+  await assert.rejects(previews.start('multi-timeout', root), error => {
+    assert.ok(['runtime_timeout', 'service_unhealthy'].includes(error.kind), `逾時應歸類為 runtime_timeout 或 service_unhealthy，實際是 ${error.kind}`);
+    return true;
+  });
+
+  assert.ok(existsSync(markerPath(root)), 'backend 程序必須已經啟動過');
+  const marker = JSON.parse(readFileSync(markerPath(root), 'utf8'));
+  assert.equal(isAlive(marker.pid), false, '逾時後 backend PID 必須真的消失');
+  assert.equal(await portInUse(marker.port), false, '逾時後 backend 的 port 必須釋放');
+  assert.equal(previews.status('multi-timeout'), null);
+});
+
+// 需求書 Test 9 — cancellation cleanup：runtime 已經 READY，但使用者在做任何驗證之前
+// 就直接取消（對應 previews.stop() 由任務取消／視窗關閉路徑呼叫），一樣要確認清乾淨。
+test('需求書 Test 9 — 使用者取消（尚未開始驗證就呼叫 previews.stop）：process／port 全部釋放', async t => {
+  const root = writeFixture();
+  const previews = createProjectPreview({npm: fakeNpm, registryPath: join(root, 'registry.json')});
+  t.after(async () => { await previews.close().catch(() => {}); rmDirSafe(root); });
+
+  const info = await previews.start('multi-cancel', root);
+  const [backend, frontend] = ['backend', 'frontend'].map(id => info.runtime.services.find(service => service.id === id));
+  assert.equal(backend.status, 'READY');
+  assert.equal(frontend.status, 'READY');
+
+  // 模擬使用者立刻取消：完全不做任何 fetch／驗證，直接停止。
+  const stopped = await previews.stop('multi-cancel');
+  assert.equal(stopped.stopped, true);
+  assert.equal(stopped.verified, true);
+  for (const service of stopped.services) assert.equal(service.verified, true, `${service.id} 必須確認已結束`);
+  assert.equal(isAlive(backend.pid), false);
+  assert.equal(await waitForPortRelease(backend.port), true);
+  assert.equal(await portInUse(frontend.port), false);
+  assert.equal(previews.status('multi-cancel'), null);
+});
+
+// 需求書 Test 10 — process tree cleanup：backend 自己再開一個孫行程（真正 listen 的是它），
+// TaskFlow 只直接認得 parent 的 PID。停止後 parent／孫行程都必須消失，不能只清掉認得的那一個。
+test('需求書 Test 10 — process tree cleanup：backend 自己開的孫行程也要一起清乾淨', async t => {
+  const root = writeFixture({backendSource: BACKEND_WITH_GRANDCHILD});
+  const previews = createProjectPreview({npm: fakeNpm, registryPath: join(root, 'registry.json')});
+  t.after(async () => { await previews.close().catch(() => {}); rmDirSafe(root); });
+
+  const info = await previews.start('multi-tree', root);
+  const backend = info.runtime.services.find(service => service.id === 'backend');
+  assert.equal(backend.status, 'READY');
+  const marker = JSON.parse(readFileSync(markerPath(root), 'utf8'));
+  assert.equal(marker.pid, backend.pid, 'TaskFlow 追蹤的 PID 是它直接 spawn 出來的 parent');
+  assert.notEqual(marker.childPid, backend.pid, '真正在監聽的是 backend 自己開的孫行程，不是同一個 PID');
+  assert.ok(isAlive(marker.pid) && isAlive(marker.childPid), '停止前 parent／孫行程都應該活著');
+
+  await previews.stop('multi-tree');
+
+  assert.equal(isAlive(marker.pid), false, 'parent 必須真的消失');
+  assert.equal(isAlive(marker.childPid), false, '孫行程不能是清不掉的孤兒，killTree 必須連整棵樹一起處理');
+  assert.equal(await portInUse(backend.port), false, '孫行程真正監聽的 port 也必須釋放');
+});
+
+// 需求書 Test 14 — Core / Guardian regression：4310 永遠只屬於 TaskFlow Core，
+// 4311 永遠只屬於 Service Guardian，Runtime Port Pool 的改造不得動到這兩個 port。
+test('需求書 Test 14 — 4310 仍然只屬於 TaskFlow Core、4311 仍然只屬於 Service Guardian', async t => {
+  const indexSource = readFileSync(new URL('../server/index.js', import.meta.url), 'utf8');
+  const guardianSource = readFileSync(new URL('../server/service-guardian.js', import.meta.url), 'utf8');
+  assert.match(indexSource, /process\.env\.PORT\s*\|\|\s*4310/, 'TaskFlow Core 的預設 listen port 必須仍然是 4310');
+  assert.match(guardianSource, /lock\.listen\(4311/, 'Service Guardian 必須仍然佔住 4311 作為單例鎖');
+  assert.deepEqual([...RESERVED_PORTS], [4310, 4311]);
+
+  // 即使故意把範圍硬塞成只剩 4310~4311，這兩個 port 依然永遠配不出去。
+  const reservedOnly = createRuntimePortManager({range: {start: 4310, end: 4311}, checkPortInUse: async () => false, log: () => {}});
+  assert.equal(await reservedOnly.isAvailable(4310), false);
+  assert.equal(await reservedOnly.isAvailable(4311), false);
+
+  // 實機多服務場景：backend／frontend 也絕不會拿到這兩個保留 port。
+  const root = writeFixture();
+  const previews = createProjectPreview({npm: fakeNpm, registryPath: join(root, 'registry.json')});
+  t.after(async () => { await previews.close().catch(() => {}); rmDirSafe(root); });
+  const info = await previews.start('multi-regress-4310', root);
+  for (const service of info.runtime.services) assert.ok(!isReservedPort(service.port), `${service.id} 不得拿到保留 port ${service.port}`);
+  await previews.stop('multi-regress-4310');
 });
