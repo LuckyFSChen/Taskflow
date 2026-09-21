@@ -143,7 +143,7 @@ try{
 }catch{
   # 只停本輪啟動、而且沒有成功接管正式 Port 的那一個 PID：不碰其他任何程序。
   if($startedServer){
-    [void](Stop-TaskFlowProcessById -ProcessId $startedServer.Id)
+    [void](Stop-TaskFlowProcessById -ProcessId $startedServer.Id -ExpectedPath $serverPath)
     $savedPid=$null
     if(Test-Path -LiteralPath 'data/server.pid'){$savedPid=(Get-Content -LiteralPath 'data/server.pid' -Raw -ErrorAction SilentlyContinue).Trim()}
     if($savedPid -eq "$($startedServer.Id)"){Remove-Item -LiteralPath 'data/server.pid' -Force -ErrorAction SilentlyContinue}

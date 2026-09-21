@@ -48,6 +48,17 @@ test('Restart 不去追隨機 port，也沒有從 server.log 解析出 port 就�
   for(const match of healthChecks) assert.match(match[0],/\$taskUrl/);
 });
 
+test('「有幾個主服務」必須用陣列問，PowerShell 會把單一元素的回傳值拆開',()=>{
+  // 實際踩過：`return @(...)` 只有一個元素時會被拆成單一物件，呼叫端的 .Count 變成
+  // $null，於是「剛好一個主服務」被判成失敗，剛啟動好的服務又被清理掉。
+  const helper=read('scripts/TaskFlow-Ports.ps1');
+  assert.match(helper,/return ,\$found/,'Get-TaskFlowServerProcess 必須用 ,$found 保住陣列');
+  const restart=read('Restart-TaskFlow.ps1');
+  const assignments=[...restart.matchAll(/\$\w+ = [^\n]*Get-TaskFlowServerProcess[^\n]*/g)];
+  assert.ok(assignments.length>0);
+  for(const match of assignments) assert.match(match[0],/@\(Get-TaskFlowServerProcess/,'呼叫端也要用 @() 固定成陣列');
+});
+
 // 共用函式的實際行為。沒有 PowerShell 的環境（例如 Linux CI）直接跳過。
 function powershell() {
   for(const candidate of process.platform==='win32'?['powershell.exe','pwsh']:['pwsh']) {

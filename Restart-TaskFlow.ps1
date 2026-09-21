@@ -30,6 +30,9 @@ $guardianPath = Join-Path $taskRoot 'server\service-guardian.js'
 # server\index.js 在系統裡（這次事故觀察到的殘留程序就是這樣累積的）。
 $startedServer = $null
 
+# Guardian 的排程工作每分鐘會把它重新拉起來。重啟期間先停用，finally 一定恢復。
+$guardianScheduleWasEnabled = $false
+
 Set-Location -LiteralPath $taskRoot
 
 
@@ -117,8 +120,16 @@ For safety, Restart-TaskFlow.ps1 did not stop it.
 
     Write-Host "Stopping $Label PID $processId..."
 
-    if (-not (Stop-TaskFlowProcessById -ProcessId $processId)) {
-        throw "$Label process PID $processId could not be stopped."
+    if (-not (Stop-TaskFlowProcessById -ProcessId $processId -ExpectedPath $ExpectedPath)) {
+        throw @"
+$Label process PID $processId could not be stopped.
+
+Reason:
+$(if ($TaskFlowLastStopError) { $TaskFlowLastStopError } else { 'The process was still running after Stop-Process and taskkill /T /F.' })
+
+If it is running as another user or elevated, run this script from an elevated PowerShell,
+or end PID $processId in Task Manager and try again.
+"@
     }
 
     if ($PidFile) {
@@ -143,9 +154,9 @@ function Remove-StrayTaskFlowServer {
         不會被誤判，也絕不「殺掉所有 node.exe」。
     #>
 
-    $stray = Get-TaskFlowServerProcess -TaskRoot $taskRoot
+    $stray = @(Get-TaskFlowServerProcess -TaskRoot $taskRoot)
 
-    if (-not $stray -or $stray.Count -eq 0) { return }
+    if ($stray.Count -eq 0) { return }
 
     Write-Host "Found $($stray.Count) leftover TaskFlow main server process(es) from earlier runs." -ForegroundColor Yellow
 
@@ -153,8 +164,13 @@ function Remove-StrayTaskFlowServer {
 
         Write-Host "Stopping leftover TaskFlow main server PID $($process.ProcessId)..."
 
-        if (-not (Stop-TaskFlowProcessById -ProcessId $process.ProcessId)) {
-            throw "Leftover TaskFlow main server PID $($process.ProcessId) could not be stopped."
+        if (-not (Stop-TaskFlowProcessById -ProcessId $process.ProcessId -ExpectedPath $serverPath)) {
+            throw @"
+Leftover TaskFlow main server PID $($process.ProcessId) could not be stopped.
+
+Reason:
+$(if ($TaskFlowLastStopError) { $TaskFlowLastStopError } else { 'The process was still running after Stop-Process and taskkill /T /F.' })
+"@
         }
     }
 }
@@ -226,6 +242,17 @@ try {
     Write-Host "Root: $taskRoot"
     Write-Host "Main server port: $TaskFlowMainPort"
     Write-Host "Service Guardian port: $TaskFlowGuardianPort"
+
+
+    # --------------------------------------------------------
+    # 停用 Guardian 排程工作
+    # --------------------------------------------------------
+    # 排程每分鐘就會把 Guardian 拉起來一次。不先停用，npm ci／build 途中就會冒出新的
+    # Guardian，再由它半路把服務拉起來，於是又多一個 server\index.js。
+
+    Write-Step 'Pausing the Service Guardian schedule'
+
+    $guardianScheduleWasEnabled = Suspend-TaskFlowGuardianSchedule
 
 
     # --------------------------------------------------------
@@ -317,6 +344,10 @@ try {
     # --------------------------------------------------------
 
     Write-Step 'Starting TaskFlow server'
+
+    # 建置花好幾分鐘；這段期間若有人把服務拉起來，先清掉再啟動，
+    # 本輪才會只剩下一個由我們負責的主服務。
+    Remove-StrayTaskFlowServer
 
     if (Get-TaskFlowPortOwner -Port $TaskFlowMainPort) {
         throw "Port $TaskFlowMainPort is still occupied; TaskFlow server was not started."
@@ -489,13 +520,17 @@ $($guardianInfo.CommandLine)
         throw "Port $TaskFlowMainPort is not owned by the TaskFlow server started by this restart (PID $($server.Id))."
     }
 
-    $savedPid = (Get-Content -LiteralPath $serverPidFile -Raw -ErrorAction SilentlyContinue).Trim()
+    $savedPid = ''
+
+    if (Test-Path -LiteralPath $serverPidFile) {
+        $savedPid = ([string](Get-Content -LiteralPath $serverPidFile -Raw -ErrorAction SilentlyContinue)).Trim()
+    }
 
     if ($savedPid -ne "$($server.Id)") {
         throw "data\server.pid ($savedPid) does not match the process listening on port $TaskFlowMainPort ($($server.Id))."
     }
 
-    $instances = Get-TaskFlowServerProcess -TaskRoot $taskRoot
+    $instances = @(Get-TaskFlowServerProcess -TaskRoot $taskRoot)
 
     if ($instances.Count -ne 1) {
         throw @"
@@ -543,7 +578,7 @@ catch {
         Write-Host ''
         Write-Host "Cleaning up the TaskFlow server started by this restart (PID $($startedServer.Id))..." -ForegroundColor Yellow
 
-        if (Stop-TaskFlowProcessById -ProcessId $startedServer.Id) {
+        if (Stop-TaskFlowProcessById -ProcessId $startedServer.Id -ExpectedPath $serverPath) {
             Write-Host 'Cleanup completed; no TaskFlow server was left running by this restart.' -ForegroundColor Yellow
         }
         else {
@@ -570,6 +605,9 @@ catch {
     exit 1
 }
 finally {
+
+    # 排程一定要恢復：這是使用者服務的自動復原機制，不能因為一次重啟就被永久停用。
+    Resume-TaskFlowGuardianSchedule -WasEnabled $guardianScheduleWasEnabled
 
     if ($locked) {
         $mutex.ReleaseMutex()

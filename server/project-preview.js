@@ -9,7 +9,6 @@ import {createStore} from './db.js';
 import {registerPreview,unregisterPreview,waitForExit} from './process-lifecycle.js';
 import {acceptanceEnvironment,cleanupAcceptanceContext,createAcceptanceContext} from './acceptance-auth.js';
 import {childEnvironment,resolveNpmCli} from './npm-runner.js';
-import {allocateRuntimePort} from './ports.js';
 import {resolveRuntimeTopology,serviceDirectory,topologyPublic} from './runtime-topology.js';
 import {allocatePort,createRuntimeManager,runtimePublic,waitForPortRelease} from './runtime-manager.js';
 import {createRuntimePortManager,isPortBindCollision} from './runtime-port-manager.js';

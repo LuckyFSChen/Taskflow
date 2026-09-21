@@ -51,7 +51,7 @@ try {
 } catch {
     # 啟動失敗就不留下這一輪開出來的 server\index.js。只停這一個 PID。
     if ($startedServer) {
-        [void](Stop-TaskFlowProcessById -ProcessId $startedServer.Id)
+        [void](Stop-TaskFlowProcessById -ProcessId $startedServer.Id -ExpectedPath $serverPath)
         $savedPidFile = Join-Path $taskRoot 'data/server.pid'
         if (Test-Path -LiteralPath $savedPidFile) {
             $savedPid = (Get-Content -LiteralPath $savedPidFile -Raw -ErrorAction SilentlyContinue).Trim()

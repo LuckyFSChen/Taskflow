@@ -19,13 +19,16 @@
 //
 // 所以主服務不再讀 PORT：只認 TASKFLOW_PORT，沒設定就是 4310。
 // 泛用的 PORT 從此純屬 runtime 子程序的身分，主服務看見它只會當成污染來記錄。
-import {createServer} from 'node:net';
-
 export const TASKFLOW_MAIN_PORT = 4310;
 export const TASKFLOW_GUARDIAN_PORT = 4311;
 
-/** 任何 runtime port 配發者都必須跳過的 port。 */
-export const RESERVED_PORTS = new Set([TASKFLOW_MAIN_PORT, TASKFLOW_GUARDIAN_PORT]);
+/**
+ * 任何 runtime port 配發者都必須跳過的 port。
+ *
+ * 這是唯一一份定義：server/runtime-port-manager.js（Runtime Port Pool／Lease）直接匯入並
+ * 轉出同一份，才不會出現「兩個模組各自記得哪些 port 是保留的」這種必然走樣的狀態。
+ */
+export const RESERVED_PORTS = Object.freeze([TASKFLOW_MAIN_PORT, TASKFLOW_GUARDIAN_PORT]);
 
 export const MAIN_PORT_ENV = 'TASKFLOW_PORT';
 export const GUARDIAN_PORT_ENV = 'TASKFLOW_GUARDIAN_PORT';
@@ -38,8 +41,7 @@ export const MAIN_HOST_ENV = 'TASKFLOW_HOST';
 export const RUNTIME_PORT_ENV_KEYS = ['PORT', 'HOST', 'PREVIEW_PORT', 'PREVIEW_URL', 'BACKEND_PORT', 'BACKEND_URL', 'FRONTEND_PORT', 'FRONTEND_URL'];
 
 export function isReservedPort(port) {
-  const value = Number(port);
-  return Number.isInteger(value) && RESERVED_PORTS.has(value);
+  return RESERVED_PORTS.includes(Number(port));
 }
 
 /**
@@ -112,33 +114,4 @@ export function infrastructureEnvironment(env = process.env) {
   copy[GUARDIAN_PORT_ENV] = String(resolveGuardianPort(env));
   copy[MAIN_HOST_ENV] = resolveMainHost(env);
   return copy;
-}
-
-/** 交給作業系統挑一個高位 port。 */
-export function probeEphemeralPort() {
-  return new Promise((resolve, reject) => {
-    const probe = createServer();
-    probe.once('error', reject);
-    probe.listen(0, '127.0.0.1', () => {
-      const {port} = probe.address();
-      probe.close(() => resolve(port));
-    });
-  });
-}
-
-/**
- * Runtime port 配發：作業系統挑，但 4310／4311 一律重配。
- *
- * 作業系統的 ephemeral 範圍通常本來就碰不到 4310，但「通常」不是保證：Windows 的
- * 動態範圍可以被 netsh 改。配發者本身必須拒絕保留 port，否則某一天 Task runtime 會
- * 安靜地佔走主服務的位置。
- */
-export async function allocateRuntimePort({probe = probeEphemeralPort, attempts = 20} = {}) {
-  const rejected = [];
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    const port = await probe();
-    if (!isReservedPort(port)) return port;
-    rejected.push(port);
-  }
-  throw new Error(`無法配發 runtime port：連續 ${attempts} 次都配到 TaskFlow 保留的 ${rejected.join('、')}。`);
 }

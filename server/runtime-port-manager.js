@@ -20,13 +20,11 @@ import {execFile} from 'node:child_process';
 import {mkdirSync, readFileSync, writeFileSync} from 'node:fs';
 import {dirname} from 'node:path';
 import {inspectEntry, isAlive, readRegistry, waitForExit} from './process-lifecycle.js';
+import {RESERVED_PORTS, isReservedPort} from './ports.js';
 
-/** 這兩個 port 永遠分別屬於 TaskFlow Core（4310）與 Service Guardian（4311），任何情況下都不可配發。 */
-export const RESERVED_PORTS = Object.freeze([4310, 4311]);
-
-export function isReservedPort(port) {
-  return RESERVED_PORTS.includes(Number(port));
-}
+// 這兩個 port 永遠分別屬於 TaskFlow Core（4310）與 Service Guardian（4311），任何情況下都不可配發。
+// 定義在 server/ports.js（基礎設施 port 的唯一出處），這裡原樣轉出，保留既有的匯入路徑。
+export {RESERVED_PORTS, isReservedPort};
 
 // acquire() 的「未被 lease」「OS 未在 Listen」檢查與呼叫端實際 bind 之間終究有一個檢查後才動手
 // 的空檔（TOCTOU）：另一個獨立的 TaskFlow 行程完全可能在這個空檔內搶先 bind 到同一個候選 port。

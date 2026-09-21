@@ -22,7 +22,6 @@ import {connect as netConnect} from 'node:net';
 import {existsSync} from 'node:fs';
 import {join, sep} from 'node:path';
 import {childEnvironment, resolveNpmCli} from './npm-runner.js';
-import {allocateRuntimePort, isReservedPort, RESERVED_PORTS} from './ports.js';
 import {isAlive, registerPreview, unregisterPreview, waitForExit} from './process-lifecycle.js';
 import {orderRuntimeServices, dependentsOf, runtimeServiceFingerprint, serviceDirectory} from './runtime-topology.js';
 import {RuntimeFailure, waitForServiceHealth} from './runtime-validation.js';

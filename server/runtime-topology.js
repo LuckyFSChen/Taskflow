@@ -11,7 +11,6 @@
 //   3. 偵測不到就照實說「偵測不到」，絕不挑一個看起來最像的目錄硬跑——挑錯比沒有更糟。
 import {existsSync, readFileSync, readdirSync, statSync} from 'node:fs';
 import {createHash} from 'node:crypto';
-import {isReservedPort, RESERVED_PORTS} from './ports.js';
 import {join, relative, isAbsolute, sep} from 'node:path';
 import {isReservedPort, resolvePortRange} from './runtime-port-manager.js';
 

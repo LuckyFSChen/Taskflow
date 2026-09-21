@@ -7,7 +7,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {
-  allocateRuntimePort,
   infrastructureEnvironment,
   inheritedRuntimePorts,
   isReservedPort,
@@ -20,7 +19,8 @@ import {
   TASKFLOW_MAIN_PORT,
 } from '../server/ports.js';
 import {childEnvironment} from '../server/npm-runner.js';
-import {allocatePort, serviceEnvironment} from '../server/runtime-manager.js';
+import {serviceEnvironment} from '../server/runtime-manager.js';
+import {RESERVED_PORTS as POOL_RESERVED_PORTS, isReservedPort as poolIsReservedPort, resolvePortRange} from '../server/runtime-port-manager.js';
 import {normalizeService} from '../server/runtime-topology.js';
 import {runServiceRecovery} from '../server/service-recovery.js';
 import {allowedOrigins} from '../server/app.js';
@@ -54,20 +54,19 @@ test('要改主服務的 port 只能用 TASKFLOW_PORT，而且值必須說得通
   assert.throws(()=>resolveGuardianPort({TASKFLOW_GUARDIAN_PORT:'4310'}),/主服務/);
 });
 
-test('Runtime port 配發者永遠不會吐出 4310 或 4311',async()=>{
+test('保留 port 只有一份定義，Runtime Port Pool 認的是同一份',()=>{
   assert.ok(isReservedPort(4310)&&isReservedPort(4311));
-  assert.equal(isReservedPort(52055),false);
+  assert.equal(isReservedPort(45000),false);
   assert.deepEqual([...RESERVED_PORTS].sort(),[4310,4311]);
 
-  const queue=[4310,4311,52001];
-  const port=await allocateRuntimePort({probe:async()=>queue.shift()});
-  assert.equal(port,52001,'配到保留 port 必須重配，不能交出去');
+  // runtime-port-manager.js 轉出的就是這一份，不是自己再記一次——兩份遲早會走樣。
+  assert.equal(poolIsReservedPort,isReservedPort);
+  assert.deepEqual([...POOL_RESERVED_PORTS],[...RESERVED_PORTS]);
 
-  await assert.rejects(allocateRuntimePort({probe:async()=>4310,attempts:3}),/保留/);
-
-  // 實際配一個：作業系統挑出來的 port 也必須通過同一道檢查。
-  const real=await allocatePort();
-  assert.ok(Number.isInteger(real)&&real>0&&!isReservedPort(real));
+  // Pool 的候選範圍本身就碰不到基礎設施 port。
+  const {start,end}=resolvePortRange({env:{}});
+  assert.ok(start>TASKFLOW_GUARDIAN_PORT,`Pool 起點 ${start} 必須高於保留 port`);
+  for(const port of RESERVED_PORTS) assert.ok(port<start||port>end);
 });
 
 test('子程序不繼承主服務的 port 身分，但仍然拿得到自己的 port',()=>{
@@ -117,7 +116,9 @@ test('專案不得在 runtime 設定裡宣告 TaskFlow 的保留 port',()=>{
   for(const port of [4310,4311]) {
     assert.throws(()=>normalizeService({id:'api',type:'backend',startCommand:'npm run dev',port},projectRoot),/保留/);
   }
-  assert.equal(normalizeService({id:'api',type:'backend',startCommand:'npm run dev',port:52010},projectRoot).port,52010);
+  // Pool 範圍內的宣告值才允許（實際 listen port 仍由 Pool 配發）。
+  const {start}=resolvePortRange({env:{}});
+  assert.equal(normalizeService({id:'api',type:'backend',startCommand:'npm run dev',port:start+2},projectRoot).port,start+2);
   assert.equal(normalizeService({id:'api',type:'backend',startCommand:'npm run dev'},projectRoot).port,null);
 });
 
