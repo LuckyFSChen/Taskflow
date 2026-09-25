@@ -1,4 +1,4 @@
-param([switch]$CheckOnly,[switch]$Restart,[switch]$Build,[string]$ResultFile)
+﻿param([switch]$CheckOnly,[switch]$Restart,[switch]$Build,[string]$ResultFile)
 $ErrorActionPreference='Stop'
 if($CheckOnly -and $Restart){throw 'CheckOnly and Restart cannot be combined.'}
 $taskRoot=Split-Path -Parent $PSScriptRoot

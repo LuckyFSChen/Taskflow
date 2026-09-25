@@ -1,17 +1,38 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
-import {existsSync} from 'node:fs';
+import {spawn,execFileSync} from 'node:child_process';
+import {existsSync,readFileSync} from 'node:fs';
 import {runServiceRecovery} from '../server/service-recovery.js';
 
 test('Recovery reads a durable result on process exit without inherited output pipes',async()=>{
  let file;
  const result=await runServiceRecovery({spawnProcess:(command,args,options)=>{
-  assert.equal(command,'powershell.exe');assert.ok(args.includes('-Restart'));assert.equal(options.stdio,'ignore');assert.equal(options.windowsHide,true);
+  assert.equal(command,'powershell.exe');assert.ok(args.includes('-Restart'));assert.deepEqual(options.stdio.slice(0,2),['ignore','ignore']);assert.equal(typeof options.stdio[2],'number');assert.equal(options.windowsHide,true);
   file=args.at(-1);
   return spawn(process.execPath,['--input-type=module','-e','import {writeFileSync} from "node:fs";writeFileSync(process.argv[1],JSON.stringify({ok:true,url:"https://ready.example.com"}));',file],options);
  }});
  assert.equal(result.url,'https://ready.example.com');assert.equal(existsSync(file),false);
+});
+
+test('Recovery preserves errors raised before a result file can be written',async()=>{
+ let file;
+ await assert.rejects(runServiceRecovery({spawnProcess:(command,args,options)=>{
+  file=args.at(-1);
+  return spawn(process.execPath,['-e','console.error("ParserError: Unexpected token");process.exitCode=1'],options);
+ }}),error=>/code 1/.test(error.message)&&/ParserError: Unexpected token/.test(error.stderr));
+ assert.equal(existsSync(file),false);
+});
+
+test('Recovery scripts retain UTF-8 BOM for Windows PowerShell decoding',()=>{
+ for(const script of ['scripts/Recover-TaskFlow.ps1','scripts/TaskFlow-Ports.ps1']){
+  assert.deepEqual([...readFileSync(script).subarray(0,3)],[0xef,0xbb,0xbf],script);
+ }
+});
+
+test('Windows PowerShell parses the recovery scripts without executing a restart',{skip:process.platform!=='win32'},()=>{
+ execFileSync('powershell.exe',['-NoProfile','-Command',
+  "$ErrorActionPreference='Stop'; foreach($script in @('scripts/Recover-TaskFlow.ps1','scripts/TaskFlow-Ports.ps1')) { $tokens=$null; $parseErrors=$null; $null=[System.Management.Automation.Language.Parser]::ParseFile((Join-Path (Get-Location) $script),[ref]$tokens,[ref]$parseErrors); if($parseErrors.Count) { throw ($parseErrors | Out-String) } }"
+ ],{windowsHide:true});
 });
 
 test('Read-only recovery selects CheckOnly and preserves active-work error for LINE',async()=>{
